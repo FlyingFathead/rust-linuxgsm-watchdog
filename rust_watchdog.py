@@ -2,7 +2,9 @@
 
 # =============================================================
 # https://github.com/FlyingFathead/rust-linuxgsm-watchdog
+# -------------------------------------------------------------
 # A restart & update watchdog for Rust game servers on LinuxGSM
+# -------------------------------------------------------------
 # FlyingFathead / 2026 / https://github.com/FlyingFathead/
 # =============================================================
 
@@ -19,7 +21,7 @@ import sys
 import time
 from datetime import datetime
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_FOR_HINTS = None
@@ -40,6 +42,10 @@ DEFAULTS = {
 
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,
+
+    # Recovery toggles (convenience flags; defaults keep current behavior)
+    "enable_server_update": True,   # controls "update"
+    "enable_mods_update": True,     # controls "mu" (mod updates)
 
     # Health checks (any PASS => RUNNING)
     "check_process_identity": True,  # pgrep RustDedicated + identity
@@ -92,6 +98,56 @@ def load_cfg(path):
             t.update(data["timeouts"])
             cfg["timeouts"] = t
     return cfg
+
+def parse_bool(v, default=True):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+    return default
+
+def apply_recovery_toggles(cfg):
+    """
+    Convenience: allow enabling/disabling server/mod updates without forcing users
+    to edit recovery_steps manually.
+
+    Behavior:
+      - if enable_server_update == False -> remove step "update"
+      - if enable_mods_update == False   -> remove step "mu"
+      - everything else remains as-is
+    """
+    enable_update = parse_bool(cfg.get("enable_server_update"), True)
+    enable_mu = parse_bool(cfg.get("enable_mods_update"), True)
+
+    orig = cfg.get("recovery_steps", [])
+    if not isinstance(orig, list):
+        fatal("config: recovery_steps must be a list", fp=None)
+
+    new = []
+    for step in orig:
+        if not isinstance(step, str) or not step.strip():
+            fatal(f"config: recovery_steps contains invalid step: {repr(step)}", fp=None)
+
+        s = step.strip().lower()
+        if s == "update" and not enable_update:
+            continue
+        if s == "mu" and not enable_mu:
+            continue
+        new.append(step)
+
+    if not new:
+        fatal("config: recovery_steps became empty after applying enable_* toggles", fp=None)
+
+    cfg["_recovery_steps_original"] = orig
+    cfg["recovery_steps"] = new
 
 def acquire_lock(lock_path, fp=None):
     """
@@ -208,6 +264,9 @@ def fatal(msg, code=2, fp=None):
     if server_dir:
         print(f"server_dir: {server_dir}", file=sys.stderr)
         print("  - must exist, be accessible, and contain an executable './rustserver'", file=sys.stderr)
+
+    if server_dir:
+        print(f"rustserver: {os.path.join(server_dir, 'rustserver')}", file=sys.stderr)
 
     if logfile:
         print(f"logfile:   {logfile}", file=sys.stderr)
@@ -618,6 +677,8 @@ def main():
     global CFG_FOR_HINTS
     CFG_FOR_HINTS = cfg
     
+    apply_recovery_toggles(cfg)
+
     server_dir = os.path.abspath(cfg["server_dir"])
     rustserver_path = os.path.join(server_dir, "rustserver")
 
@@ -651,6 +712,15 @@ def main():
     log(f"Watchdog v{__version__} started (dry_run={cfg['dry_run']})", fp)
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
+
+    if cfg.get("_recovery_steps_original") != cfg.get("recovery_steps"):
+        log(
+            f"NOTE: recovery_steps filtered by toggles "
+            f"(enable_server_update={cfg.get('enable_server_update', True)}, "
+            f"enable_mods_update={cfg.get('enable_mods_update', True)}): "
+            f"{cfg.get('_recovery_steps_original')} -> {cfg.get('recovery_steps')}",
+            fp
+        )
 
     down_streak = 0
     paused = False

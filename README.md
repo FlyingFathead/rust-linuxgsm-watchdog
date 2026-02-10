@@ -78,6 +78,8 @@ Example `rust_watchdog.json`:
 
 Notes:
 
+* `enable_server_update`: if false, skip the `update` step even if it’s listed in `recovery_steps`.
+* `enable_mods_update`: if false, skip the `mu` step even if it’s listed in `recovery_steps`.
 * `pause_file`: if this file exists, the watchdog should pause (if you implemented/kept that feature).
 * `dry_run`: logs what it *would* do, but never runs recovery steps.
 * `down_confirmations`: prevents one bad poll from causing a recovery.
@@ -196,6 +198,7 @@ sudo systemctl restart rust-watchdog.service
 Bump `timeouts.update` / `timeouts.mu` in JSON if SteamCMD is slow, or keep them strict if you prefer fail-fast and retry later.
 
 ### History
+- v0.2.2 - server & plugin updates on restart can now be toggled
 - v0.2.1 - pre-flight checks, interruptible sleep, stop-aware recovery, stop escalation in run_cmd
 - v0.2.0 - stop flag + SIGTERM/SIGINT handler, TCP FAIL counts as DOWN (no “UNKNOWN forever”)
 - v0.1.0 - initial release
