@@ -1,6 +1,6 @@
 # rust-linuxgsm-watchdog
 
-A small, boring, stdlib-only watchdog for **Rust (the game) dedicated servers managed by LinuxGSM**.
+A small, boring, stdlib-only watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM**.
 
 It polls server health, and if the server is *confirmed down*, it runs a recovery sequence:
 
