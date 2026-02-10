@@ -14,6 +14,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -696,11 +697,91 @@ def smoothrestarter_available(server_dir, cfg=None):
     ok = plugin_ok
     return ok, cfg_ok, cfg_path, plugin_path
 
-def tmux_list_sessions():
+def _parse_tmux_l_and_s_from_cmdline(line: str):
+    """
+    Accepts a pgrep -af line, e.g.:
+      "42245 tmux -L rustserver-<something> new-session ... -s rustserver ./RustDedicated ..."
+    Returns (tmux_L_socket_name, tmux_session_name), either can be None.
+    """
+    try:
+        toks = shlex.split(line)
+    except Exception:
+        return (None, None)
+
+    # pgrep -af includes pid as first token
+    if toks and toks[0].isdigit():
+        toks = toks[1:]
+
+    l_name = None
+    s_name = None
+
+    # tmux -L <socket>
+    try:
+        if "-L" in toks:
+            i = toks.index("-L")
+            if i + 1 < len(toks):
+                l_name = toks[i + 1]
+    except Exception:
+        pass
+
+    # tmux ... -s <session>
+    try:
+        if "-s" in toks:
+            i = toks.index("-s")
+            if i + 1 < len(toks):
+                s_name = toks[i + 1]
+    except Exception:
+        pass
+
+    return (l_name, s_name)
+
+def detect_lgsm_tmux_context(cfg, fp=None):
+    """
+    Find the LinuxGSM tmux server socket (-L name) and tmux session (-s name)
+    that hosts THIS Rust server identity.
+
+    Returns (l_name, session_name) or (None, None).
+    """
+    identity = str(cfg.get("identity") or "").strip()
+    if not identity:
+        return (None, None)
+
+    needle1 = f"+server.identity {identity}"
+    needle2 = f"+server.identity \"{identity}\""
+
+    try:
+        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+    except subprocess.CalledProcessError:
+        return (None, None)
+    except Exception:
+        return (None, None)
+
+    # LinuxGSM typically wraps RustDedicated inside a tmux command line
+    for line in lines:
+        if "tmux" not in line or "RustDedicated" not in line:
+            continue
+        if needle1 not in line and needle2 not in line:
+            continue
+
+        l_name, s_name = _parse_tmux_l_and_s_from_cmdline(line)
+        if l_name or s_name:
+            return (l_name, s_name)
+
+    return (None, None)
+
+def tmux_base_cmd(l_name=None):
+    """
+    Build tmux command for either default server or LinuxGSM (-L) server.
+    """
+    if l_name:
+        return ["tmux", "-L", l_name]
+    return ["tmux"]
+
+def tmux_list_sessions(l_name=None):
     if not shutil.which("tmux"):
         return None  # tmux missing
     try:
-        out = subprocess.check_output(["tmux", "ls"], stderr=subprocess.STDOUT, text=True)
+        out = subprocess.check_output(tmux_base_cmd(l_name) + ["ls"], stderr=subprocess.STDOUT, text=True)
     except subprocess.CalledProcessError:
         return []  # tmux exists, but no sessions (rc=1)
     sessions = []
@@ -709,10 +790,12 @@ def tmux_list_sessions():
             sessions.append(line.split(":", 1)[0])
     return sessions
 
-def choose_tmux_target(cfg, rustserver_path):
-    sessions = tmux_list_sessions()
+def choose_tmux_target(cfg, rustserver_path, l_name=None, prefer_session=None):
+    sessions = tmux_list_sessions(l_name)
     if not sessions:
         return None
+    if prefer_session and prefer_session in sessions:
+        return prefer_session
 
     script_name = os.path.basename(rustserver_path)  # usually "rustserver"
     identity = str(cfg.get("identity") or "").strip()
@@ -730,12 +813,12 @@ def choose_tmux_target(cfg, rustserver_path):
 
     return None
 
-def tmux_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
+def tmux_send_line(target_session, line, fp=None, dry_run=False, timeout=5, l_name=None):
     """
     Send a line to the server console via tmux send-keys.
     """
     if dry_run:
-        log(f"DRY_RUN: would tmux send-keys -t {target_session} '{line}' C-m", fp)
+        log(f"DRY_RUN: would {' '.join(tmux_base_cmd(l_name))} send-keys -t {target_session} '{line}' C-m", fp)
         return True
 
     if not shutil.which("tmux"):
@@ -744,7 +827,7 @@ def tmux_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
 
     try:
         p = subprocess.run(
-            ["tmux", "send-keys", "-t", target_session, line, "C-m"],
+            tmux_base_cmd(l_name) + ["send-keys", "-t", target_session, line, "C-m"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -840,10 +923,22 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
     cmd = template.format(delay=delay) if "{delay}" in template else f"{template} {delay}"
 
     # Try tmux first
-    t_sessions = tmux_list_sessions()
-    t_target = choose_tmux_target(cfg, rustserver_path) if t_sessions is not None else None
+    l_name, prefer_session = detect_lgsm_tmux_context(cfg, fp=fp)
+
+    t_sessions = tmux_list_sessions(l_name)
+    t_target = choose_tmux_target(
+        cfg, rustserver_path,
+        l_name=l_name,
+        prefer_session=prefer_session
+    ) if t_sessions is not None else None
+
     if t_target:
-        return tmux_send_line(t_target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
+        return tmux_send_line(
+            t_target, cmd,
+            fp=fp,
+            dry_run=cfg.get("dry_run", False),
+            l_name=l_name
+        )
 
     # Fallback to screen
     s_sessions = screen_list_sessions()
@@ -964,7 +1059,14 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     if not cfg_ok:
         log(f"SMOOTH_TEST: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
 
-    t_sessions = tmux_list_sessions()
+    # Detect LinuxGSM tmux socket/session (tmux -L <name> ... -s <session>)
+    l_name, prefer_session = detect_lgsm_tmux_context(cfg, fp=fp)
+    if l_name:
+        log(f"SMOOTH_TEST: detected LinuxGSM tmux server (-L): {l_name}", fp)
+    if prefer_session:
+        log(f"SMOOTH_TEST: detected LinuxGSM tmux session (-s): {prefer_session}", fp)
+
+    t_sessions = tmux_list_sessions(l_name)
     s_sessions = screen_list_sessions()
     log(f"SMOOTH_TEST: tmux sessions: {t_sessions}", fp)
     log(f"SMOOTH_TEST: screen sessions: {s_sessions}", fp)
@@ -973,7 +1075,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     target = None
 
     if t_sessions is not None:
-        target = choose_tmux_target(cfg, rustserver_path)
+        target = choose_tmux_target(cfg, rustserver_path, l_name=l_name, prefer_session=prefer_session)
         if target:
             backend = "tmux"
 
@@ -994,7 +1096,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     if send:
         log("SMOOTH_TEST: SENDING command (this may start a restart countdown!)", fp)
         if backend == "tmux":
-            ok_send = tmux_send_line(target, cmd, fp=fp, dry_run=False)
+            ok_send = tmux_send_line(target, cmd, fp=fp, dry_run=False, l_name=l_name)
         else:
             ok_send = screen_send_line(target, cmd, fp=fp, dry_run=False)
 
