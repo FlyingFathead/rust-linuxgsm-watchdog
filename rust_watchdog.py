@@ -7,6 +7,7 @@
 # =============================================================
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from datetime import datetime
 __version__ = "0.2.1"
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CFG_FOR_HINTS = None
 DEFAULTS = {
     "server_dir": "/home/rustserver",
     "identity": "rustserver",
@@ -167,7 +169,83 @@ def fatal(msg, code=2, fp=None):
             log(f"FATAL: {msg}", fp)
     except Exception:
         pass
+
     print(f"FATAL: {msg}", file=sys.stderr)
+
+    # --- extra "you probably meant to do X" hints ---
+    try:
+        u = getpass.getuser()
+    except Exception:
+        u = "unknown"
+    try:
+        uid = os.geteuid()
+        gid = os.getegid()
+    except Exception:
+        uid = gid = "unknown"
+
+    cfg = CFG_FOR_HINTS or {}
+    server_dir = (cfg.get("server_dir") or "").strip()
+    logfile = (cfg.get("logfile") or "").strip()
+    lockfile = (cfg.get("lockfile") or "").strip()
+    pause_file = (cfg.get("pause_file") or "").strip()
+
+    sep = "-" * 72
+    print("", file=sys.stderr)
+    print(sep, file=sys.stderr)
+    print("rust-linuxgsm-watchdog: startup failed", file=sys.stderr)
+    print(sep, file=sys.stderr)
+
+    print(f"Reason: {msg}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    # Best-effort runtime context
+    print(f"User: {u} (uid={uid} gid={gid})", file=sys.stderr)
+    try:
+        print(f"CWD:  {os.getcwd()}", file=sys.stderr)
+    except Exception:
+        pass
+
+    if server_dir:
+        print(f"server_dir: {server_dir}", file=sys.stderr)
+        print("  - must exist, be accessible, and contain an executable './rustserver'", file=sys.stderr)
+
+    if logfile:
+        print(f"logfile:   {logfile}", file=sys.stderr)
+        print("  - parent directory must be writable by the current user", file=sys.stderr)
+
+    if lockfile:
+        print(f"lockfile:  {lockfile}", file=sys.stderr)
+
+    if pause_file:
+        print(f"pause_file:{pause_file}", file=sys.stderr)
+
+    print("", file=sys.stderr)
+    print(sep, file=sys.stderr)
+    print("How to fix (recommended)", file=sys.stderr)
+    print(sep, file=sys.stderr)
+
+    print("Edit your config JSON so all paths make sense on THIS machine.", file=sys.stderr)
+    print("Minimal example (use real paths):", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("{", file=sys.stderr)
+    print('  "server_dir": "/path/to/your/linuxgsm/rustserver/dir",', file=sys.stderr)
+    print('  "logfile": "./log/rust_watchdog.log",', file=sys.stderr)
+    print('  "lockfile": "/tmp/rustserver_watchdog.lock",', file=sys.stderr)
+    print('  "pause_file": ""', file=sys.stderr)
+    print("}", file=sys.stderr)
+
+    print("", file=sys.stderr)
+    print("Then create the local log dir if you used ./log:", file=sys.stderr)
+    print("  mkdir -p ./log", file=sys.stderr)
+
+    print("", file=sys.stderr)
+    print(sep, file=sys.stderr)
+    print("If this IS the LinuxGSM host", file=sys.stderr)
+    print(sep, file=sys.stderr)
+    print("Run it via systemd as the LinuxGSM user so permissions match your server install.", file=sys.stderr)
+    print("(See rust-watchdog.service in the repo.)", file=sys.stderr)
+    print(sep, file=sys.stderr)
+
     raise SystemExit(code)
 
 def ensure_dir(path, what, fp=None):
@@ -537,6 +615,9 @@ def main():
         return
 
     cfg = load_cfg(args.config)
+    global CFG_FOR_HINTS
+    CFG_FOR_HINTS = cfg
+    
     server_dir = os.path.abspath(cfg["server_dir"])
     rustserver_path = os.path.join(server_dir, "rustserver")
 
