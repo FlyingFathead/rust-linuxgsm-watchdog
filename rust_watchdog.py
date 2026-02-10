@@ -21,6 +21,8 @@ DEFAULTS = {
     "lockfile": "/tmp/rustserver_watchdog.lock",
     "logfile": "/home/rustserver/log/rust_watchdog.log",
 
+    "pause_file": "",  # e.g. "/home/rustserver/.watchdog_pause" (empty = disabled)
+
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,
 
@@ -322,9 +324,25 @@ def main():
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
 
     down_streak = 0
+    paused = False
 
     try:
         while True:
+            pause_file = cfg.get("pause_file")
+
+            if pause_file and os.path.exists(pause_file):
+                if not paused:
+                    log(f"PAUSED: {pause_file} exists -- skipping checks/recovery", fp)
+                    paused = True
+                if args.once:
+                    break
+                time.sleep(int(cfg["interval_seconds"]))
+                continue
+            else:
+                if paused:
+                    log(f"UNPAUSED: {pause_file} removed -- resuming", fp)
+                    paused = False
+
             state, evidence = health_report(cfg, server_dir, rustserver_path, fp)
             log(f"HEALTH: {state}", fp)
             for line in evidence:

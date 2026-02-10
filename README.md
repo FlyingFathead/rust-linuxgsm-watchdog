@@ -1,8 +1,8 @@
 # rust-linuxgsm-watchdog
 
-A small, boring, stdlib-only watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM**.
+A small, boring, stdlib-only watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM** to keep your server up, running and up to date in a more automated way than what [LinuxGSM](https://linuxgsm.com/) offers by default.
 
-It polls server health, and if the server is *confirmed down*, it runs a recovery sequence:
+The watchdog polls server health, and if the server is *confirmed down*, it runs a recovery sequence:
 
 1) `./rustserver update`  
 2) `./rustserver mu` (Oxide update via LinuxGSM mods)  
