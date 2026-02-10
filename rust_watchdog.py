@@ -698,11 +698,11 @@ def smoothrestarter_available(server_dir, cfg=None):
 
 def tmux_list_sessions():
     if not shutil.which("tmux"):
-        return []
+        return None  # tmux missing
     try:
         out = subprocess.check_output(["tmux", "ls"], stderr=subprocess.STDOUT, text=True)
     except subprocess.CalledProcessError:
-        return []  # rc=1 when no sessions
+        return []  # tmux exists, but no sessions (rc=1)
     sessions = []
     for line in out.splitlines():
         if ":" in line:
@@ -762,11 +762,72 @@ def tmux_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
         log(f"SMOOTH_BRIDGE: tmux send-keys error: {e}", fp)
         return False
 
+def screen_list_sessions():
+    if not shutil.which("screen"):
+        return None  # screen missing
+    try:
+        out = subprocess.check_output(["screen", "-ls"], stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as e:
+        out = e.output or ""
+    sessions = []
+    for line in out.splitlines():
+        line = line.strip()
+        # Typical: "12345.rustserver  (Detached)"
+        m = re.match(r"^(\d+\.\S+)\s", line)
+        if m:
+            sessions.append(m.group(1))
+    return sessions
+
+def choose_screen_target(cfg, rustserver_path):
+    sessions = screen_list_sessions()
+    if not sessions:
+        return None
+
+    identity = str(cfg.get("identity") or "").strip()
+
+    for s in sessions:
+        if identity and identity in s:
+            return s
+
+    for s in sessions:
+        if "rustserver" in s.lower():
+            return s
+
+    if len(sessions) == 1:
+        return sessions[0]
+
+    return sessions[0]
+
+def screen_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
+    if dry_run:
+        log(f"DRY_RUN: would screen -S {target_session} -p 0 -X stuff '{line}\\r'", fp)
+        return True
+
+    if not shutil.which("screen"):
+        log("SMOOTH_BRIDGE: screen not found in PATH", fp)
+        return False
+
+    try:
+        p = subprocess.run(
+            ["screen", "-S", target_session, "-p", "0", "-X", "stuff", line + "\r"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+        if p.returncode != 0:
+            log(f"SMOOTH_BRIDGE: screen stuff failed rc={p.returncode}: {strip_ansi(p.stdout).strip()}", fp)
+            return False
+        log(f"SMOOTH_BRIDGE: sent to screen '{target_session}': {line}", fp)
+        return True
+    except subprocess.TimeoutExpired:
+        log("SMOOTH_BRIDGE: screen stuff timed out", fp)
+        return False
+    except Exception as e:
+        log(f"SMOOTH_BRIDGE: screen stuff error: {e}", fp)
+        return False
+
 def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
-    """
-    Ask SmoothRestarter to initiate a graceful restart countdown.
-    Returns True if the request was sent successfully.
-    """
     ok, cfg_ok, cfg_path, plugin_path = smoothrestarter_available(server_dir, cfg)
     if not ok:
         log(f"SMOOTH_BRIDGE: enabled but SmoothRestarter plugin not found: {plugin_path}", fp)
@@ -776,18 +837,22 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
 
     delay = int(cfg.get("smoothrestarter_restart_delay_seconds", 300))
     template = (cfg.get("smoothrestarter_console_cmd") or "srestart restart {delay}").strip()
+    cmd = template.format(delay=delay) if "{delay}" in template else f"{template} {delay}"
 
-    if "{delay}" in template:
-        cmd = template.format(delay=delay)
-    else:
-        cmd = f"{template} {delay}"
+    # Try tmux first
+    t_sessions = tmux_list_sessions()
+    t_target = choose_tmux_target(cfg, rustserver_path) if t_sessions is not None else None
+    if t_target:
+        return tmux_send_line(t_target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
 
-    target = choose_tmux_target(cfg, rustserver_path)
-    if not target:
-        log(f"SMOOTH_BRIDGE: could not find tmux session to target. tmux ls => {tmux_list_sessions()}", fp)
-        return False
+    # Fallback to screen
+    s_sessions = screen_list_sessions()
+    s_target = choose_screen_target(cfg, rustserver_path) if s_sessions is not None else None
+    if s_target:
+        return screen_send_line(s_target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
 
-    return tmux_send_line(target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
+    log(f"SMOOTH_BRIDGE: no console session found. tmux={t_sessions} screen={s_sessions}", fp)
+    return False
 
 def check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp=None):
     """
@@ -899,23 +964,42 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     if not cfg_ok:
         log(f"SMOOTH_TEST: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
 
-    sessions = tmux_list_sessions()
-    log(f"SMOOTH_TEST: tmux sessions: {sessions}", fp)
+    t_sessions = tmux_list_sessions()
+    s_sessions = screen_list_sessions()
+    log(f"SMOOTH_TEST: tmux sessions: {t_sessions}", fp)
+    log(f"SMOOTH_TEST: screen sessions: {s_sessions}", fp)
 
-    target = choose_tmux_target(cfg, rustserver_path)
+    backend = None
+    target = None
+
+    if t_sessions is not None:
+        target = choose_tmux_target(cfg, rustserver_path)
+        if target:
+            backend = "tmux"
+
+    if not target and s_sessions is not None:
+        target = choose_screen_target(cfg, rustserver_path)
+        if target:
+            backend = "screen"
+
     if not target:
-        log("SMOOTH_TEST: FAIL: could not pick a tmux target session", fp)
+        log("SMOOTH_TEST: FAIL: could not pick a console target session (tmux/screen)", fp)
         return 2
 
-    log(f"SMOOTH_TEST: chosen tmux target: {target}", fp)
+    log(f"SMOOTH_TEST: chosen backend: {backend} target: {target}", fp)
 
     cmd = build_smoothrestarter_cmd(cfg)
     log(f"SMOOTH_TEST: would send: {cmd}", fp)
 
     if send:
-        log("SMOOTH_TEST: SENDING command via tmux (this may start a restart countdown!)", fp)
-        if not tmux_send_line(target, cmd, fp=fp, dry_run=False):
-            log("SMOOTH_TEST: FAIL: tmux send failed", fp)
+        log("SMOOTH_TEST: SENDING command (this may start a restart countdown!)", fp)
+        if backend == "tmux":
+            ok_send = tmux_send_line(target, cmd, fp=fp, dry_run=False)
+        else:
+            ok_send = screen_send_line(target, cmd, fp=fp, dry_run=False)
+
+        if not ok_send:
+            log(f"SMOOTH_TEST: FAIL: {backend} send failed", fp)
             return 2
         log("SMOOTH_TEST: OK: command sent", fp)
     else:
@@ -973,7 +1057,7 @@ def main():
     ap.add_argument("--test-smoothrestarter", action="store_true",
                     help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
-                    help="same as --test-smoothrestarter but actually sends the command via tmux; then exit")
+                    help="same as --test-smoothrestarter but actually sends the command via tmux or screen; then exit")
     args = ap.parse_args()
 
     if args.version:
