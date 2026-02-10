@@ -7,13 +7,12 @@ Wants=network-online.target
 Type=simple
 User=rustserver
 Group=rustserver
-WorkingDirectory=/home/rustserver
-ExecStart=/usr/bin/python3 /home/rustserver/rust_watchdog.py --config /home/rustserver/rust_watchdog.json
+WorkingDirectory=/home/rustserver/rust-linuxgsm-watchdog
+ExecStart=/usr/bin/python3 /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
 Restart=always
 RestartSec=5
 KillMode=process
 
-# Hardening (optional)
 NoNewPrivileges=true
 PrivateTmp=true
 

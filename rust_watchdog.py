@@ -20,6 +20,7 @@ from datetime import datetime
 
 __version__ = "0.2.0"
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
     "server_dir": "/home/rustserver",
     "identity": "rustserver",
@@ -28,9 +29,12 @@ DEFAULTS = {
     "cooldown_seconds": 120,
 
     "lockfile": "/tmp/rustserver_watchdog.lock",
-    "logfile": "/home/rustserver/log/rust_watchdog.log",
 
-    "pause_file": "",  # e.g. "/home/rustserver/.watchdog_pause" (empty = disabled)
+    # NOTE: this must be a FILE path, not a directory
+    "logfile": "/home/rustserver/rust-linuxgsm-watchdog/log/rust_watchdog.log",
+
+    # Pause feature enabled by default (only pauses if the file exists)
+    "pause_file": "/home/rustserver/rust-linuxgsm-watchdog/.watchdog_pause",
 
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,

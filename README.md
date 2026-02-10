@@ -87,6 +87,14 @@ Notes:
 
 ## Usage
 
+First, clone the repo i.e. with:
+
+```bash
+cd &&
+git clone https://github.com/FlyingFathead/rust-linuxgsm-watchdog &&
+cd rust-linuxgsm-watchdog
+```
+
 ### One-shot (manual test)
 
 Run one loop iteration and exit:
@@ -124,13 +132,12 @@ Wants=network-online.target
 Type=simple
 User=rustserver
 Group=rustserver
-WorkingDirectory=/home/rustserver
-ExecStart=/usr/bin/python3 /home/rustserver/rust_watchdog.py --config /home/rustserver/rust_watchdog.json
+WorkingDirectory=/home/rustserver/rust-linuxgsm-watchdog
+ExecStart=/usr/bin/python3 /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
 Restart=always
 RestartSec=5
 KillMode=process
 
-# Hardening (optional, but usually safe)
 NoNewPrivileges=true
 PrivateTmp=true
 
