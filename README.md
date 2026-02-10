@@ -54,7 +54,7 @@ Example `rust_watchdog.json`:
 {
   "server_dir": "/home/rustserver",
   "identity": "rustserver",
-  "pause_file": "/home/rustserver/.watchdog_pause",
+  "pause_file": "/home/rustserver/rust-linuxgsm-watchdog/.watchdog_pause",
   "dry_run": false,
 
   "interval_seconds": 10,

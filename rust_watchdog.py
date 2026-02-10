@@ -18,7 +18,7 @@ import sys
 import time
 from datetime import datetime
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
@@ -527,7 +527,7 @@ def health_report(cfg, server_dir, rustserver_path, fp=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="./rust_watchdog.json")
+    ap.add_argument("--config", default=os.path.join(PROJECT_DIR, "rust_watchdog.json"))
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     args = ap.parse_args()
@@ -539,6 +539,9 @@ def main():
     cfg = load_cfg(args.config)
     server_dir = os.path.abspath(cfg["server_dir"])
     rustserver_path = os.path.join(server_dir, "rustserver")
+
+    if not (cfg.get("check_process_identity") or cfg.get("check_tcp_rcon") or cfg.get("check_lgsm_details")):
+        fatal("config: at least one health check must be enabled", fp=fp)
 
     # Clean shutdown behavior under systemd (SIGTERM) and Ctrl-C (SIGINT)
     signal.signal(signal.SIGTERM, _request_stop)
