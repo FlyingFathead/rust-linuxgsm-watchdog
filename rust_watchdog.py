@@ -101,6 +101,35 @@ STATUS_RE = re.compile(r"^\s*Status:\s*(\S+)\s*$", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 UPDATE_YES_RE = re.compile(r"\b(update available|update required|available:\s*yes)\b", re.IGNORECASE)
 UPDATE_NO_RE  = re.compile(r"\b(no update available|available:\s*no|already up to date|up to date)\b", re.IGNORECASE)
+RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
+# ---------------------------------------------------------
+# Optional dependency: websocket-client (for Rust WebRCON)
+# ---------------------------------------------------------
+_WS_CACHE = {"checked": False, "ok": False, "err": ""}
+
+def websocket_dep_status():
+    """
+    Returns (ok: bool, err: str).
+    Cached so we don't import-spam or repeat warnings every loop.
+    """
+    if _WS_CACHE["checked"]:
+        return (_WS_CACHE["ok"], _WS_CACHE["err"])
+
+    _WS_CACHE["checked"] = True
+    try:
+        from websocket import create_connection  # noqa: F401
+        _WS_CACHE["ok"] = True
+        _WS_CACHE["err"] = ""
+    except Exception as e:
+        _WS_CACHE["ok"] = False
+        _WS_CACHE["err"] = str(e)
+
+    return (_WS_CACHE["ok"], _WS_CACHE["err"])
+
+def redact_secrets(s: str) -> str:
+    if not s:
+        return s
+    return RCON_PW_RE.sub(r'\1"<redacted>"', s)
 
 # Set to True when systemd/user requests a stop (SIGTERM/SIGINT)
 stop_requested = False
@@ -649,6 +678,95 @@ def parse_update_available(out: str):
         return True
     return None
 
+def extract_rcon_from_cmdline_line(line: str):
+    """
+    Returns (rcon_ip, rcon_port, rcon_password) or (None, None, None)
+    """
+    try:
+        toks = shlex.split(line)
+    except Exception:
+        return (None, None, None)
+
+    # Drop leading PID from pgrep -af
+    if toks and toks[0].isdigit():
+        toks = toks[1:]
+
+    def get_arg(name):
+        # arguments look like: +rcon.ip 127.0.0.1
+        try:
+            i = toks.index(name)
+            if i + 1 < len(toks):
+                return toks[i + 1]
+        except ValueError:
+            return None
+        return None
+
+    ip = get_arg("+rcon.ip")
+    port = get_arg("+rcon.port")
+    pw = get_arg("+rcon.password")
+
+    # Normalize
+    if ip == "0.0.0.0":
+        ip = "127.0.0.1"
+
+    try:
+        port = int(port) if port is not None else None
+    except Exception:
+        port = None
+
+    return (ip, port, pw)
+
+def detect_rcon_from_identity(cfg):
+    identity = str(cfg.get("identity") or "").strip()
+    if not identity:
+        return (None, None, None)
+
+    needle1 = f"+server.identity {identity}"
+    needle2 = f'+server.identity "{identity}"'
+
+    try:
+        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+    except Exception:
+        return (None, None, None)
+
+    for line in lines:
+        if needle1 not in line and needle2 not in line:
+            continue
+        ip, port, pw = extract_rcon_from_cmdline_line(line)
+        if ip and port and pw:
+            return (ip, port, pw)
+
+    return (None, None, None)
+
+def rcon_send(cfg, command: str, fp=None):
+    """
+    Send a command via Rust WebRCON and return (ok, response_text).
+    """
+    ip, port, pw = detect_rcon_from_identity(cfg)
+    if not (ip and port and pw):
+        return (False, "RCON autodetect failed (missing ip/port/password)")
+
+    ok_ws, ws_err = websocket_dep_status()
+    if not ok_ws:
+        return (False, f"websocket-client not available: {ws_err}")
+
+    from websocket import create_connection
+
+    url = f"ws://{ip}:{port}/{pw}"
+
+    ident = int(time.time())  # unique-ish
+    payload = {"Identifier": ident, "Message": command, "Name": "watchdog"}
+
+    try:
+        ws = create_connection(url, timeout=5)
+        ws.send(json.dumps(payload))
+        ws.settimeout(3)
+        resp = ws.recv()
+        ws.close()
+        return (True, resp)
+    except Exception as e:
+        return (False, f"RCON send failed: {e}")
+
 def smoothrestarter_paths(server_dir, cfg=None):
     """
     SmoothRestarter defaults (uMod), under LinuxGSM:
@@ -911,6 +1029,16 @@ def screen_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
         return False
 
 def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
+    """
+    Ask SmoothRestarter to schedule a restart.
+
+    Priority order:
+      1) WebRCON (requires python dep: websocket-client)
+      2) tmux send-keys (LinuxGSM console)
+      3) screen stuff (fallback)
+
+    Returns True if we successfully sent the command via ANY backend.
+    """
     ok, cfg_ok, cfg_path, plugin_path = smoothrestarter_available(server_dir, cfg)
     if not ok:
         log(f"SMOOTH_BRIDGE: enabled but SmoothRestarter plugin not found: {plugin_path}", fp)
@@ -922,31 +1050,59 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
     template = (cfg.get("smoothrestarter_console_cmd") or "srestart restart {delay}").strip()
     cmd = template.format(delay=delay) if "{delay}" in template else f"{template} {delay}"
 
-    # Try tmux first
+    # ---------------------------------------------------------
+    # 1) Try WebRCON first (optional dependency: websocket-client)
+    # ---------------------------------------------------------
+    ok_ws, ws_err = websocket_dep_status()
+    if not ok_ws:
+        log(
+            f"SMOOTH_BRIDGE: couldn't load websocket-client ({ws_err}) -- "
+            f"RCON bridge disabled; falling back to tmux/screen",
+            fp
+        )
+    else:
+        ok_r, resp = rcon_send(cfg, cmd, fp=fp)
+        if ok_r:
+            log(f"SMOOTH_BRIDGE: RCON OK: {strip_ansi(resp).strip()}", fp)
+            return True
+        log(f"SMOOTH_BRIDGE: RCON failed: {resp} -- falling back to tmux/screen", fp)
+
+    # ---------------------------------------------------------
+    # 2) Try tmux (LinuxGSM console)
+    # ---------------------------------------------------------
     l_name, prefer_session = detect_lgsm_tmux_context(cfg, fp=fp)
 
     t_sessions = tmux_list_sessions(l_name)
-    t_target = choose_tmux_target(
-        cfg, rustserver_path,
-        l_name=l_name,
-        prefer_session=prefer_session
-    ) if t_sessions is not None else None
+    t_target = (
+        choose_tmux_target(
+            cfg, rustserver_path,
+            l_name=l_name,
+            prefer_session=prefer_session
+        )
+        if t_sessions is not None else None
+    )
 
     if t_target:
-        return tmux_send_line(
+        ok_t = tmux_send_line(
             t_target, cmd,
             fp=fp,
             dry_run=cfg.get("dry_run", False),
             l_name=l_name
         )
+        if ok_t:
+            return True
 
-    # Fallback to screen
+    # ---------------------------------------------------------
+    # 3) Fallback to screen
+    # ---------------------------------------------------------
     s_sessions = screen_list_sessions()
     s_target = choose_screen_target(cfg, rustserver_path) if s_sessions is not None else None
     if s_target:
-        return screen_send_line(s_target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
+        ok_s = screen_send_line(s_target, cmd, fp=fp, dry_run=cfg.get("dry_run", False))
+        if ok_s:
+            return True
 
-    log(f"SMOOTH_BRIDGE: no console session found. tmux={t_sessions} screen={s_sessions}", fp)
+    log(f"SMOOTH_BRIDGE: no console session found / send failed. tmux={t_sessions} screen={s_sessions}", fp)
     return False
 
 def check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp=None):
@@ -998,7 +1154,7 @@ def check_process_identity(identity, fp=None):
             hits.append(line)
 
     if hits:
-        return (True, f"matched process: {hits[0]}")
+        return (True, f"matched process: {redact_secrets(hits[0])}")
     return (False, f"RustDedicated running, but identity '{identity}' not found in cmdline")
 
 def check_tcp(host, port, timeout_s):
@@ -1051,6 +1207,12 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
     log(f"SMOOTH_TEST: plugin path: {sr_plugin}", fp)
     log(f"SMOOTH_TEST: config path: {sr_cfg}", fp)
+
+    ok_ws, ws_err = websocket_dep_status()
+    if not ok_ws:
+        log(f"SMOOTH_TEST: websocket-client missing ({ws_err}) -- RCON path unavailable", fp)
+    else:
+        log("SMOOTH_TEST: websocket-client OK -- RCON path available", fp)
 
     if not ok:
         log(f"SMOOTH_TEST: FAIL: SmoothRestarter plugin missing. Get it from: {SMOOTHRESTARTER_URL}", fp)
@@ -1156,6 +1318,8 @@ def main():
     ap.add_argument("--config", default=os.path.join(PROJECT_DIR, "rust_watchdog.json"))
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--version", action="store_true", help="print version and exit")
+    ap.add_argument("--test-rcon-say", metavar="MSG",
+                help="send a global chat message via RCON (no plugins required) and exit")
     ap.add_argument("--test-smoothrestarter", action="store_true",
                     help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
@@ -1181,6 +1345,23 @@ def main():
 
     # Pre-flight checklist (also opens logfile if enabled)
     fp = preflight_or_die(cfg, server_dir, rustserver_path)
+
+    # One-time dependency hint
+    ok_ws, ws_err = websocket_dep_status()
+    if not ok_ws:
+        log(
+            f"DEPS: websocket-client missing ({ws_err}) -- RCON features disabled "
+            f"(--test-rcon-say and RCON SmoothRestarter bridge won't work).",
+            fp
+        )
+
+    # test rcon
+    if args.test_rcon_say:
+        msg = args.test_rcon_say.replace('"', '\\"')
+        ok, resp = rcon_send(cfg, f'global.say "{msg}"', fp=fp)
+        log(f"RCON_SAY: {'OK' if ok else 'FAIL'} -- {resp}", fp)
+        if fp: fp.close()
+        raise SystemExit(0 if ok else 2)
 
     # Bridge test mode (exit immediately after)
     if args.test_smoothrestarter or args.test_smoothrestarter_send:

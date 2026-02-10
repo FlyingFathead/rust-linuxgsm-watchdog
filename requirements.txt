@@ -1,0 +1,2 @@
+# Runtime deps (enables WebRCON features: --test-rcon-say, SmoothRestarter RCON path)
+websocket-client>=1.6
