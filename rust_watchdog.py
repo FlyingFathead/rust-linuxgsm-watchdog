@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -880,6 +880,49 @@ def check_lgsm_details(server_dir, rustserver_path, timeout_s):
 def inside_screen_or_tmux():
     return bool(os.environ.get("STY")) or bool(os.environ.get("TMUX"))
 
+def build_smoothrestarter_cmd(cfg):
+    delay = int(cfg.get("smoothrestarter_restart_delay_seconds", 300))
+    template = (cfg.get("smoothrestarter_console_cmd") or "srestart restart {delay}").strip()
+    if "{delay}" in template:
+        return template.format(delay=delay)
+    return f"{template} {delay}"
+
+def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=False):
+    ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
+    log(f"SMOOTH_TEST: plugin path: {sr_plugin}", fp)
+    log(f"SMOOTH_TEST: config path: {sr_cfg}", fp)
+
+    if not ok:
+        log(f"SMOOTH_TEST: FAIL: SmoothRestarter plugin missing. Get it from: {SMOOTHRESTARTER_URL}", fp)
+        return 2
+
+    if not cfg_ok:
+        log(f"SMOOTH_TEST: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
+
+    sessions = tmux_list_sessions()
+    log(f"SMOOTH_TEST: tmux sessions: {sessions}", fp)
+
+    target = choose_tmux_target(cfg, rustserver_path)
+    if not target:
+        log("SMOOTH_TEST: FAIL: could not pick a tmux target session", fp)
+        return 2
+
+    log(f"SMOOTH_TEST: chosen tmux target: {target}", fp)
+
+    cmd = build_smoothrestarter_cmd(cfg)
+    log(f"SMOOTH_TEST: would send: {cmd}", fp)
+
+    if send:
+        log("SMOOTH_TEST: SENDING command via tmux (this may start a restart countdown!)", fp)
+        if not tmux_send_line(target, cmd, fp=fp, dry_run=False):
+            log("SMOOTH_TEST: FAIL: tmux send failed", fp)
+            return 2
+        log("SMOOTH_TEST: OK: command sent", fp)
+    else:
+        log("SMOOTH_TEST: OK: wiring looks good (dry test)", fp)
+
+    return 0
+
 def health_report(cfg, server_dir, rustserver_path, fp=None):
     """
     Returns (state, evidence_lines)
@@ -927,6 +970,10 @@ def main():
     ap.add_argument("--config", default=os.path.join(PROJECT_DIR, "rust_watchdog.json"))
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--version", action="store_true", help="print version and exit")
+    ap.add_argument("--test-smoothrestarter", action="store_true",
+                    help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
+    ap.add_argument("--test-smoothrestarter-send", action="store_true",
+                    help="same as --test-smoothrestarter but actually sends the command via tmux; then exit")
     args = ap.parse_args()
 
     if args.version:
@@ -948,6 +995,15 @@ def main():
 
     # Pre-flight checklist (also opens logfile if enabled)
     fp = preflight_or_die(cfg, server_dir, rustserver_path)
+
+    # Bridge test mode (exit immediately after)
+    if args.test_smoothrestarter or args.test_smoothrestarter_send:
+        rc = test_smoothrestarter_bridge(
+            cfg, server_dir, rustserver_path, fp=fp, send=bool(args.test_smoothrestarter_send)
+        )
+        if fp:
+            fp.close()
+        raise SystemExit(rc)
 
     if not (cfg.get("check_process_identity") or cfg.get("check_tcp_rcon") or cfg.get("check_lgsm_details")):
         fatal("config: at least one health check must be enabled", fp=fp)
