@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust LinuxGSM watchdog (update + oxide + restart)
+Description=Rust LinuxGSM watchdog (update + mods-update + restart)
 After=network-online.target
 Wants=network-online.target
 

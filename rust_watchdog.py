@@ -30,7 +30,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +61,6 @@ DEFAULTS = {
     "forced_wipe_tz": "Europe/London",
     "forced_wipe_hour": 19,
     "forced_wipe_minute": 0,
-    "forced_wipe_lead_hours": 24,
 
     # How long before wipe we consider it "soon" (lead time)
     "forced_wipe_lead_hours": 24,
@@ -694,14 +693,14 @@ def fatal(msg, code=2, fp=None):
     print("", file=sys.stderr)
     print("{", file=sys.stderr)
     print('  "server_dir": "/path/to/your/linuxgsm/rustserver/dir",', file=sys.stderr)
-    print('  "logfile": "./log/rust_watchdog.log",', file=sys.stderr)
-    print('  "lockfile": "/tmp/rustserver_watchdog.lock",', file=sys.stderr)
-    print('  "pause_file": ""', file=sys.stderr)
+    print('  "logfile": "./data/log/rust_watchdog.log",', file=sys.stderr)
+    print('  "lockfile": "./data/lock/rust_watchdog.lock",', file=sys.stderr)
+    print('  "pause_file": "./data/.watchdog_pause"', file=sys.stderr)
     print("}", file=sys.stderr)
 
     print("", file=sys.stderr)
-    print("Then create the local log dir if you used ./log:", file=sys.stderr)
-    print("  mkdir -p ./log", file=sys.stderr)
+    print("Then create the local data dirs if needed:", file=sys.stderr)
+    print("  mkdir -p ./data/log ./data/lock", file=sys.stderr)
 
     print("", file=sys.stderr)
     print(sep, file=sys.stderr)

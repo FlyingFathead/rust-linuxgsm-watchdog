@@ -202,9 +202,9 @@ You’re running recovery from inside `screen` or another multiplexer. Run the w
 
 The watchdog uses a lock to prevent multiple instances.
 
-If you see:
+If you see a lock complaint, it will mention your configured lockfile path, e.g.:
 
-* `Lock exists at /tmp/rustserver_watchdog.lock`
+* `Lock exists at /home/rustserver/rust-linuxgsm-watchdog/data/lock/rust_watchdog.lock`
 
 Check if it’s actually running:
 
@@ -215,7 +215,7 @@ pgrep -af rust_watchdog.py
 If nothing is running and the lock is stale:
 
 ```bash
-sudo rm -f /tmp/rustserver_watchdog.lock
+rm -f /home/rustserver/rust-linuxgsm-watchdog/data/lock/rust_watchdog.lock
 sudo systemctl restart rust-watchdog.service
 ```
 
@@ -322,6 +322,7 @@ Run the watchdog outside tmux/screen (systemd recommended) so recovery isn’t b
 ---
 
 ### History
+- v0.2.7 - small bugfixes
 - v0.2.6 - Implemented a standalone restart timer notification to the server when Smooth Restarter is not available and when we're watching for updates
   - The watchdog is now calculating a countdown to Facepunch's forced wipe day (by default, the first Thursday of every month at 19:00 GMT); pending restarts over updates are on hold by default that day until we're past the expected update time.
   - WIP: set wipe levels during forced wipe update-restarts.
