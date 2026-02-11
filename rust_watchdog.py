@@ -12,6 +12,7 @@ import argparse
 import getpass
 import json
 import os
+from pathlib import Path
 import re
 import select
 import shlex
@@ -30,7 +31,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,11 @@ DEFAULTS = {
 
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,
+
+    # watch for updates
+    "enable_update_watch": True,
+    "update_check_interval_seconds": 600,
+    "update_check_timeout": 60,
 
     # ---------------------------------------------------------
     # Forced wipe highlighter (Rust monthly forced wipe baseline)
@@ -132,6 +138,11 @@ DEFAULTS = {
     # ---------------------------------------------------------
     # Optional: SmoothRestarter bridge
     # ---------------------------------------------------------
+    # check for SmoothRestarter.cs integrity
+    "smoothrestarter_probe_strict": False,
+    "smoothrestarter_probe_min_score": 2,
+    "smoothrestarter_command": "sr",
+
     "enable_smoothrestarter_bridge": False,
     "smoothrestarter_restart_delay_seconds": 300,
     "smoothrestarter_console_cmd": "srestart restart {delay}",
@@ -189,6 +200,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 UPDATE_YES_RE = re.compile(r"\b(update available|update required|available:\s*yes)\b", re.IGNORECASE)
 UPDATE_NO_RE  = re.compile(r"\b(no update available|available:\s*no|already up to date|up to date)\b", re.IGNORECASE)
 RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
+
 # ---------------------------------------------------------
 # Optional dependency: websocket-client (for Rust WebRCON)
 # ---------------------------------------------------------
@@ -360,7 +372,10 @@ def forced_wipe_highlight_log(cfg, fp=None, *, now_utc: datetime = None):
     window = timedelta(minutes=max(0, window_m))
 
     dt = wipe_utc - now_utc
-    active = (dt <= lead) or (dt <= timedelta(0) and (now_utc - wipe_utc) <= window)
+    active = (
+    (timedelta(0) < dt <= lead) or
+    (dt <= timedelta(0) and (now_utc - wipe_utc) <= window)
+    )
 
     # show also system local time (whatever the host is using)
     wipe_local = wipe_utc.astimezone()
@@ -475,16 +490,15 @@ def norm_path(p, *, base_dir: str):
 def normalize_cfg_paths(cfg: dict, config_path: str) -> dict:
     base_dir = _cfg_base_dir(config_path)
 
-    # Paths that should behave consistently across systemd/manual:
     for k in ("server_dir", "lockfile", "logfile", "pause_file"):
         if k in cfg:
             cfg[k] = norm_path(cfg.get(k), base_dir=base_dir)
 
-    # Optional override paths (only normalize if user actually set them)
+    # SR overrides: relative to server_dir (LinuxGSM root)
     for k in ("smoothrestarter_config_path", "smoothrestarter_plugin_path"):
         v = cfg.get(k)
         if isinstance(v, str) and v.strip():
-            cfg[k] = norm_path(v, base_dir=base_dir)
+            cfg[k] = norm_path(v, base_dir=cfg["server_dir"])
 
     return cfg
 
@@ -693,14 +707,14 @@ def fatal(msg, code=2, fp=None):
     print("", file=sys.stderr)
     print("{", file=sys.stderr)
     print('  "server_dir": "/path/to/your/linuxgsm/rustserver/dir",', file=sys.stderr)
-    print('  "logfile": "./data/log/rust_watchdog.log",', file=sys.stderr)
+    print('  "logfile": "./log/rust_watchdog.log",', file=sys.stderr)
     print('  "lockfile": "./data/lock/rust_watchdog.lock",', file=sys.stderr)
     print('  "pause_file": "./data/.watchdog_pause"', file=sys.stderr)
     print("}", file=sys.stderr)
 
     print("", file=sys.stderr)
     print("Then create the local data dirs if needed:", file=sys.stderr)
-    print("  mkdir -p ./data/log ./data/lock", file=sys.stderr)
+    print("  mkdir -p ./log ./data/lock", file=sys.stderr)
 
     print("", file=sys.stderr)
     print(sep, file=sys.stderr)
@@ -892,6 +906,157 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
     log("PRECHECK: finished OK", fp)
     return fp
 
+# --------------------------------------------------------
+# Checks on SmoothRestarter integrity
+# --------------------------------------------------------
+def _read_text_best_effort(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def smoothrestarter_probe_cs(sr_plugin_path: Path, *, min_score: int = 2):
+    """
+    Returns (looks_ok, score, matched[], notes[]).
+
+    "looks_ok" here means "kinda looks like SmoothRestarter" -- it's not a guarantee.
+    This should be WARN-only by default (do not use it to hard-fail unless user enables strict mode).
+    """
+    txt = _read_text_best_effort(sr_plugin_path)
+    notes = []
+    matched = []
+
+    if not txt.strip():
+        notes.append("SmoothRestarter.cs unreadable or empty")
+        return False, 0, matched, notes
+
+    # Keep these fairly stable + forgiving. Use regex so whitespace/refactors don't break us.
+    signatures = [
+        (r"\bnamespace\s+Oxide\.Plugins\b", "namespace Oxide.Plugins"),
+        (r'\[Info\(\s*"SmoothRestarter"\s*,', '[Info("SmoothRestarter", ...)]'),
+        (r"\bclass\s+SmoothRestarter\b", "class SmoothRestarter"),
+        (r"\bCovalencePlugin\b", "CovalencePlugin base"),
+        (r"\bAddCovalenceCommand\b", "AddCovalenceCommand usage"),
+        (r"\bsmoothrestarter\.(status|restart|cancel)\b", "permission strings"),
+    ]
+
+    score = 0
+    for pattern, label in signatures:
+        if re.search(pattern, txt, flags=re.IGNORECASE | re.MULTILINE):
+            matched.append(label)
+            score += 1
+
+    looks_ok = score >= min_score
+    if not looks_ok:
+        notes.append(
+            f"SmoothRestarter.cs signature score too low ({score}/{len(signatures)}). "
+            f"Matched: {matched or 'none'}"
+        )
+
+    return looks_ok, score, matched, notes
+
+def smoothrestarter_probe_config_commands(sr_cfg_path: Path, wanted_cmd: str):
+    """
+    Returns (ok, problems[]). Checks that watchdog's command alias exists in SmoothRestarter config.
+    """
+    problems = []
+    if not sr_cfg_path.exists():
+        problems.append(f"SmoothRestarter config missing: {sr_cfg_path} (may be first run)")
+        return True, problems  # warn-only
+
+    try:
+        data = json.loads(sr_cfg_path.read_text(encoding="utf-8", errors="ignore") or "{}")
+    except Exception as e:
+        problems.append(f"SmoothRestarter config unreadable/invalid JSON: {e}")
+        return False, problems
+
+    cmds = data.get("Commands")
+    if not isinstance(cmds, list) or not cmds:
+        problems.append('SmoothRestarter config has no "Commands" list; watchdog cannot verify alias')
+        return True, problems  # warn-only
+
+    if wanted_cmd not in cmds:
+        problems.append(
+            f'SmoothRestarter config Commands does not include "{wanted_cmd}". '
+            f"Available: {cmds}"
+        )
+        return False, problems
+
+    return True, problems
+
+
+def smoothrestarter_paths(server_dir, cfg=None):
+    """
+    SmoothRestarter defaults (uMod), under LinuxGSM:
+      {server_dir}/serverfiles/oxide/config/SmoothRestarter.json
+      {server_dir}/serverfiles/oxide/plugins/SmoothRestarter.cs
+
+    Overrides (optional):
+      cfg["smoothrestarter_config_path"]
+      cfg["smoothrestarter_plugin_path"]
+
+    If an override is relative, it's resolved relative to server_dir.
+    """
+    cfg = cfg or {}
+
+    def resolve(p):
+        p = (p or "").strip()
+        if not p:
+            return ""
+        p = os.path.expandvars(os.path.expanduser(p))
+        if not os.path.isabs(p):
+            p = os.path.abspath(os.path.join(server_dir, p))
+        return p
+
+    cfg_override = resolve(cfg.get("smoothrestarter_config_path"))
+    plugin_override = resolve(cfg.get("smoothrestarter_plugin_path"))
+
+    if cfg_override and plugin_override:
+        return (cfg_override, plugin_override)
+
+    base = os.path.join(server_dir, "serverfiles", "oxide")
+    default_cfg = os.path.join(base, "config", "SmoothRestarter.json")
+    default_plugin = os.path.join(base, "plugins", "SmoothRestarter.cs")
+
+    return (
+        cfg_override or default_cfg,
+        plugin_override or default_plugin,
+    )
+
+def smoothrestarter_available(server_dir: str, cfg: dict):
+    sr_cfg_s, sr_plugin_s = smoothrestarter_paths(server_dir, cfg)
+    sr_cfg = Path(sr_cfg_s)
+    sr_plugin = Path(sr_plugin_s)
+
+    strict_probe = bool(cfg.get("smoothrestarter_probe_strict", False))
+    min_score = int(cfg.get("smoothrestarter_probe_min_score", 2))
+
+    notes = []
+
+    if not sr_plugin.exists():
+        notes.append(f"SmoothRestarter plugin missing: {sr_plugin}")
+        return False, sr_cfg.exists(), str(sr_cfg), str(sr_plugin), notes
+
+    looks_ok, score, matched, probe_notes = smoothrestarter_probe_cs(sr_plugin, min_score=min_score)
+    notes.extend(probe_notes)
+    notes.append(f"SmoothRestarter.cs probe: score={score}, matched={matched}")
+
+    if strict_probe and not looks_ok:
+        notes.append("SmoothRestarter probe strict mode: treating low score as NOT OK")
+        return False, sr_cfg.exists(), str(sr_cfg), str(sr_plugin), notes
+
+    # command alias check (warn-only)
+    wanted_cmd = smoothrestarter_cmd_prefix(cfg)
+    cmd_ok, cmd_notes = smoothrestarter_probe_config_commands(sr_cfg, wanted_cmd)
+    notes.extend(cmd_notes)
+    if not cmd_ok:
+        notes.append("SmoothRestarter command alias check failed (warn-only).")
+
+    return True, sr_cfg.exists(), str(sr_cfg), str(sr_plugin), notes
+
+# --------------------------------------------------------
+# Command runners etc
+# --------------------------------------------------------
 def run_cmd(cmd, cwd, fp=None, timeout=None, dry_run=False):
     """
     Run a command, stream stdout live, and enforce timeout even if the process is silent.
@@ -1154,54 +1319,6 @@ def rcon_send(cfg, command: str, fp=None):
         except Exception:
             pass
 
-def smoothrestarter_paths(server_dir, cfg=None):
-    """
-    SmoothRestarter defaults (uMod), under LinuxGSM:
-      {server_dir}/serverfiles/oxide/config/SmoothRestarter.json
-      {server_dir}/serverfiles/oxide/plugins/SmoothRestarter.cs
-
-    Overrides (optional):
-      cfg["smoothrestarter_config_path"]
-      cfg["smoothrestarter_plugin_path"]
-
-    If an override is relative, it's resolved relative to server_dir.
-    """
-    cfg = cfg or {}
-
-    def resolve(p):
-        p = (p or "").strip()
-        if not p:
-            return ""
-        p = os.path.expandvars(os.path.expanduser(p))
-        if not os.path.isabs(p):
-            p = os.path.abspath(os.path.join(server_dir, p))
-        return p
-
-    cfg_override = resolve(cfg.get("smoothrestarter_config_path"))
-    plugin_override = resolve(cfg.get("smoothrestarter_plugin_path"))
-
-    if cfg_override and plugin_override:
-        return (cfg_override, plugin_override)
-
-    base = os.path.join(server_dir, "serverfiles", "oxide")
-    default_cfg = os.path.join(base, "config", "SmoothRestarter.json")
-    default_plugin = os.path.join(base, "plugins", "SmoothRestarter.cs")
-
-    return (
-        cfg_override or default_cfg,
-        plugin_override or default_plugin,
-    )
-
-def smoothrestarter_available(server_dir, cfg=None):
-    cfg_path, plugin_path = smoothrestarter_paths(server_dir, cfg)
-    plugin_ok = os.path.isfile(plugin_path)
-    cfg_ok = os.path.isfile(cfg_path)
-
-    # Treat plugin as "available" if the plugin file exists.
-    # Config may not exist yet on fresh installs.
-    ok = plugin_ok
-    return ok, cfg_ok, cfg_path, plugin_path
-
 def _parse_tmux_l_and_s_from_cmdline(line: str):
     """
     Accepts a pgrep -af line, e.g.:
@@ -1423,12 +1540,16 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
     We do NOT inject via tmux/screen because LinuxGSM's tmux session is not a real interactive console
     for Rust server commands in your setup (as established earlier).
     """
-    ok, cfg_ok, cfg_path, plugin_path = smoothrestarter_available(server_dir, cfg)
+    
+    ok, cfg_ok, sr_cfg, sr_plugin, notes = smoothrestarter_available(server_dir, cfg)
+    for n in notes:
+        log(f"SMOOTH_BRIDGE: {n}", fp)
+
     if not ok:
-        log(f"SMOOTH_BRIDGE: SmoothRestarter plugin not found: {plugin_path}", fp)
+        log(f"SMOOTH_BRIDGE: SmoothRestarter plugin not found: {sr_plugin}", fp)
         return False
     if not cfg_ok:
-        log(f"SMOOTH_BRIDGE: NOTE: SmoothRestarter config missing (may be first run): {cfg_path}", fp)
+        log(f"SMOOTH_BRIDGE: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
 
     delay = int(cfg.get("smoothrestarter_restart_delay_seconds", 300))
     template = (cfg.get("smoothrestarter_console_cmd") or "srestart restart {delay}").strip()
@@ -1701,7 +1822,14 @@ def update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=None)
     best_effort_rcon_say(cfg, str(cfg.get("update_watch_final_message", "")).strip(), fp=fp)
 
     # Now do the actual sequence
-    steps = ["stop"] + list(cfg.get("recovery_steps", ["update", "mu", "restart"]))
+    base = [s.strip().lower() for s in cfg.get("recovery_steps", [])]
+    base = [s for s in base if s]  # sanitize
+
+    if "restart" in base:
+        base = [s for s in base if s != "restart"]
+        base.append("start")  # or keep restart and drop explicit stop
+
+    steps = ["stop"] + base
 
     for step in steps:
         if stop_requested:
@@ -1730,7 +1858,11 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     RCON-only SmoothRestarter ceremony test.
     No tmux/screen injection.
     """
-    ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
+
+    ok, cfg_ok, sr_cfg, sr_plugin, notes = smoothrestarter_available(server_dir, cfg)
+    for n in notes:
+        log(f"SMOOTH_BRIDGE: {n}", fp)
+
     log(f"SMOOTH_TEST: plugin path: {sr_plugin}", fp)
     log(f"SMOOTH_TEST: config path: {sr_cfg}", fp)
 
@@ -1992,7 +2124,9 @@ def main():
 
     # One-time SmoothRestarter info on startup (only if bridge is enabled)
     if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
-        ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
+        ok, cfg_ok, sr_cfg, sr_plugin, notes = smoothrestarter_available(server_dir, cfg)
+        for n in notes:
+            log(f"SMOOTH_BRIDGE: {n}", fp)
 
         # Keep the original "expected paths" (what we will look for)
         log(f"SMOOTH_BRIDGE: expected plugin path: {sr_plugin}", fp)
@@ -2087,7 +2221,9 @@ def main():
                     # If the bridge is enabled, warn on every update-check tick
                     # if SmoothRestarter isn't installed (non-fatal).
                     if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
-                        ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
+                        ok, cfg_ok, sr_cfg, sr_plugin, notes = smoothrestarter_available(server_dir, cfg)
+                        for n in notes:
+                            log(f"SMOOTH_BRIDGE: {n}", fp)
                         if not ok:
                             log(f"SMOOTH_BRIDGE: enabled but SmoothRestarter plugin not found: {sr_plugin}", fp)
                         elif not cfg_ok:

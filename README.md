@@ -322,7 +322,8 @@ Run the watchdog outside tmux/screen (systemd recommended) so recovery isn’t b
 ---
 
 ### History
-- v0.2.7 - small bugfixes
+- v0.2.8 - Rudimentary checks on [Smooth Restarter](https://umod.org/plugins/smooth-restarter) integrity; more bug fixes
+- v0.2.7 - Small bugfixes
 - v0.2.6 - Implemented a standalone restart timer notification to the server when Smooth Restarter is not available and when we're watching for updates
   - The watchdog is now calculating a countdown to Facepunch's forced wipe day (by default, the first Thursday of every month at 19:00 GMT); pending restarts over updates are on hold by default that day until we're past the expected update time.
   - WIP: set wipe levels during forced wipe update-restarts.
