@@ -155,6 +155,7 @@ Send a chat broadcast via WebRCON:
 
 ```bash
 ./rust_watchdog.py --config ./rust_watchdog.json --test-rcon-say "hello from watchdog"
+```
 
 Send an arbitrary WebRCON command:
 
