@@ -13,6 +13,10 @@ venv/
 ENV/
 env/
 
+# data
+data/
+data/**
+
 # Editor/OS junk
 .DS_Store
 Thumbs.db

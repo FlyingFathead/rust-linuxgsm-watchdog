@@ -42,13 +42,13 @@ DEFAULTS = {
     "interval_seconds": 30,
     "cooldown_seconds": 120,
 
-    "lockfile": "/tmp/rustserver_watchdog.lock",
+    "lockfile": os.path.join(PROJECT_DIR, "data", "lock", "rust_watchdog.lock"),
 
     # NOTE: this must be a FILE path, not a directory
-    "logfile": "/home/rustserver/rust-linuxgsm-watchdog/log/rust_watchdog.log",
+    "logfile":  os.path.join(PROJECT_DIR, "log",  "rust_watchdog.log"),
 
     # Pause feature enabled by default (only pauses if the file exists)
-    "pause_file": "/home/rustserver/rust-linuxgsm-watchdog/.watchdog_pause",
+    "pause_file": os.path.join(PROJECT_DIR, "data", ".watchdog_pause"),
 
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,
@@ -416,6 +416,53 @@ def in_forced_wipe_update_hold(cfg, now_utc: datetime, fp=None):
         return (True, f"within {hold_m}m of wipe ({when} {info.get('tz_name','')})")
 
     return (False, "")
+
+def _cfg_base_dir(config_path: str) -> str:
+    # Resolve relative paths against the CONFIG FILE location, not CWD.
+    # This makes behavior identical under systemd vs manual runs.
+    try:
+        cp = os.path.abspath(os.path.expanduser(os.path.expandvars(config_path or "")))
+        return os.path.dirname(cp) if cp else PROJECT_DIR
+    except Exception:
+        return PROJECT_DIR
+
+def norm_path(p, *, base_dir: str):
+    """
+    Normalize paths:
+      - expand ~ and $VARS
+      - if relative, resolve against base_dir (config file dir)
+      - return absolute, normalized path
+      - keep ""/None as ""
+    """
+    if p is None:
+        return ""
+    if not isinstance(p, str):
+        p = str(p)
+    p = p.strip()
+    if not p:
+        return ""
+
+    p = os.path.expandvars(os.path.expanduser(p))
+    if not os.path.isabs(p):
+        p = os.path.join(base_dir, p)
+
+    return os.path.normpath(os.path.abspath(p))
+
+def normalize_cfg_paths(cfg: dict, config_path: str) -> dict:
+    base_dir = _cfg_base_dir(config_path)
+
+    # Paths that should behave consistently across systemd/manual:
+    for k in ("server_dir", "lockfile", "logfile", "pause_file"):
+        if k in cfg:
+            cfg[k] = norm_path(cfg.get(k), base_dir=base_dir)
+
+    # Optional override paths (only normalize if user actually set them)
+    for k in ("smoothrestarter_config_path", "smoothrestarter_plugin_path"):
+        v = cfg.get(k)
+        if isinstance(v, str) and v.strip():
+            cfg[k] = norm_path(v, base_dir=base_dir)
+
+    return cfg
 
 # --------------------------------------------------------
 # CONFIG LOADER
@@ -1705,12 +1752,15 @@ def main():
         return
 
     cfg = load_cfg(args.config)
+    cfg = normalize_cfg_paths(cfg, args.config)
+        
     global CFG_FOR_HINTS
     CFG_FOR_HINTS = cfg
     
     apply_recovery_toggles(cfg)
 
-    server_dir = os.path.abspath(cfg["server_dir"])
+    # Now server_dir is already absolute+stable (no CWD surprises)
+    server_dir = cfg["server_dir"]
     rustserver_path = os.path.join(server_dir, "rustserver")
 
     # Clean shutdown behavior under systemd (SIGTERM) and Ctrl-C (SIGINT)

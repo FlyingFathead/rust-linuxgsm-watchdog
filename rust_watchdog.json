@@ -2,8 +2,11 @@
   "server_dir": "/home/rustserver",
   "identity": "rustserver",
 
-  "pause_file": "/home/rustserver/rust-linuxgsm-watchdog/.watchdog_pause",
   "dry_run": false,
+
+  "lockfile": "/home/rustserver/rust-linuxgsm-watchdog/data/lock/rust_watchdog.lock",
+  "logfile": "/home/rustserver/rust-linuxgsm-watchdog/data/log/rust_watchdog.log",
+  "pause_file": "/home/rustserver/rust-linuxgsm-watchdog/data/.watchdog_pause",
 
   "interval_seconds": 10,
   "cooldown_seconds": 120,
