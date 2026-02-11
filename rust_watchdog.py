@@ -1255,6 +1255,21 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     cmd = build_smoothrestarter_cmd(cfg)
     log(f"SMOOTH_TEST: would send: {cmd}", fp)
 
+    # Optional: announce bridge test in-game so you can SEE it's this test.
+    # (Uses RCON, so only works if websocket-client is available and autodetect succeeds.)
+    if ok_ws:
+        prefix = "[Rust Watchdog] SMOOTH_TEST:"
+        chat = f'{prefix} backend={backend} target={target} cmd="{cmd}"'
+        chat_escaped = chat.replace('"', '\\"')
+
+        ok_a, resp_a = rcon_send(cfg, f'global.say "{chat_escaped}"', fp=fp)
+        if ok_a:
+            log("SMOOTH_TEST: announced in chat via RCON", fp)
+        else:
+            log(f"SMOOTH_TEST: could not announce in chat via RCON: {resp_a}", fp)
+    else:
+        log("SMOOTH_TEST: no chat announce (websocket-client missing -> RCON unavailable)", fp)
+
     if send:
         log("SMOOTH_TEST: SENDING command (this may start a restart countdown!)", fp)
         if backend == "tmux":
@@ -1320,6 +1335,8 @@ def main():
     ap.add_argument("--version", action="store_true", help="print version and exit")
     ap.add_argument("--test-rcon-say", metavar="MSG",
                 help="send a global chat message via RCON (no plugins required) and exit")
+    ap.add_argument("--test-rcon-cmd", metavar="CMD",
+                help="send an arbitrary RCON command and print the response; then exit")
     ap.add_argument("--test-smoothrestarter", action="store_true",
                     help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
@@ -1360,6 +1377,32 @@ def main():
         msg = args.test_rcon_say.replace('"', '\\"')
         ok, resp = rcon_send(cfg, f'global.say "{msg}"', fp=fp)
         log(f"RCON_SAY: {'OK' if ok else 'FAIL'} -- {resp}", fp)
+        if fp: fp.close()
+        raise SystemExit(0 if ok else 2)
+
+    # test rcon: arbitrary command
+    if args.test_rcon_cmd:
+        cmd = args.test_rcon_cmd.strip()
+        if not cmd:
+            log("RCON_CMD: FAIL -- empty command", fp)
+            if fp: fp.close()
+            raise SystemExit(2)
+
+        ok, resp = rcon_send(cfg, cmd, fp=fp)
+        log(f"RCON_CMD: {'OK' if ok else 'FAIL'} -- cmd={cmd}", fp)
+
+        # Pretty-print JSON responses if they look like JSON
+        s = (resp or "").strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                log("RCON_CMD: response (json):", fp)
+                for line in json.dumps(json.loads(s), indent=2).splitlines():
+                    log(line, fp)
+            except Exception:
+                log(f"RCON_CMD: response: {resp}", fp)
+        else:
+            log(f"RCON_CMD: response: {resp}", fp)
+
         if fp: fp.close()
         raise SystemExit(0 if ok else 2)
 
