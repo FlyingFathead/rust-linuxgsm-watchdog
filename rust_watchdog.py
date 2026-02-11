@@ -63,8 +63,19 @@ DEFAULTS = {
     "forced_wipe_minute": 0,
     "forced_wipe_lead_hours": 24,
 
+    # How long before wipe we consider it "soon" (lead time)
+    "forced_wipe_lead_hours": 24,
+
     # How long after the scheduled time we still consider it "wipe window"
     "forced_wipe_window_minutes": 180,
+
+    # Pre-wipe update hold (avoid restart/update thrash just before wipe)
+    # If update-watch finds an update during the hold window, we only log it.
+    "forced_wipe_update_hold": True,
+    "forced_wipe_update_hold_before_minutes": 360,  # 6h
+
+    # Optional: if server is DOWN during pre-wipe hold, skip update/mu and just restart
+    "forced_wipe_recovery_restart_only_prewipe": True,
 
     # Cadence schedule (time-to-wipe -> log interval)
     # Each entry can include:
@@ -383,6 +394,29 @@ def forced_wipe_highlight_log(cfg, fp=None, *, now_utc: datetime = None):
 
     return (max(1, int(interval)), active)
 
+def in_forced_wipe_update_hold(cfg, now_utc: datetime, fp=None):
+    """
+    True during the pre-wipe hold window (default: last N minutes before wipe).
+    Intended to stop update-watch / SmoothRestarter spam right before wipe.
+    Returns (hold: bool, reason: str).
+    """
+    if not parse_bool(cfg.get("forced_wipe_update_hold"), False):
+        return (False, "")
+
+    hold_m = int(cfg.get("forced_wipe_update_hold_before_minutes", 360))
+    if hold_m <= 0:
+        return (False, "")
+
+    info = next_forced_wipe(now_utc, cfg, fp=fp)
+    wipe_utc = info["wipe_utc_dt"]
+    dt = wipe_utc - now_utc
+
+    if timedelta(0) < dt <= timedelta(minutes=hold_m):
+        when = info["wipe_tz_dt"].strftime("%Y-%m-%d %H:%M")
+        return (True, f"within {hold_m}m of wipe ({when} {info.get('tz_name','')})")
+
+    return (False, "")
+
 # --------------------------------------------------------
 # CONFIG LOADER
 # --------------------------------------------------------
@@ -675,7 +709,7 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         except Exception as e:
             fatal(f"logfile: cannot open for append '{logfile}': {e}", fp=None)
 
-    log(f"PRECHECK: watchdog v{__version__} starting pre-flight checklist", fp)
+    log(f"PRECHECK: Rust Watchdog v{__version__} starting pre-flight checklist", fp)
     log(f"PRECHECK: uid={os.geteuid()} gid={os.getegid()} cwd={os.getcwd()}", fp)
 
     # 1) Basic config sanity (cheap failures first)
@@ -1760,7 +1794,7 @@ def main():
     if not acquire_lock(cfg["lockfile"], fp):
         sys.exit(1)
 
-    log(f"Watchdog v{__version__} started (dry_run={cfg['dry_run']})", fp)
+    log(f"Rust Watchdog v{__version__} by FlyingFathead started (dry_run={cfg['dry_run']})", fp)
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
 
@@ -1869,27 +1903,32 @@ def main():
 
                     verdict = check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp)
 
-                    if verdict is True:
-                        log("UPDATE_WATCH: update available", fp)
+                    hold, reason = in_forced_wipe_update_hold(cfg, datetime.now(timezone.utc), fp=fp)
 
-                        if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
-                            cooldown = int(cfg.get("restart_request_cooldown_seconds", 3600))
-                            if (now - last_restart_request) < cooldown:
-                                left = int(cooldown - (now - last_restart_request))
-                                log(f"SMOOTH_BRIDGE: restart request cooldown active ({left}s left) -- not requesting again", fp)
-                            else:
-                                ok = request_smooth_restart(cfg, server_dir, rustserver_path, fp)
-                                if ok:
-                                    last_restart_request = now
-                                    log(
-                                        f"SMOOTH_BRIDGE: requested SmoothRestarter restart "
-                                        f"(delay={int(cfg.get('smoothrestarter_restart_delay_seconds', 300))}s)",
-                                        fp
-                                    )
-                                else:
-                                    log("SMOOTH_BRIDGE: failed to request SmoothRestarter restart", fp)
+                    if verdict is True:
+                        if hold:
+                            log(f"UPDATE_WATCH: update available, but HOLDING until wipe ({reason})", fp)
                         else:
-                            log("UPDATE_WATCH: SmoothRestarter bridge disabled; no graceful restart requested", fp)
+                            log("UPDATE_WATCH: update available", fp)
+
+                            if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
+                                cooldown = int(cfg.get("restart_request_cooldown_seconds", 3600))
+                                if (now - last_restart_request) < cooldown:
+                                    left = int(cooldown - (now - last_restart_request))
+                                    log(f"SMOOTH_BRIDGE: restart request cooldown active ({left}s left) -- not requesting again", fp)
+                                else:
+                                    ok = request_smooth_restart(cfg, server_dir, rustserver_path, fp)
+                                    if ok:
+                                        last_restart_request = now
+                                        log(
+                                            f"SMOOTH_BRIDGE: requested SmoothRestarter restart "
+                                            f"(delay={int(cfg.get('smoothrestarter_restart_delay_seconds', 300))}s)",
+                                            fp
+                                        )
+                                    else:
+                                        log("SMOOTH_BRIDGE: failed to request SmoothRestarter restart", fp)
+                            else:
+                                log("UPDATE_WATCH: SmoothRestarter bridge disabled; no graceful restart requested", fp)
 
                     elif verdict is False:
                         log("UPDATE_WATCH: no update available", fp)
@@ -1898,7 +1937,19 @@ def main():
 
             if state == "DOWN" and down_streak >= int(cfg["down_confirmations"]):
                 log("CONFIRMED DOWN -> recovery sequence", fp)
-                for step in cfg["recovery_steps"]:
+
+                steps = list(cfg["recovery_steps"])
+
+                if parse_bool(cfg.get("forced_wipe_recovery_restart_only_prewipe"), False):
+                    hold, reason = in_forced_wipe_update_hold(cfg, datetime.now(timezone.utc), fp=fp)
+                    if hold:
+                        # Drop update/mu during pre-wipe hold; keep server alive without chasing builds
+                        steps = [s for s in steps if s.strip().lower() not in ("update", "mu")]
+                        if not steps:
+                            steps = ["restart"]
+                        log(f"RECOVERY: pre-wipe HOLD active -> skipping update/mu ({reason})", fp)
+
+                for step in steps:
                     if stop_requested:
                         log("Stop requested -- aborting recovery sequence", fp)
                         break

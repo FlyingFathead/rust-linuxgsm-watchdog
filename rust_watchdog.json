@@ -42,8 +42,11 @@
   "forced_wipe_tag_scheduled": "scheduled",
   "forced_wipe_tag_soon": "WIPE SOON",
   "forced_wipe_tag_window": "WIPE WINDOW",
-
   "forced_wipe_message_template": "FORCED_WIPE: next = {wipe_tz} ({tz_name}) | local={wipe_local} | utc={wipe_utc} | in {eta} | {tag}",
+
+  "forced_wipe_update_hold": true,
+  "forced_wipe_update_hold_before_minutes": 360,
+  "forced_wipe_recovery_restart_only_prewipe": true,
 
   "enable_smoothrestarter_bridge": false,
   "smoothrestarter_restart_delay_seconds": 300,
