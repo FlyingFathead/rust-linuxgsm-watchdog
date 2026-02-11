@@ -1992,13 +1992,24 @@ def main():
     # One-time SmoothRestarter info on startup (only if bridge is enabled)
     if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
         ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
+
+        # Keep the original "expected paths" (what we will look for)
         log(f"SMOOTH_BRIDGE: expected plugin path: {sr_plugin}", fp)
         log(f"SMOOTH_BRIDGE: expected config path: {sr_cfg}", fp)
 
+        # Add explicit existence verdicts
+        plugin_state = "FOUND" if ok else "MISSING"
+        cfg_state = "FOUND" if cfg_ok else "MISSING"
+        log(f"SMOOTH_BRIDGE: plugin: {plugin_state}", fp)
+        log(f"SMOOTH_BRIDGE: config: {cfg_state}", fp)
+
+        # And a human summary
         if not ok:
             log(f"SMOOTH_BRIDGE: SmoothRestarter not installed (plugin missing). Get it from: {SMOOTHRESTARTER_URL}", fp)
         elif not cfg_ok:
-            log(f"SMOOTH_BRIDGE: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
+            log(f"SMOOTH_BRIDGE: SmoothRestarter installed (plugin found), but config missing (OK on first run): {sr_cfg}", fp)
+        else:
+            log("SMOOTH_BRIDGE: SmoothRestarter installed (plugin+config found) -- bridge ready.", fp)
 
     if cfg.get("_recovery_steps_original") != cfg.get("recovery_steps"):
         log(
