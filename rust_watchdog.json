@@ -12,6 +12,9 @@
   "cooldown_seconds": 120,
   "down_confirmations": 2,
 
+  "Daily restarts": [],
+  "Restart when new Oxide.Rust is out": false,
+
   "check_process_identity": true,
 
   "check_tcp_rcon": true,

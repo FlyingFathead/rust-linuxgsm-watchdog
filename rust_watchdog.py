@@ -60,6 +60,13 @@ DEFAULTS = {
     "update_check_timeout": 60,
 
     # ---------------------------------------------------------
+    # Duplicate RustDedicated guard (same +server.identity)
+    # ---------------------------------------------------------
+    "dupe_identity_policy": "pause",   # "warn" | "pause" | "fatal" | "kill_extra"
+    "dupe_identity_check_listen_port": True,
+    "server_port": 28015,             # used for listen check when possible
+
+    # ---------------------------------------------------------
     # Forced wipe highlighter (Rust monthly forced wipe baseline)
     # First Thursday of month, 19:00 Europe/London
     # ---------------------------------------------------------
@@ -163,6 +170,19 @@ DEFAULTS = {
 
     # Rate-limit restart requests (avoid spamming SR during loops)
     "restart_request_cooldown_seconds": 3600,
+
+    # If SR is already counting down (or we fail to request it),
+    # what should watchdog do?
+    #   "fallback"  -> use no-SR countdown + stop/update/mu/restart NOW
+    #   "log_only"  -> do NOT fallback; just log and let SR / humans handle it
+    "smoothrestarter_fail_policy": "fallback",
+
+    # When SR path is used, optionally do our own timed RCON notices based on the delay we requested.
+    # This does not cancel/retry SR and does not change SR behavior.
+    "update_watch_sr_notify": True,
+    "update_watch_sr_notify_at_seconds": [300, 120, 60, 30, 10],
+    "update_watch_sr_notify_template": "Restart in about {seconds}s (update detected).",
+    "update_watch_sr_final_message": "Restarting now -- come back in a few minutes!",
 
     # ---------------------------------------------------------
     # Update-watch announcements + fallback countdown (no SR)
@@ -633,6 +653,122 @@ def sleep_interruptible(seconds):
         if stop_requested:
             return
         time.sleep(0.2)
+
+# ----------------------------------------------------
+# Find potential duplicate instances of RustDedicated
+# ----------------------------------------------------
+def find_rustdedicated_identity_matches(identity: str):
+    """
+    Returns list of (pid:int, cmdline:str) for RustDedicated cmdlines that match +server.identity.
+    """
+    needle1 = f"+server.identity {identity}"
+    needle2 = f'+server.identity "{identity}"'
+    try:
+        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+    except Exception:
+        return []
+
+    hits = []
+    for line in lines:
+        if needle1 in line or needle2 in line:
+            try:
+                pid_s = line.split(None, 1)[0]
+                pid = int(pid_s)
+            except Exception:
+                continue
+            hits.append((pid, line))
+    return hits
+
+def pid_listens_udp_port(pid: int, port: int) -> bool:
+    """
+    Best-effort. Requires ss to show pid mappings (usually OK as same user; sudo always OK).
+    """
+    if not shutil.which("ss"):
+        return False
+    try:
+        out = subprocess.check_output(["ss", "-Hlunp"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return False
+
+    needle_pid = f"pid={pid},"
+    needle_port = f":{port} "
+    for line in out.splitlines():
+        if needle_port in line and needle_pid in line:
+            return True
+    return False
+
+def handle_duplicate_rustdedicated(cfg, fp=None) -> bool:
+    """
+    Returns True if safe to proceed, False if watchdog should skip actions this tick.
+    Policy:
+      - warn: log only, continue
+      - pause: create pause_file, skip actions
+      - fatal: exit
+      - kill_extra: kill all but the one listening on server_port (only if identifiable)
+    """
+    identity = str(cfg.get("identity") or "").strip()
+    if not identity:
+        return True
+
+    hits = find_rustdedicated_identity_matches(identity)
+    if len(hits) <= 1:
+        return True
+
+    policy = str(cfg.get("dupe_identity_policy", "pause")).strip().lower()
+    listen_check = parse_bool(cfg.get("dupe_identity_check_listen_port", True), True)
+    server_port = int(cfg.get("server_port", 28015))
+
+    log(f"DUPLICATE: found {len(hits)} RustDedicated instances for identity='{identity}'", fp)
+    for pid, line in hits:
+        log(f"DUPLICATE: pid={pid} cmd={redact_secrets(line)}", fp)
+
+    active_pid = None
+    if listen_check:
+        for pid, _ in hits:
+            if pid_listens_udp_port(pid, server_port):
+                active_pid = pid
+                break
+        if active_pid:
+            log(f"DUPLICATE: active instance appears to be pid={active_pid} (listening UDP {server_port})", fp)
+        else:
+            log(f"DUPLICATE: could not identify an active listener on UDP {server_port}", fp)
+
+    if policy == "warn":
+        return True
+
+    if policy == "fatal":
+        fatal(f"Duplicate RustDedicated instances detected for identity '{identity}'", fp=fp)
+
+    if policy == "pause":
+        pause_file = (cfg.get("pause_file") or "").strip()
+        if pause_file:
+            try:
+                Path(pause_file).write_text(
+                    f"auto-paused due to duplicate RustDedicated instances for identity='{identity}' at {ts()}\n",
+                    encoding="utf-8"
+                )
+                log(f"DUPLICATE: created pause file: {pause_file}", fp)
+            except Exception as e:
+                log(f"DUPLICATE: failed to create pause file '{pause_file}': {e}", fp)
+        log("DUPLICATE: skipping watchdog actions this tick (policy=pause)", fp)
+        return False
+
+    if policy == "kill_extra":
+        if not active_pid:
+            log("DUPLICATE: policy=kill_extra but active pid not identifiable -> refusing to kill", fp)
+            return False
+        for pid, _ in hits:
+            if pid == active_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log(f"DUPLICATE: SIGTERM sent to extra pid={pid}", fp)
+            except Exception as e:
+                log(f"DUPLICATE: failed to SIGTERM pid={pid}: {e}", fp)
+        return False  # let next tick settle
+
+    log(f"DUPLICATE: unknown dupe_identity_policy='{policy}' -> defaulting to pause behavior", fp)
+    return False
 
 # ------------------------------------
 # PRE-FLIGHT CHECKS
@@ -1282,6 +1418,26 @@ def detect_rcon_from_identity(cfg):
             return (ip, port, pw)
 
     return (None, None, None)
+
+# -----------------------------------------------------
+# RCON HELPERS
+# -----------------------------------------------------
+SR_ALREADY_RESTARTING_RE = re.compile(r"\balready\s+restarting\b", re.IGNORECASE)
+
+def rcon_extract_message(resp: str) -> str:
+    s = (resp or "").strip()
+    if not s:
+        return ""
+    # Rust WebRCON often returns JSON; try common message keys.
+    try:
+        obj = json.loads(s)
+        for k in ("Message", "message", "Text", "text"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return strip_ansi(v).strip()
+    except Exception:
+        pass
+    return strip_ansi(s).strip()
 
 def rcon_send(cfg, command: str, fp=None):
     """
@@ -2183,6 +2339,18 @@ def main():
                     log(f"UNPAUSED: {pause_file} removed -- resuming", fp)
                     paused = False
                     down_streak = 0
+
+            # ---------------------------------------------------------
+            # DUPE CHECKS
+            # ---------------------------------------------------------
+
+            # 0) Duplicate RustDedicated identity guard (pause/fatal/kill_extra etc)
+            if not handle_duplicate_rustdedicated(cfg, fp=fp):
+                # policy decided to skip actions this tick
+                if args.once:
+                    break
+                sleep_interruptible(int(cfg["interval_seconds"]))
+                continue
 
             state, evidence = health_report(cfg, server_dir, rustserver_path, fp)
             log(f"HEALTH: {state}", fp)
