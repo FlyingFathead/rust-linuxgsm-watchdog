@@ -710,6 +710,8 @@ def fatal(msg, code=2, fp=None):
     print("Run it via systemd as the LinuxGSM user so permissions match your server install.", file=sys.stderr)
     print("(See rust-watchdog.service in the repo.)", file=sys.stderr)
     print(sep, file=sys.stderr)
+    print("If you need help with command line options, run:  ./rust_watchdog.py --help")
+    print(sep, file=sys.stderr)
 
     raise SystemExit(code)
 
