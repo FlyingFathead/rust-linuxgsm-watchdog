@@ -244,6 +244,7 @@ so run the watchdog outside tmux/screen (systemd recommended).
 ---
 
 ### History
+- v0.2.5 - Switched completely to RCON to interact with bridged Oxide plugins like Smooth Restarter
 - v0.2.4 - [Smooth Restarter](https://umod.org/plugins/smooth-restarter) bridge test (`--test-smoothrestarter` and `--test-smoothrestarter-send`)
 - v0.2.3 - initial support for bridging with [Smooth Restarter](https://umod.org/plugins/smooth-restarter)
 - v0.2.2 - server & plugin updates on restart can now be toggled

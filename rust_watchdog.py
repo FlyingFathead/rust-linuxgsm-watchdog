@@ -21,9 +21,10 @@ import socket
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from datetime import datetime
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,9 +98,6 @@ DEFAULTS = {
 
     # Rate-limit restart requests (avoid spamming SR during loops)
     "restart_request_cooldown_seconds": 3600,
-
-    # SmoothRestarter transport: RCON only (no tmux/screen injection)
-    "smoothrestarter_rcon_only": True,
 
     # Optional overrides (leave empty to use the default LinuxGSM layout)
     # If relative, they're resolved relative to server_dir.
@@ -648,6 +646,30 @@ def run_cmd(cmd, cwd, fp=None, timeout=None, dry_run=False):
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s or "")
 
+RCON_SAY_PRETTY_RE = re.compile(r'^\s*(global\.say|say)\s+"(.*)"\s*$', re.IGNORECASE)
+
+def pretty_rcon_cmd(cmd: str) -> str:
+    """
+    Make chat-y RCON commands readable in logs.
+
+    Examples:
+      global.say "hi"   -> global.say: hi
+      say "hi"          -> say: hi
+    """
+    cmd = (cmd or "").strip()
+    m = RCON_SAY_PRETTY_RE.match(cmd)
+    if not m:
+        return cmd
+
+    verb = m.group(1)
+    msg = m.group(2)
+
+    # Reverse the escaping done in rcon_global_say_cmd()
+    # (keep this conservative; we only undo what we do)
+    msg = msg.replace("\\\\", "\\").replace('\\"', '"')
+
+    return f"{verb}: {msg}"
+
 def run_cmd_capture(cmd, cwd, fp=None, timeout=None, dry_run=False):
     """
     Run a command and capture combined stdout/stderr.
@@ -762,20 +784,27 @@ def rcon_send(cfg, command: str, fp=None):
 
     from websocket import create_connection
 
-    url = f"ws://{ip}:{port}/{pw}"
+    pw_enc = quote(pw, safe="")   # encode everything unsafe
+    url = f"ws://{ip}:{port}/{pw_enc}"
 
     ident = int(time.time())  # unique-ish
     payload = {"Identifier": ident, "Message": command, "Name": "watchdog"}
 
+    ws = None
     try:
         ws = create_connection(url, timeout=5)
         ws.send(json.dumps(payload))
         ws.settimeout(3)
         resp = ws.recv()
-        ws.close()
         return (True, resp)
     except Exception as e:
         return (False, f"RCON send failed: {e}")
+    finally:
+        try:
+            if ws:
+                ws.close()
+        except Exception:
+            pass
 
 def smoothrestarter_paths(server_dir, cfg=None):
     """
@@ -1223,7 +1252,8 @@ def rcon_global_say_cmd(prefix: str, msg: str) -> str:
 
     # Escape backslashes + quotes for Rust console string
     full = full.replace("\\", "\\\\").replace('"', '\\"')
-    return f'global.say "{full}"'
+    # Rust console quirk: add trailing char after closing quote so it doesn't get ignored
+    return f'global.say "{full}"\\'
 
 def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=False):
     """
@@ -1375,7 +1405,7 @@ def main():
     ap.add_argument("--test-smoothrestarter", action="store_true",
                     help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
-                    help="same as --test-smoothrestarter but actually sends the command via tmux or screen; then exit")
+        help="same as --test-smoothrestarter but actually sends the ceremony via RCON; then exit")
     args = ap.parse_args()
 
     if args.version:
@@ -1410,7 +1440,7 @@ def main():
     # test rcon
     if args.test_rcon_say:
         msg = args.test_rcon_say.replace('"', '\\"')
-        ok, resp = rcon_send(cfg, f'global.say "{msg}"', fp=fp)
+        ok, resp = rcon_send(cfg, rcon_global_say_cmd("", args.test_rcon_say), fp=fp)
         log(f"RCON_SAY: {'OK' if ok else 'FAIL'} -- {resp}", fp)
         if fp: fp.close()
         raise SystemExit(0 if ok else 2)
