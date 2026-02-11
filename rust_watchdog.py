@@ -651,6 +651,20 @@ RCON_SAY_PRETTY_RE = re.compile(
     re.IGNORECASE
 )
 
+def sanitize_rust_console_text(s: str) -> str:
+    """
+    Make chat text safe to embed in a Rust console command line.
+
+    - strips CR/LF
+    - strips ';' (Rust console can treat it as command separator)
+    - trims
+    """
+    s = (s or "")
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = s.replace(";", " ")
+    s = s.strip()
+    return s if s else " "
+
 def pretty_rcon_cmd(cmd: str) -> str:
     cmd = (cmd or "").strip()
     m = RCON_SAY_PRETTY_RE.match(cmd)
@@ -1253,6 +1267,18 @@ def rcon_global_say_cmd(prefix: str, msg: str) -> str:
     # NO trailing backslash. Just send the command.
     return f'global.say "{full}"'
 
+def rcon_say_cmd(prefix: str, msg: str) -> str:
+    """
+    Build a Rust chat broadcast using 'say ...' (no quotes).
+
+    This avoids the annoying \"...\" echo you get with global.say "...".
+    """
+    prefix = (prefix or "").strip()
+    msg = (msg or "").strip()
+    full = f"{prefix} {msg}".strip() if prefix else msg
+    full = sanitize_rust_console_text(full)
+    return f"say {full}"
+
 def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=False):
     """
     RCON-only SmoothRestarter ceremony test.
@@ -1294,7 +1320,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     cancel_cmd = f"{prefix} cancel"
 
     log("SMOOTH_TEST: ceremony plan (RCON only):", fp)
-    log("  announce: dry-run start (global.say)", fp)
+    log("  announce: dry-run start (say)", fp)
     if want_status:
         log(f"  send: {status_cmd}", fp)
     log(f"  send: {restart_cmd}", fp)
@@ -1302,7 +1328,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     log(f"  send: {cancel_cmd}", fp)
     if want_status:
         log(f"  send: {status_cmd}", fp)
-    log("  announce: test over (global.say)", fp)
+    log("  announce: test over (say)", fp)
 
     if not send:
         log("SMOOTH_TEST: OK: wiring looks good (dry test; not sending anything)", fp)
@@ -1320,7 +1346,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     log("SMOOTH_TEST: SENDING ceremony via RCON (countdown will be started, then cancelled)", fp)
 
     # 1) announce start
-    if not rcon_line(rcon_global_say_cmd(chat_prefix, "SmoothRestarter bridge DRY-RUN test starting -- server is NOT restarting.")):
+    if not rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge DRY-RUN test starting -- server is NOT restarting.")):
         return 2
 
     # 2) optional status
@@ -1344,7 +1370,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
         rcon_line(status_cmd)
 
     # 7) announce end
-    rcon_line(rcon_global_say_cmd(chat_prefix, "SmoothRestarter bridge DRY-RUN test over -- countdown cancelled."))
+    rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge dry run test over -- countdown cancelled. Back to Rust!"))
 
     log("SMOOTH_TEST: OK: ceremony complete (RCON only)", fp)
     return 0
@@ -1437,8 +1463,10 @@ def main():
 
     # test rcon
     if args.test_rcon_say:
-        msg = args.test_rcon_say.replace('"', '\\"')
-        ok, resp = rcon_send(cfg, rcon_global_say_cmd("", args.test_rcon_say), fp=fp)
+        # // (old method)
+        # msg = args.test_rcon_say.replace('"', '\\"')
+        # ok, resp = rcon_send(cfg, rcon_global_say_cmd("", args.test_rcon_say), fp=fp)
+        ok, resp = rcon_send(cfg, rcon_say_cmd("", args.test_rcon_say), fp=fp)
         log(f"RCON_SAY: {'OK' if ok else 'FAIL'} -- {resp}", fp)
         if fp: fp.close()
         raise SystemExit(0 if ok else 2)
