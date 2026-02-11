@@ -1346,7 +1346,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
     log("SMOOTH_TEST: SENDING ceremony via RCON (countdown will be started, then cancelled)", fp)
 
     # 1) announce start
-    if not rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge DRY-RUN test starting -- server is NOT restarting.")):
+    if not rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge DRY RUN test starting. Don't Panic! Server is NOT restarting.")):
         return 2
 
     # 2) optional status
@@ -1370,7 +1370,7 @@ def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=
         rcon_line(status_cmd)
 
     # 7) announce end
-    rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge dry run test over -- countdown cancelled. Back to Rust!"))
+    rcon_line(rcon_say_cmd(chat_prefix, "SmoothRestarter bridge dry run test over, countdown cancelled. Back to Rust!"))
 
     log("SMOOTH_TEST: OK: ceremony complete (RCON only)", fp)
     return 0
