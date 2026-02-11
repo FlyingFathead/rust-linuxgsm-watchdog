@@ -22,7 +22,13 @@ import subprocess
 import sys
 import time
 from urllib.parse import quote
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+# Python 3.9+: stdlib timezone database access (requires tzdata on the host)
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore
+except Exception:
+    ZoneInfo = None  # type: ignore
+    ZoneInfoNotFoundError = Exception  # type: ignore
 
 __version__ = "0.2.5"
 
@@ -46,6 +52,44 @@ DEFAULTS = {
 
     # DRY RUN MODE: when true, never runs recovery steps
     "dry_run": False,
+
+    # ---------------------------------------------------------
+    # Forced wipe highlighter (Rust monthly forced wipe baseline)
+    # First Thursday of month, 19:00 Europe/London
+    # ---------------------------------------------------------
+    "enable_forced_wipe_highlight": True,
+    "forced_wipe_tz": "Europe/London",
+    "forced_wipe_hour": 19,
+    "forced_wipe_minute": 0,
+    "forced_wipe_lead_hours": 24,
+
+    # How long after the scheduled time we still consider it "wipe window"
+    "forced_wipe_window_minutes": 180,
+
+    # Cadence schedule (time-to-wipe -> log interval)
+    # Each entry can include:
+    #   - dt_gt_seconds: match if dt_seconds > this
+    #   - dt_lte_seconds: match if dt_seconds <= this
+    #   - interval_seconds: required
+    # First match wins; last entry can be a fallback with only interval_seconds.
+    "forced_wipe_log_schedule": [
+        {"dt_gt_seconds": 604800, "interval_seconds": 86400},  # > 7d   -> daily
+        {"dt_gt_seconds": 172800, "interval_seconds": 21600},  # > 48h  -> 6h
+        {"dt_gt_seconds": 86400,  "interval_seconds": 7200},   # > 24h  -> 2h
+        {"dt_gt_seconds": 21600,  "interval_seconds": 3600},   # > 6h   -> 1h
+        {"dt_gt_seconds": 3600,   "interval_seconds": 1800},   # > 1h   -> 30m
+        {"dt_gt_seconds": 600,    "interval_seconds": 300},    # > 10m  -> 5m
+        {"dt_gt_seconds": 0,      "interval_seconds": 60},     # > 0    -> 1m
+        {"dt_gt_seconds": -10800, "interval_seconds": 600},    # > -3h  -> 10m
+        {"interval_seconds": 86400},                            # fallback
+    ],
+
+    # Message strings
+    "forced_wipe_tag_scheduled": "scheduled",
+    "forced_wipe_tag_soon": "WIPE SOON",
+    "forced_wipe_tag_window": "WIPE WINDOW",
+    "forced_wipe_message_template":
+        "FORCED_WIPE: next = {wipe_tz} ({tz_name}) | local={wipe_local} | utc={wipe_utc} | in {eta} | {tag}",
 
     # Recovery toggles (convenience flags; defaults keep current behavior)
     "enable_server_update": True,   # controls "update"
@@ -152,6 +196,196 @@ def log(line, fp=None):
         fp.write(msg + "\n")
         fp.flush()
 
+# --------------------------------------------------------
+# TIMEZONE HELPERS & COUNTERS
+# --------------------------------------------------------
+def _zoneinfo_available() -> bool:
+    return ZoneInfo is not None
+
+def _get_tz(name: str, fp=None):
+    """
+    Best-effort timezone loader.
+    If tzdata is missing on the host, fall back to UTC and log a warning once.
+    """
+    name = (name or "").strip()
+    if not name or not _zoneinfo_available():
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        log(f"FORCED_WIPE: WARNING: ZoneInfo '{name}' not found on this host (tzdata missing?). Falling back to UTC.", fp)
+        return timezone.utc
+    except Exception as e:
+        log(f"FORCED_WIPE: WARNING: ZoneInfo error for '{name}': {e}. Falling back to UTC.", fp)
+        return timezone.utc
+
+def _human_td(td: timedelta) -> str:
+    """
+    Human-ish duration, e.g. "2d 3h 14m".
+    """
+    total = int(td.total_seconds())
+    sign = "-" if total < 0 else ""
+    total = abs(total)
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d > 0:
+        return f"{sign}{d}d {h}h {m}m"
+    if h > 0:
+        return f"{sign}{h}h {m}m"
+    return f"{sign}{m}m"
+
+def _first_thursday_dt(year: int, month: int, *, hour: int, minute: int, tz) -> datetime:
+    """
+    Return aware datetime for "first Thursday of (year, month) at HH:MM" in tz.
+    weekday: Monday=0 ... Sunday=6. Thursday=3.
+    """
+    d0 = datetime(year, month, 1, hour, minute, tzinfo=tz)
+    target = 3  # Thursday
+    delta = (target - d0.weekday()) % 7
+    return d0 + timedelta(days=delta)
+
+def next_forced_wipe(now_utc: datetime, cfg, fp=None):
+    """
+    Compute next "monthly forced wipe baseline":
+      first Thursday of month @ forced_wipe_hour:forced_wipe_minute in forced_wipe_tz.
+
+    Returns dict with:
+      - wipe_tz_dt (aware, in forced wipe tz)
+      - wipe_utc_dt (aware, in UTC)
+      - tz (tz object)
+    """
+    tz_name = str(cfg.get("forced_wipe_tz") or "Europe/London")
+    tz = _get_tz(tz_name, fp=fp)
+
+    hour = int(cfg.get("forced_wipe_hour", 19))
+    minute = int(cfg.get("forced_wipe_minute", 0))
+
+    now_tz = now_utc.astimezone(tz)
+    cand = _first_thursday_dt(now_tz.year, now_tz.month, hour=hour, minute=minute, tz=tz)
+    if now_tz >= cand:
+        # next month
+        y = now_tz.year
+        m = now_tz.month + 1
+        if m == 13:
+            y += 1
+            m = 1
+        cand = _first_thursday_dt(y, m, hour=hour, minute=minute, tz=tz)
+
+    cand_utc = cand.astimezone(timezone.utc)
+    return {"wipe_tz_dt": cand, "wipe_utc_dt": cand_utc, "tz": tz, "tz_name": tz_name}
+
+def _pick_forced_wipe_interval(cfg, dt_seconds: float) -> int:
+    """
+    Pick log interval based on cfg["forced_wipe_log_schedule"].
+    dt_seconds = (wipe_time_utc - now_utc).total_seconds()
+    """
+    schedule = cfg.get("forced_wipe_log_schedule")
+    if isinstance(schedule, list) and schedule:
+        for ent in schedule:
+            if not isinstance(ent, dict):
+                continue
+            interval = ent.get("interval_seconds")
+            if interval is None:
+                continue
+
+            gt = ent.get("dt_gt_seconds", None)
+            lte = ent.get("dt_lte_seconds", None)
+
+            try:
+                if gt is not None and not (dt_seconds > float(gt)):
+                    continue
+                if lte is not None and not (dt_seconds <= float(lte)):
+                    continue
+                return max(1, int(interval))
+            except Exception:
+                continue
+
+    # Backwards-compatible fallback if schedule is missing:
+    # use old "idle vs active" knobs if present
+    idle_i = int(cfg.get("forced_wipe_log_interval_seconds", 3600))
+    active_i = int(cfg.get("forced_wipe_log_interval_seconds_active", 300))
+    # caller can still decide active vs idle; return idle by default here
+    return max(1, idle_i)
+
+def forced_wipe_highlight_log(cfg, fp=None, *, now_utc: datetime = None):
+    """
+    Emit one status line about next forced wipe.
+    Returns (next_log_after_seconds, is_active_window).
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    info = next_forced_wipe(now_utc, cfg, fp=fp)
+
+    wipe_utc = info["wipe_utc_dt"]
+    wipe_tz = info["wipe_tz_dt"]
+
+    lead_h = int(cfg.get("forced_wipe_lead_hours", 24))
+    window_m = int(cfg.get("forced_wipe_window_minutes", 180))
+    lead = timedelta(hours=max(0, lead_h))
+    window = timedelta(minutes=max(0, window_m))
+
+    dt = wipe_utc - now_utc
+    active = (dt <= lead) or (dt <= timedelta(0) and (now_utc - wipe_utc) <= window)
+
+    # show also system local time (whatever the host is using)
+    wipe_local = wipe_utc.astimezone()
+
+    # Configurable tags
+    tag_scheduled = str(cfg.get("forced_wipe_tag_scheduled", "scheduled"))
+    tag_soon = str(cfg.get("forced_wipe_tag_soon", "WIPE SOON"))
+    tag_window = str(cfg.get("forced_wipe_tag_window", "WIPE WINDOW"))
+
+    # Choose tag (wipe window overrides "soon")
+    if dt <= timedelta(0) and (now_utc - wipe_utc) <= window:
+        tag = tag_window
+    elif active:
+        tag = tag_soon
+    else:
+        tag = tag_scheduled
+
+    # Configurable message template
+    template = str(cfg.get(
+        "forced_wipe_message_template",
+        "FORCED_WIPE: next = {wipe_tz} ({tz_name}) | local={wipe_local} | utc={wipe_utc} | in {eta} | {tag}"
+    ))
+
+    wipe_tz_s = wipe_tz.strftime("%Y-%m-%d %H:%M")
+    wipe_local_s = wipe_local.strftime("%Y-%m-%d %H:%M %z")
+    wipe_utc_s = wipe_utc.strftime("%Y-%m-%d %H:%MZ")
+
+    try:
+        msg = template.format(
+            wipe_tz=wipe_tz_s,
+            tz_name=str(info.get("tz_name", "")),
+            wipe_local=wipe_local_s,
+            wipe_utc=wipe_utc_s,
+            eta=_human_td(dt),
+            tag=tag,
+        )
+    except Exception:
+        # Hard fallback if template is broken / missing placeholders
+        msg = (
+            f"FORCED_WIPE: next = {wipe_tz_s} ({info.get('tz_name','')})"
+            f" | local={wipe_local_s}"
+            f" | utc={wipe_utc_s}"
+            f" | in {_human_td(dt)} | {tag}"
+        )
+
+    log(msg, fp)
+
+    interval = _pick_forced_wipe_interval(cfg, dt.total_seconds())
+
+    # If we're using the old knobs (no schedule), keep the old "active vs idle" behavior:
+    if not isinstance(cfg.get("forced_wipe_log_schedule"), list):
+        idle_i = int(cfg.get("forced_wipe_log_interval_seconds", 3600))
+        active_i = int(cfg.get("forced_wipe_log_interval_seconds_active", 300))
+        interval = active_i if active else idle_i
+
+    return (max(1, int(interval)), active)
+
+# --------------------------------------------------------
+# CONFIG LOADER
+# --------------------------------------------------------
 def load_cfg(path):
     cfg = dict(DEFAULTS)
     if path and os.path.exists(path):
@@ -1530,6 +1764,17 @@ def main():
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
 
+    # One-time forced wipe info on startup
+    forced_wipe_enabled = parse_bool(cfg.get("enable_forced_wipe_highlight"), True)
+    last_forced_wipe_log = 0.0
+    forced_wipe_log_interval = int(cfg.get("forced_wipe_log_interval_seconds", 3600))
+    if forced_wipe_enabled:
+        try:
+            forced_wipe_log_interval, _ = forced_wipe_highlight_log(cfg, fp=fp)
+            last_forced_wipe_log = time.monotonic()
+        except Exception as e:
+            log(f"FORCED_WIPE: WARNING: failed to compute/log forced wipe schedule: {e}", fp)
+
     # One-time SmoothRestarter info on startup (only if bridge is enabled)
     if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
         ok, cfg_ok, sr_cfg, sr_plugin = smoothrestarter_available(server_dir, cfg)
@@ -1583,6 +1828,18 @@ def main():
             log(f"HEALTH: {state}", fp)
             for line in evidence:
                 log(f"  {line}", fp)
+
+            # Forced wipe highlighter (rate-limited)
+            if forced_wipe_enabled:
+                nowm = time.monotonic()
+                if (nowm - last_forced_wipe_log) >= float(forced_wipe_log_interval):
+                    try:
+                        forced_wipe_log_interval, _active = forced_wipe_highlight_log(cfg, fp=fp)
+                    except Exception as e:
+                        log(f"FORCED_WIPE: WARNING: schedule calc failed: {e}", fp)
+                        # back off so we don't spam exceptions
+                        forced_wipe_log_interval = max(3600, forced_wipe_log_interval)
+                    last_forced_wipe_log = nowm
 
             if state == "DOWN":
                 down_streak += 1

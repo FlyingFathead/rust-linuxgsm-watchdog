@@ -20,6 +20,31 @@
   "update_check_interval_seconds": 600,
   "update_check_timeout": 60,
 
+  "enable_forced_wipe_highlight": true,
+  "forced_wipe_tz": "Europe/London",
+  "forced_wipe_hour": 19,
+  "forced_wipe_minute": 0,
+
+  "forced_wipe_window_minutes": 180,
+
+  "forced_wipe_log_schedule": [
+    { "dt_gt_seconds": 604800,  "interval_seconds": 86400 },
+    { "dt_gt_seconds": 172800,  "interval_seconds": 21600 },
+    { "dt_gt_seconds": 86400,   "interval_seconds": 7200  },
+    { "dt_gt_seconds": 21600,   "interval_seconds": 3600  },
+    { "dt_gt_seconds": 3600,    "interval_seconds": 1800  },
+    { "dt_gt_seconds": 600,     "interval_seconds": 300   },
+    { "dt_gt_seconds": 0,       "interval_seconds": 60    },
+    { "dt_gt_seconds": -10800,  "interval_seconds": 600   },
+    { "interval_seconds": 86400 }                            
+  ],
+
+  "forced_wipe_tag_scheduled": "scheduled",
+  "forced_wipe_tag_soon": "WIPE SOON",
+  "forced_wipe_tag_window": "WIPE WINDOW",
+
+  "forced_wipe_message_template": "FORCED_WIPE: next = {wipe_tz} ({tz_name}) | local={wipe_local} | utc={wipe_utc} | in {eta} | {tag}",
+
   "enable_smoothrestarter_bridge": false,
   "smoothrestarter_restart_delay_seconds": 300,
   "smoothrestarter_console_cmd": "srestart restart {delay}",
