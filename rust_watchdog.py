@@ -31,7 +31,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,7 +46,8 @@ DEFAULTS = {
     "lockfile": os.path.join(PROJECT_DIR, "data", "lock", "rust_watchdog.lock"),
 
     # NOTE: this must be a FILE path, not a directory
-    "logfile":  os.path.join(PROJECT_DIR, "log",  "rust_watchdog.log"),
+    # "logfile":  os.path.join(PROJECT_DIR, "log",  "rust_watchdog.log"),
+    "logfile":  os.path.join(PROJECT_DIR, "data", "log", "rust_watchdog.log"),
 
     # Pause feature enabled by default (only pauses if the file exists)
     "pause_file": os.path.join(PROJECT_DIR, "data", ".watchdog_pause"),
@@ -146,6 +147,10 @@ DEFAULTS = {
     # Optional: SmoothRestarter bridge
     # ---------------------------------------------------------
     # check for SmoothRestarter.cs integrity
+    # Optional: verify SmoothRestarter is actually loaded (via RCON plugin list / status)
+    "smoothrestarter_check_loaded": True,          # <-- main toggle
+    "smoothrestarter_check_loaded_strict": False,   # if true: treat "not loaded" as NOT OK
+
     "smoothrestarter_probe_strict": False,
     "smoothrestarter_probe_min_score": 2,
     "smoothrestarter_command": "sr",
@@ -220,6 +225,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 UPDATE_YES_RE = re.compile(r"\b(update available|update required|available:\s*yes)\b", re.IGNORECASE)
 UPDATE_NO_RE  = re.compile(r"\b(no update available|available:\s*no|already up to date|up to date)\b", re.IGNORECASE)
 RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
+UNKNOWN_CMD_RE = re.compile(r"\bunknown\s+(command|console\s+command)\b", re.IGNORECASE)
+SR_NAME_RE = re.compile(r"\bsmooth\s*restarter\b", re.IGNORECASE)
 
 # ---------------------------------------------------------
 # Optional dependency: websocket-client (for Rust WebRCON)
@@ -850,7 +857,7 @@ def fatal(msg, code=2, fp=None):
 
     print("", file=sys.stderr)
     print("Then create the local data dirs if needed:", file=sys.stderr)
-    print("  mkdir -p ./log ./data/lock", file=sys.stderr)
+    print("  mkdir -p ./data/log ./data/lock", file=sys.stderr)
 
     print("", file=sys.stderr)
     print(sep, file=sys.stderr)
@@ -1045,6 +1052,64 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
 # --------------------------------------------------------
 # Checks on SmoothRestarter integrity
 # --------------------------------------------------------
+def _extract_line_matching(text: str, pat: re.Pattern):
+    for ln in (text or "").splitlines():
+        if pat.search(ln):
+            return ln.strip()
+    return ""
+
+def smoothrestarter_loaded_via_rcon(cfg, fp=None):
+    """
+    Returns (state, detail)
+      state: "LOADED" | "FAILED" | "NOT_FOUND" | "SKIPPED" | "UNKNOWN"
+    """
+    ok_ws, ws_err = websocket_dep_status()
+    if not ok_ws:
+        return ("SKIPPED", f"websocket-client missing ({ws_err})")
+
+    ip, port, pw = detect_rcon_from_identity(cfg)
+    if not (ip and port and pw):
+        return ("SKIPPED", "RCON autodetect failed (missing ip/port/password)")
+
+    # 1) Try framework plugin list commands (best signal)
+    probe_cmds = [
+        "oxide.plugins",   # uMod/Oxide :contentReference[oaicite:2]{index=2}
+        "plugins",         # alias :contentReference[oaicite:3]{index=3}
+        "c.plugins",       # Carbon :contentReference[oaicite:4]{index=4}
+    ]
+
+    for cmd in probe_cmds:
+        ok, resp = rcon_send(cfg, cmd, fp=fp)
+        if not ok:
+            continue
+
+        msg = rcon_extract_message(resp)
+        if not msg:
+            continue
+
+        if UNKNOWN_CMD_RE.search(msg):
+            continue
+
+        hitline = _extract_line_matching(msg, SR_NAME_RE)
+        if hitline:
+            # Try to distinguish "loaded" vs "failed" (oxide.plugins includes failed-to-load)
+            if re.search(r"\b(fail|error|exception)\b", hitline, re.IGNORECASE):
+                return ("FAILED", f"{cmd}: {hitline}")
+            return ("LOADED", f"{cmd}: {hitline}")
+
+        # Command worked, but SR not in list
+        return ("NOT_FOUND", f"{cmd}: SmoothRestarter not listed")
+
+    # 2) Fallback: ask SR itself (works even if list cmd differs)
+    prefix = smoothrestarter_cmd_prefix(cfg)  # "sr" or "srestart" etc
+    ok, resp = rcon_send(cfg, f"{prefix} status", fp=fp)
+    if ok:
+        msg = rcon_extract_message(resp)
+        if msg and not UNKNOWN_CMD_RE.search(msg):
+            return ("LOADED", f"{prefix} status: {strip_ansi(msg).strip()[:200]}")
+
+    return ("UNKNOWN", "could not verify via oxide.plugins/plugins/c.plugins nor via '<prefix> status'")
+
 def _read_text_best_effort(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="ignore")
@@ -1187,6 +1252,16 @@ def smoothrestarter_available(server_dir: str, cfg: dict):
     notes.extend(cmd_notes)
     if not cmd_ok:
         notes.append("SmoothRestarter command alias check failed (warn-only).")
+
+    # Optional: runtime-loaded check (RCON)
+    if parse_bool(cfg.get("smoothrestarter_check_loaded"), False):
+        state, detail = smoothrestarter_loaded_via_rcon(cfg, fp=None)
+        notes.append(f"SmoothRestarter runtime-loaded check: {state} -- {detail}")
+
+        if parse_bool(cfg.get("smoothrestarter_check_loaded_strict"), False):
+            if state not in ("LOADED",):
+                notes.append("SmoothRestarter runtime-loaded strict mode: treating as NOT OK")
+                return False, sr_cfg.exists(), str(sr_cfg), str(sr_plugin), notes
 
     return True, sr_cfg.exists(), str(sr_cfg), str(sr_plugin), notes
 
@@ -2278,8 +2353,8 @@ def main():
         except Exception as e:
             log(f"FORCED_WIPE: WARNING: failed to compute/log forced wipe schedule: {e}", fp)
 
-    # One-time SmoothRestarter info on startup (only if bridge is enabled)
-    if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
+    # One-time SmoothRestarter info on startup (even if bridge is disabled)
+    if parse_bool(cfg.get("smoothrestarter_check_loaded"), False) or parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
         ok, cfg_ok, sr_cfg, sr_plugin, notes = smoothrestarter_available(server_dir, cfg)
         for n in notes:
             log(f"SMOOTH_BRIDGE: {n}", fp)

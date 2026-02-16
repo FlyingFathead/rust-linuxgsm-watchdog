@@ -63,6 +63,9 @@
   "smoothrestarter_config_path": "",
   "smoothrestarter_plugin_path": "",
 
+  "smoothrestarter_check_loaded": true,
+  "smoothrestarter_check_loaded_strict": false,
+
   "check_lgsm_details": false,
 
   "recovery_steps": ["update", "mu", "restart"],

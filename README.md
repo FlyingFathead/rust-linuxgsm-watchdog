@@ -322,6 +322,7 @@ Run the watchdog outside tmux/screen (systemd recommended) so recovery isn’t b
 ---
 
 ### History
+- v0.2.9 - More detailed Smooth Restarter Oxide/Carbon checkup
 - v0.2.8 - Rudimentary checks on [Smooth Restarter](https://umod.org/plugins/smooth-restarter) integrity; more bug fixes
 - v0.2.7 - Small bugfixes
 - v0.2.6 - Implemented a standalone restart timer notification to the server when Smooth Restarter is not available and when we're watching for updates
