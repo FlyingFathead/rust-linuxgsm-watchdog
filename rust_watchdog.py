@@ -228,6 +228,57 @@ RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
 UNKNOWN_CMD_RE = re.compile(r"\bunknown\s+(command|console\s+command)\b", re.IGNORECASE)
 SR_NAME_RE = re.compile(r"\bsmooth\s*restarter\b", re.IGNORECASE)
 
+LOG = logging.getLogger("rust_watchdog")
+
+# ---------------------------------------------------------
+# ALERTS (optional module)
+# ---------------------------------------------------------
+ALERTS = None
+
+def init_alerts(cfg, fp=None):
+    """
+    Initialize optional alert manager.
+    Never raises. Never breaks watchdog.
+    """
+    global ALERTS
+
+    if not parse_bool(cfg.get("alerts_enabled"), False):
+        log("ALERTS: disabled (alerts_enabled=false)", fp)
+        return None
+
+    try:
+        # Ensure script dir is on sys.path (systemd safe, symlink safe)
+        if PROJECT_DIR not in sys.path:
+            sys.path.insert(0, PROJECT_DIR)
+
+        from rust_watchdog_alerts import AlertManager  # noqa
+    except Exception as e:
+        log(f"ALERTS: disabled (import failed): {e}", fp)
+        ALERTS = None
+        return None
+
+    try:
+        # Prefer injection over stdlib logging wiring:
+        ALERTS = AlertManager(cfg, emit_log=lambda m: log(f"ALERTS: {m}", fp))
+        log("ALERTS: enabled", fp)
+        return ALERTS
+    except Exception as e:
+        log(f"ALERTS: disabled (init failed): {e}", fp)
+        ALERTS = None
+        return None
+
+def alert(event: str, message: str = "", level: str = "info", fp=None, **ctx):
+    """
+    Fire-and-forget alert. Never raises.
+    """
+    if not ALERTS:
+        return
+    try:
+        ALERTS.emit(event=event, message=message, level=level, **ctx)
+    except Exception as e:
+        # don't spam; just one line
+        log(f"ALERTS: emit failed: {e}", fp)
+
 # ---------------------------------------------------------
 # Optional dependency: websocket-client (for Rust WebRCON)
 # ---------------------------------------------------------
@@ -662,6 +713,21 @@ def sleep_interruptible(seconds):
         time.sleep(0.2)
 
 # ----------------------------------------------------
+# PID finder for RustDedicated
+# ----------------------------------------------------
+def pgrep_rustdedicated_cmdlines():
+    """
+    Return lines like: '<pid> ./RustDedicated -batchmode ...'
+    This excludes tmux wrapper processes.
+    """
+    try:
+        return subprocess.check_output(["pgrep", "-ax", "RustDedicated"], text=True).splitlines()
+    except subprocess.CalledProcessError:
+        return []
+    except Exception:
+        return []
+
+# ----------------------------------------------------
 # Find potential duplicate instances of RustDedicated
 # ----------------------------------------------------
 def find_rustdedicated_identity_matches(identity: str):
@@ -671,7 +737,7 @@ def find_rustdedicated_identity_matches(identity: str):
     needle1 = f"+server.identity {identity}"
     needle2 = f'+server.identity "{identity}"'
     try:
-        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+        lines = pgrep_rustdedicated_cmdlines()
     except Exception:
         return []
 
@@ -750,13 +816,18 @@ def handle_duplicate_rustdedicated(cfg, fp=None) -> bool:
         pause_file = (cfg.get("pause_file") or "").strip()
         if pause_file:
             try:
-                Path(pause_file).write_text(
-                    f"auto-paused due to duplicate RustDedicated instances for identity='{identity}' at {ts()}\n",
-                    encoding="utf-8"
-                )
-                log(f"DUPLICATE: created pause file: {pause_file}", fp)
+                if os.path.exists(pause_file):
+                    # Do NOT overwrite; could be a manual pause.
+                    log(f"DUPLICATE: pause file already exists (not overwriting): {pause_file}", fp)
+                else:
+                    Path(pause_file).write_text(
+                        f"reason=duplicate_identity identity={identity} at={ts()}\n",
+                        encoding="utf-8"
+                    )
+                    log(f"DUPLICATE: created pause file: {pause_file}", fp)
             except Exception as e:
                 log(f"DUPLICATE: failed to create pause file '{pause_file}': {e}", fp)
+
         log("DUPLICATE: skipping watchdog actions this tick (policy=pause)", fp)
         return False
 
@@ -775,6 +846,43 @@ def handle_duplicate_rustdedicated(cfg, fp=None) -> bool:
         return False  # let next tick settle
 
     log(f"DUPLICATE: unknown dupe_identity_policy='{policy}' -> defaulting to pause behavior", fp)
+    return False
+
+def autoclear_stale_dupe_pause_on_startup(cfg, fp=None):
+    """
+    Auto-clear pause_file ONLY if it was auto-created for duplicate identity
+    and the duplicate condition is no longer present.
+    Never raises.
+    """
+    pause_file = (cfg.get("pause_file") or "").strip()
+    if not pause_file or not os.path.exists(pause_file):
+        return False
+
+    try:
+        txt = Path(pause_file).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        txt = ""
+
+    # Only auto-clear pauses we created for dupes
+    if "reason=duplicate_identity" not in (txt or ""):
+        log(f"PAUSE: pause_file exists (manual pause assumed): {pause_file}", fp)
+        return False
+
+    identity = str(cfg.get("identity") or "").strip()
+    hits = find_rustdedicated_identity_matches(identity) if identity else []
+
+    if len(hits) <= 1:
+        try:
+            os.unlink(pause_file)
+            log(f"PAUSE: auto-cleared stale dupe pause file: {pause_file}", fp)
+            return True
+        except Exception as e:
+            log(f"PAUSE: failed to auto-clear {pause_file}: {e}", fp)
+            return False
+
+    log(f"PAUSE: keeping pause file (duplicate still present): {pause_file}", fp)
+    for pid, line in hits:
+        log(f"PAUSE: still duplicate: pid={pid} cmd={redact_secrets(line)}", fp)
     return False
 
 # ------------------------------------
@@ -1481,7 +1589,7 @@ def detect_rcon_from_identity(cfg):
     needle2 = f'+server.identity "{identity}"'
 
     try:
-        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+        lines = pgrep_rustdedicated_cmdlines()
     except Exception:
         return (None, None, None)
 
@@ -1603,7 +1711,7 @@ def detect_lgsm_tmux_context(cfg, fp=None):
     needle2 = f"+server.identity \"{identity}\""
 
     try:
-        lines = subprocess.check_output(["pgrep", "-af", "RustDedicated"], text=True).splitlines()
+        lines = pgrep_rustdedicated_cmdlines()
     except subprocess.CalledProcessError:
         return (None, None)
     except Exception:
@@ -2247,7 +2355,7 @@ def main():
 
     cfg = load_cfg(args.config)
     cfg = normalize_cfg_paths(cfg, args.config)
-        
+
     global CFG_FOR_HINTS
     CFG_FOR_HINTS = cfg
     
@@ -2263,6 +2371,15 @@ def main():
 
     # Pre-flight checklist (also opens logfile if enabled)
     fp = preflight_or_die(cfg, server_dir, rustserver_path)
+    log(f"Rust Watchdog v{__version__} starting (dry_run={cfg.get('dry_run')})", fp)
+
+    # Auto-clear stale dupe pause files created by our dupe-guard (if safe)
+    autoclear_stale_dupe_pause_on_startup(cfg, fp)
+
+    # init alerts if in use
+    init_alerts(cfg, fp)
+    alert("watchdog_start", f"rust-linuxgsm-watchdog v{__version__} started", fp=fp,
+        identity=cfg.get("identity"), dry_run=cfg.get("dry_run"))
 
     # One-time dependency hint
     ok_ws, ws_err = websocket_dep_status()
@@ -2602,6 +2719,11 @@ def main():
                 if args.once:
                     break
     finally:
+        try:
+            if ALERTS and hasattr(ALERTS, "close"):
+                ALERTS.close()
+        except Exception:
+            pass
         release_lock(cfg["lockfile"])
         if fp:
             fp.close()
