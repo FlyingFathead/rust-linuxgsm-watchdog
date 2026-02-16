@@ -42,7 +42,7 @@
     { "dt_gt_seconds": 600,     "interval_seconds": 300   },
     { "dt_gt_seconds": 0,       "interval_seconds": 60    },
     { "dt_gt_seconds": -10800,  "interval_seconds": 600   },
-    { "interval_seconds": 86400 }                            
+    { "interval_seconds": 86400 }
   ],
 
   "forced_wipe_tag_scheduled": "scheduled",
@@ -59,7 +59,7 @@
   "smoothrestarter_console_cmd": "srestart restart {delay}",
 
   "restart_request_cooldown_seconds": 3600,
-  
+
   "smoothrestarter_config_path": "",
   "smoothrestarter_plugin_path": "",
 
@@ -69,5 +69,40 @@
   "check_lgsm_details": false,
 
   "recovery_steps": ["update", "mu", "restart"],
-  "timeouts": { "update": 1800, "mu": 900, "restart": 600 }
+  "timeouts": { "update": 1800, "mu": 900, "restart": 600 },
+
+  "alerts": {
+    "enabled": false,
+    "backends": ["telegram"],
+
+    "state_path": "/home/rustserver/rust-linuxgsm-watchdog/data/state/alerts_state.json",
+
+    "cooldown_seconds_default": 900,
+    "dedupe_seconds": 300,
+
+    "include_host": true,
+    "include_identity": true,
+
+    "telegram": {
+      "token_env": "RUST_WD_TELEGRAM_TOKEN",
+      "chat_ids_env": "RUST_WD_TELEGRAM_CHAT_IDS",
+      "parse_mode": "HTML",
+      "disable_web_preview": true,
+      "timeout_s": 8,
+      "preflight_getme": true
+    },
+
+    "discord": {
+      "webhook_env": "RUST_WD_DISCORD_WEBHOOK",
+      "timeout_s": 8
+    },
+
+    "cooldowns": {
+      "server_down": 900,
+      "server_recovered": 300,
+      "update_available": 1800,
+      "update_applied": 600,
+      "forced_wipe_soon": 3600
+    }
+  }
 }

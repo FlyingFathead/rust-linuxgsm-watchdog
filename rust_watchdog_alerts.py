@@ -16,6 +16,46 @@ from urllib.error import URLError, HTTPError
 
 TELEGRAM_LIMIT = 4096
 
+# ---------------------------------------
+# HELPERS
+# ---------------------------------------
+
+def _parse_int_list(s: str) -> List[int]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    # split on commas and whitespace
+    parts = []
+    for chunk in s.replace(",", " ").split():
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    out: List[int] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
+def _telegram_getme(token: str, timeout_s: int = 8) -> (bool, str):
+    # Returns (ok, detail)
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    req = Request(url, headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        obj = json.loads(raw) if raw else {}
+        if isinstance(obj, dict) and obj.get("ok") is True:
+            # keep it short; don’t leak anything sensitive
+            u = obj.get("result", {}).get("username", "")
+            return True, f"ok (bot=@{u})" if u else "ok"
+        return False, f"bad response: {raw[:200]}"
+    except (HTTPError, URLError, TimeoutError, OSError) as e:
+        return False, f"{type(e).__name__}: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 
 def _now() -> float:
     return time.time()
@@ -71,6 +111,7 @@ class TelegramBackend(Backend):
         self.parse_mode = parse_mode
         self.disable_web_preview = disable_web_preview
         self.timeout_s = timeout_s
+        self.last_error = ""
 
     def send(self, alert: Alert, rendered: str) -> bool:
         ok_all = True
@@ -90,11 +131,11 @@ class TelegramBackend(Backend):
                 try:
                     with urlopen(req, timeout=self.timeout_s) as resp:
                         _ = resp.read()
-                except (HTTPError, URLError, TimeoutError, OSError):
+                except (HTTPError, URLError, TimeoutError, OSError) as e:
+                    self.last_error = f"{type(e).__name__}: {e}"
                     ok_all = False
 
         return ok_all
-
 
 class DiscordWebhookBackend(Backend):
     name = "discord"
@@ -204,20 +245,23 @@ class AlertManager:
         # Telegram
         if "telegram" in backends:
             tcfg = self.cfg.get("telegram", {}) or {}
-            token = os.getenv(str(tcfg.get("token_env", "RUST_WD_TELEGRAM_TOKEN")), "")
-            chat_ids = tcfg.get("chat_ids") or tcfg.get("chat_id")
-            ids: List[int] = []
 
-            try:
-                if isinstance(chat_ids, list):
-                    ids = [int(x) for x in chat_ids]
-                elif isinstance(chat_ids, (str, int)):
-                    if isinstance(chat_ids, str) and "," in chat_ids:
-                        ids = [int(x.strip()) for x in chat_ids.split(",") if x.strip()]
-                    else:
-                        ids = [int(chat_ids)]
-            except Exception:
-                ids = []
+            token_env = str(tcfg.get("token_env", "RUST_WD_TELEGRAM_TOKEN")).strip()
+            chat_ids_env = str(tcfg.get("chat_ids_env", "RUST_WD_TELEGRAM_CHAT_IDS")).strip()
+
+            token = (os.getenv(token_env, "") or "").strip()
+            ids = _parse_int_list(os.getenv(chat_ids_env, ""))
+
+            timeout_s = int(tcfg.get("timeout_s", 8))
+            preflight = bool(tcfg.get("preflight_getme", False))
+
+            if preflight and token:
+                ok, detail = _telegram_getme(token, timeout_s=timeout_s)
+                if ok:
+                    self._log("INFO", f"telegram preflight getMe: {detail}")
+                else:
+                    self._log("WARN", f"telegram preflight getMe failed: {detail}")
+                    token = ""  # disable backend if token bad
 
             if token and ids:
                 self.backends.append(
@@ -226,7 +270,7 @@ class AlertManager:
                         chat_ids=ids,
                         parse_mode=str(tcfg.get("parse_mode", "HTML")),
                         disable_web_preview=bool(tcfg.get("disable_web_preview", True)),
-                        timeout_s=int(tcfg.get("timeout_s", 8)),
+                        timeout_s=timeout_s,
                     )
                 )
 
@@ -235,7 +279,12 @@ class AlertManager:
             dcfg = self.cfg.get("discord", {}) or {}
             webhook = os.getenv(str(dcfg.get("webhook_env", "RUST_WD_DISCORD_WEBHOOK")), "")
             if webhook:
-                self.backends.append(DiscordWebhookBackend(webhook_url=webhook, timeout_s=int(dcfg.get("timeout_s", 8))))
+                self.backends.append(
+                    DiscordWebhookBackend(
+                        webhook_url=webhook,
+                        timeout_s=int(dcfg.get("timeout_s", 8)),
+                    )
+                )
 
         if not self.backends:
             self._log("WARN", "enabled, but no usable backends configured -- disabling alerts")
