@@ -1669,16 +1669,49 @@ def rcon_send(cfg, command: str, fp=None):
     pw_enc = quote(pw, safe="")   # encode everything unsafe
     url = f"ws://{ip}:{port}/{pw_enc}"
 
-    ident = int(time.time())  # unique-ish
+    ident = int(time.time() * 1000)  # unique-ish (ms)
     payload = {"Identifier": ident, "Message": command, "Name": "watchdog"}
 
     ws = None
     try:
         ws = create_connection(url, timeout=5)
+        ws.settimeout(1.0)  # short recv timeout; we loop ourselves
         ws.send(json.dumps(payload))
-        ws.settimeout(3)
-        resp = ws.recv()
-        return (True, resp)
+
+        deadline = time.monotonic() + 3.0
+        last = ""
+
+        while time.monotonic() < deadline:
+            try:
+                resp = ws.recv()
+            except Exception as e:
+                last = str(e)
+                continue
+
+            if not resp:
+                continue
+
+            last = resp
+
+            # Prefer the frame that matches our Identifier
+            try:
+                obj = json.loads(resp)
+                if isinstance(obj, dict):
+                    rid = obj.get("Identifier", None)
+                    if rid == ident:
+                        return (True, resp)
+                    # ignore other frames (serverinfo/chat/etc)
+                    continue
+            except Exception:
+                # Non-JSON response: treat as reply
+                return (True, resp)
+
+        return (
+            False,
+            f"RCON recv timeout waiting for Identifier={ident} "
+            f"(last={strip_ansi(str(last))[:200]})"
+        )
+
     except Exception as e:
         return (False, f"RCON send failed: {e}")
     finally:
