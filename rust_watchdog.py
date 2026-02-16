@@ -11,7 +11,6 @@
 import argparse
 import getpass
 import json
-import logging
 import os
 from pathlib import Path
 import re
@@ -229,8 +228,6 @@ RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
 UNKNOWN_CMD_RE = re.compile(r"\bunknown\s+(command|console\s+command)\b", re.IGNORECASE)
 SR_NAME_RE = re.compile(r"\bsmooth\s*restarter\b", re.IGNORECASE)
 
-LOG = logging.getLogger("rust_watchdog")
-
 # ---------------------------------------------------------
 # ALERTS (optional module)
 # ---------------------------------------------------------
@@ -312,6 +309,9 @@ def redact_secrets(s: str) -> str:
 # Set to True when systemd/user requests a stop (SIGTERM/SIGINT)
 stop_requested = False
 
+# --------------------------------------------------------
+# LOGGING + TIMESTAMPS
+# --------------------------------------------------------
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2373,6 +2373,8 @@ def main():
     # Pre-flight checklist (also opens logfile if enabled)
     fp = preflight_or_die(cfg, server_dir, rustserver_path)
     log(f"Rust Watchdog v{__version__} starting (dry_run={cfg.get('dry_run')})", fp)
+    log(f"SOURCE: {os.path.abspath(__file__)}", fp)
+    log(f"CONFIG: {os.path.abspath(args.config)}", fp)
 
     # Auto-clear stale dupe pause files created by our dupe-guard (if safe)
     autoclear_stale_dupe_pause_on_startup(cfg, fp)
