@@ -10,6 +10,8 @@ This program is stdlib-only by default. If you enable WebRCON features (tests / 
 
 This is meant to complement workflows like uMod’s **[Smooth Restarter](https://umod.org/plugins/smooth-restarter)** that can *stop the server gracefully* but don’t handle **Steam-end server update + mod updates + restart** on their own.
 
+The Rust Watchdog currently supports server status/restart/update alerts via the [Telegram Bot API](https://core.telegram.org/bots).
+
 ---
 
 ## Why this exists
@@ -318,6 +320,149 @@ When `enable_smoothrestarter_bridge=true`, the watchdog logs the expected Smooth
 
 Note: the bridge sends commands via Rust WebRCON (requires `websocket-client`).
 Run the watchdog outside tmux/screen (systemd recommended) so recovery isn’t blocked by nested multiplexers.
+
+---
+
+## Telegram alerts setup
+
+The watchdog can send alert messages via **Telegram Bot API** (outbound HTTPS).
+
+### 1) Create a Telegram bot (get a token)
+
+1. In Telegram, open **@BotFather**
+2. Run:
+
+   * `/newbot`
+   * pick a name + username
+3. BotFather will give you a token that looks like:
+
+   * `123456789:AA...`
+
+Keep that token secret.
+
+### 2) Get your `chat_id` (private chat or group)
+
+#### Option A: Private chat (simplest)
+
+1. Open your new bot in Telegram and press **Start** (or send any message).
+2. On the server, run:
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456789:AA..."
+curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | jq
+```
+
+Look for something like:
+
+* `.result[].message.chat.id`
+
+You can also extract the latest chat id quickly:
+
+```bash
+curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" \
+  | jq '.result[-1].message.chat.id'
+```
+
+#### Option B: Group chat
+
+1. Add the bot to your group.
+2. In the group, send a command so the bot definitely “sees” it (privacy mode won’t block commands):
+
+   * `/start`
+3. Then run the same `getUpdates` command above and read the group `chat.id` (usually a **negative** number).
+
+### 3) Quick “does Telegram even work from this server” test
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456789:AA..."
+export TELEGRAM_CHAT_ID="123456789"   # or -1001234567890 for a group
+
+curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+  --data-urlencode "text=rust-linuxgsm-watchdog: test message" \
+  | jq
+```
+
+If it returns `"ok": true`, you’re good.
+
+### 4) Store secrets safely (recommended)
+
+Don’t hardcode the token in a public config. Use an env file readable only by root:
+
+```bash
+sudo install -m 600 /dev/null /etc/default/rust-watchdog
+sudo nano /etc/default/rust-watchdog
+```
+
+Put:
+
+```bash
+TELEGRAM_BOT_TOKEN="123456789:AA..."
+TELEGRAM_CHAT_ID="-1001234567890"
+```
+
+Then in your `rust-watchdog.service`, add:
+
+```ini
+EnvironmentFile=/etc/default/rust-watchdog
+```
+
+Reload + restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart rust-watchdog.service
+```
+
+### 5) Configure the watchdog
+
+**Config key names depend on the version.** If you’re unsure, just search the code:
+
+```bash
+grep -nRi "telegram" rust_watchdog.py
+```
+
+Typical configuration patterns look like one of these:
+
+#### Pattern A (flat keys)
+
+```json
+{
+  "enable_alerts": true,
+  "alerts_backend": "telegram",
+  "telegram_bot_token": "$TELEGRAM_BOT_TOKEN",
+  "telegram_chat_id": "$TELEGRAM_CHAT_ID"
+}
+```
+
+#### Pattern B (nested)
+
+```json
+{
+  "alerts": {
+    "enabled": true,
+    "backend": "telegram",
+    "telegram": {
+      "bot_token": "$TELEGRAM_BOT_TOKEN",
+      "chat_id": "$TELEGRAM_CHAT_ID"
+    }
+  }
+}
+```
+
+> Note: This project expands `$VARS` in config strings, so using environment variables keeps secrets out of the JSON.
+
+### 6) Verify alerts end-to-end
+
+Run a one-shot cycle (or whatever minimal run you prefer) and watch logs:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json --once
+# or:
+journalctl -u rust-watchdog.service -f
+```
+
+If Telegram is misconfigured, you should see a clear error (bad token/chat_id, blocked outbound HTTPS, etc.).
 
 ---
 
