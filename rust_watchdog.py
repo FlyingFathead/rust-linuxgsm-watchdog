@@ -1511,39 +1511,48 @@ def run_cmd(cmd, cwd, fp=None, timeout=None, dry_run=False):
             # If systemd/user asked us to stop, abort this step.
             if stop_requested:
                 log(f"Stop requested -- terminating: {' '.join(cmd)}", fp)
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                except Exception:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
-
-                # Give it a moment to die, then force-kill if needed
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline and p.poll() is None:
-                    time.sleep(0.2)
-
-                if p.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                    except Exception:
-                        try:
-                            p.kill()
-                        except Exception:
-                            pass
-
+                _terminate_process_group(p, fp, grace=5.0)
                 raise RuntimeError(f"Stop requested -- aborting: {' '.join(cmd)}")
 
-            # Hard timeout (works even if child prints nothing)
+            # if stop_requested:
+            #     log(f"Stop requested -- terminating: {' '.join(cmd)}", fp)
+            #     try:
+            #         os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            #     except Exception:
+            #         try:
+            #             p.terminate()
+            #         except Exception:
+            #             pass
+
+            #     # Give it a moment to die, then force-kill if needed
+            #     deadline = time.monotonic() + 5.0
+            #     while time.monotonic() < deadline and p.poll() is None:
+            #         time.sleep(0.2)
+
+            #     if p.poll() is None:
+            #         try:
+            #             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            #         except Exception:
+            #             try:
+            #                 p.kill()
+            #             except Exception:
+            #                 pass
+
+            #     raise RuntimeError(f"Stop requested -- aborting: {' '.join(cmd)}")
+
+            # # Hard timeout (works even if child prints nothing)
+            # if timeout is not None and (time.monotonic() - start) > timeout:
+            #     try:
+            #         os.killpg(os.getpgid(p.pid), signal.SIGKILL)  # kill whole group
+            #     except Exception:
+            #         try:
+            #             p.kill()  # fallback: at least kill the parent
+            #         except Exception:
+            #             pass
+            #     raise TimeoutError(f"Timeout after {timeout}s: {' '.join(cmd)}")
+
             if timeout is not None and (time.monotonic() - start) > timeout:
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)  # kill whole group
-                except Exception:
-                    try:
-                        p.kill()  # fallback: at least kill the parent
-                    except Exception:
-                        pass
+                _terminate_process_group(p, fp, grace=20.0)  # pick your grace
                 raise TimeoutError(f"Timeout after {timeout}s: {' '.join(cmd)}")
 
             # Wait briefly for output (non-blocking)
@@ -1572,6 +1581,37 @@ def run_cmd(cmd, cwd, fp=None, timeout=None, dry_run=False):
                 p.stdout.close()
         except Exception:
             pass
+
+def _terminate_process_group(p, fp, *, grace=20.0):
+    # Try TERM first so LinuxGSM can clean up locks
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        log(f"TERM sent to process group pid={p.pid}", fp)
+    except Exception:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + float(grace)
+    while time.monotonic() < deadline and p.poll() is None:
+        time.sleep(0.2)
+
+    if p.poll() is None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            log(f"KILL sent to process group pid={p.pid}", fp)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    # Reap it (best-effort)
+    try:
+        p.wait(timeout=5.0)
+    except Exception:
+        pass
 
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s or "")
