@@ -16,6 +16,18 @@ from urllib.error import URLError, HTTPError
 
 TELEGRAM_LIMIT = 4096
 
+DEFAULT_EMOJI_BY_EVENT = {
+    "recovery_attempted": "⚠️",
+    "confirmed_down": "☠️",
+}
+
+DEFAULT_EMOJI_BY_LEVEL = {
+    "INFO": "ℹ️",
+    "WARNING": "⚠️",
+    "ERROR": "🧨",
+    "CRITICAL": "☠️",
+}
+
 # ---------------------------------------
 # HELPERS
 # ---------------------------------------
@@ -221,8 +233,11 @@ class AlertManager:
         self.app_default = str(self.cfg.get("app", "rust-linuxgsm-watchdog"))
         self.version_default = str(self.cfg.get("version", "")).strip()
 
-        self.emoji_by_event = self.cfg.get("emoji_by_event", {}) or {}
-        self.emoji_by_level = self.cfg.get("emoji_by_level", {}) or {}
+        cfg_e_event = self.cfg.get("emoji_by_event", {}) or {}
+        cfg_e_level = self.cfg.get("emoji_by_level", {}) or {}
+
+        self.emoji_by_event = {**DEFAULT_EMOJI_BY_EVENT, **cfg_e_event}
+        self.emoji_by_level = {**DEFAULT_EMOJI_BY_LEVEL, **cfg_e_level}
 
         self.event_titles = self.cfg.get("event_titles", {}) or {}
         self.event_bodies = self.cfg.get("event_bodies", {}) or {}
