@@ -8,35 +8,33 @@ Type=simple
 User=rustserver
 Group=rustserver
 WorkingDirectory=/home/rustserver/rust-linuxgsm-watchdog
+EnvironmentFile=-/etc/default/rust-watchdog
 
-# Create a private runtime dir under /run for a lockfile
+# One-instance guard (NO /tmp lockfiles). systemd creates /run/rust-watchdog/
 RuntimeDirectory=rust-watchdog
 RuntimeDirectoryMode=0755
 
-# HARD LOCK: prevent multiple watchdog instances (and duplicate RustDedicated)
-# venv method:
-ExecStart=/usr/bin/flock -n /run/rust-watchdog/lock \
-  /home/rustserver/rust-linuxgsm-watchdog/.venv/bin/python \
-  /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py \
-  --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
+# venv method (recommended)
+ExecStart=/usr/bin/flock -n /run/rust-watchdog/lock /home/rustserver/rust-linuxgsm-watchdog/.venv/bin/python /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
 
 # alt method (no venv):
-# ExecStart=/usr/bin/flock -n /run/rust-watchdog/lock \
-#   /usr/bin/python3 \
-#   /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py \
-#   --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
+# ExecStart=/usr/bin/flock -n /run/rust-watchdog/lock /usr/bin/python3 /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.py --config /home/rustserver/rust-linuxgsm-watchdog/rust_watchdog.json
 
-# Restart only when the watchdog crashes / exits non-zero
+# Restart only if watchdog fails (prevents “restart loops” from papering over real errors)
 Restart=on-failure
 RestartSec=5
 
-# On stop/restart, kill the whole cgroup (watchdog + tmux/RustDedicated it spawned).
-# (KillMode defaults to control-group; leaving it unset is fine.)
+# Stop behavior:
+# Default (recommended): service "owns" the server. Stopping/restarting the service stops tmux/RustDedicated it spawned.
+KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=30
 
+# IMPORTANT: Do NOT enable PrivateTmp when using LinuxGSM+tmux unless you *really* know what you're doing.
+# It can make LinuxGSM's tmux/socket checks disagree with reality.
+PrivateTmp=false
+
 NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
