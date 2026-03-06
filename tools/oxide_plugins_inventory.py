@@ -33,8 +33,10 @@ CS_STR = r'"(?P<s>(?:\\.|[^"\\])*)"'
 # Match C# verbatim string literal: @" ... " where quotes are doubled: ""
 CS_VSTR = r'@\"(?P<vs>(?:\"\"|[^\"])*?)\"'
 
+# Info("Name","Author","Version") -- Python re forbids duplicate named groups,
+# so we give the 3 fields unique names.
 INFO_RE = re.compile(
-    rf'\[\s*Info\s*\(\s*{CS_STR}\s*,\s*{CS_STR}\s*,\s*{CS_STR}\s*\)\s*\]',
+    r'\[\s*Info\s*\(\s*"(?P<name>(?:\\.|[^"\\])*)"\s*,\s*"(?P<author>(?:\\.|[^"\\])*)"\s*,\s*"(?P<version>(?:\\.|[^"\\])*)"\s*\)\s*\]',
     re.MULTILINE,
 )
 
@@ -105,18 +107,13 @@ def _extract_info(text: str) -> Tuple[Optional[str], Optional[str], Optional[str
     if not m:
         return None, None, None
 
-    # INFO_RE has three CS_STR blocks, each with same group name "s", so we can't use groupdict.
-    # Use findall with a more explicit pattern:
-    # We'll re-run a parse over the matched chunk to get the three strings in order.
-    chunk = m.group(0)
-    strings = re.findall(r'"((?:\\.|[^"\\])*)"', chunk)
-    if len(strings) >= 3:
-        name = _unescape_csharp_normal(strings[0])
-        author = _unescape_csharp_normal(strings[1])
-        version = _unescape_csharp_normal(strings[2])
-        return name, author, version
+    gd = m.groupdict()
 
-    return None, None, None
+    name = _unescape_csharp_normal(gd.get("name") or "").strip()
+    author = _unescape_csharp_normal(gd.get("author") or "").strip()
+    version = _unescape_csharp_normal(gd.get("version") or "").strip()
+
+    return (name or None, author or None, version or None)
 
 
 def scan_plugins(dir_path: Path, recursive: bool = False) -> List[Dict[str, Any]]:
@@ -210,6 +207,11 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = scan_plugins(Path(args.dir).expanduser(), recursive=args.recursive)
+
+    if not rows:
+        p = str(Path(args.dir).expanduser())
+        print(f"No plugins found in directory: {p}")
+        return 0
 
     if args.as_json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))
