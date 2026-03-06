@@ -2,18 +2,24 @@
 """
 umod_plugins_check.py
 
-Check local Oxide/uMod Rust plugins (*.cs) against uMod's public JSON endpoints.
+Check local Oxide/uMod Rust plugins (*.cs) against uMod plugin JSON endpoints.
 
-Strategy:
-- Use your existing oxide_plugins_inventory.py as the local source of truth.
-- For each local plugin, query uMod:
-    https://umod.org/plugins/search.json?query=<q>&page=1&sort=title&sortdir=asc&filter=&categories[]=rust
-  and pick the best match (prefer exact download_url basename == local filename).
-- Cache responses on disk to avoid rate limits.
+Prefer direct per-plugin JSON:
+  https://umod.org/plugins/<TitleCaseName>.json
 
-Refs:
-- search.json endpoint is recommended by uMod admin: /plugins/search.json?... :contentReference[oaicite:2]{index=2}
-- uMod also mentions /latest.json and warns about rate limits :contentReference[oaicite:3]{index=3}
+This avoids hammering /plugins/search.json per plugin (which rate-limits fast and is legacy).
+
+Features:
+- cache to disk (TTL)
+- proper 429 handling (Retry-After / X-Retry-After)
+- min interval throttling
+- progress output
+- optional ANSI colors
+
+Exit codes:
+- 0: all OK
+- 1: at least one OUTDATED
+- 2: at least one UNKNOWN or ERROR
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 # ------------------------------------------------------------
-# Import your inventory scanner (no duplicated parsing)
+# Import your inventory scanner (local source of truth)
 # ------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -43,54 +49,34 @@ except Exception as e:
     print(f"FATAL: cannot import scan_plugins from oxide_plugins_inventory.py: {e}", file=sys.stderr)
     raise SystemExit(2)
 
-# ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
-UMOD_SEARCH_BASE = "https://umod.org/plugins/search.json"
 USER_AGENT = "rust-linuxgsm-watchdog/umod_plugins_check (stdlib urllib)"
 
+UMOD_PLUGIN_JSON = "https://umod.org/plugins/{name}.json"
+UMOD_SEARCH_JSON = "https://umod.org/plugins/search.json"
+
 CACHE_DIR_DEFAULT = HERE.parent / "data" / "cache"
-CACHE_FILE_DEFAULT = CACHE_DIR_DEFAULT / "umod_search_cache.json"
-CACHE_TTL_SECONDS_DEFAULT = 12 * 3600  # 12h
+CACHE_FILE_DEFAULT = CACHE_DIR_DEFAULT / "umod_plugin_json_cache.json"
+CACHE_TTL_SECONDS_DEFAULT = 12 * 3600
 
 # ------------------------------------------------------------
-# Helpers
+# Version compare (best-effort)
 # ------------------------------------------------------------
-def norm(s: str) -> str:
-    s = (s or "").lower()
-    return re.sub(r"[^a-z0-9]+", "", s)
-
-def stem_noext(filename: str) -> str:
-    return Path(filename).stem
-
 def parse_version(v: str) -> Tuple[Tuple[int, ...], str]:
-    """
-    Best-effort version compare. Good enough for typical x.y.z(.n).
-    Returns (nums, suffix). Compares nums lexicographically; suffix as tiebreaker.
-    """
     v = (v or "").strip()
     if v.startswith(("v", "V")):
         v = v[1:].strip()
-
     m = re.match(r"^([0-9]+(?:\.[0-9]+)*)?(.*)$", v)
     if not m:
         return ((), v)
-
     nums_s = (m.group(1) or "").strip()
     suffix = (m.group(2) or "").strip()
-
-    nums: Tuple[int, ...]
     if nums_s:
-        nums = tuple(int(x) for x in nums_s.split(".") if x.isdigit() or re.match(r"^\d+$", x))
+        nums = tuple(int(x) for x in nums_s.split(".") if re.match(r"^\d+$", x))
     else:
         nums = ()
-
     return (nums, suffix)
 
 def version_is_newer(remote: str, local: str) -> Optional[bool]:
-    """
-    Returns True if remote > local, False if remote <= local, None if can't compare.
-    """
     if not remote or not local:
         return None
     r_nums, r_suf = parse_version(remote)
@@ -99,31 +85,15 @@ def version_is_newer(remote: str, local: str) -> Optional[bool]:
         return None
     if r_nums != l_nums:
         return r_nums > l_nums
-    # same numeric version: treat suffix presence as "different" but not strictly newer
     if r_suf == l_suf:
         return False
-    # If remote has no suffix but local does, assume remote is "cleaner"/newer-ish
     if (not r_suf) and l_suf:
         return True
     return None
 
-def http_get_json(url: str, *, timeout_s: int = 12) -> Any:
-    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    try:
-        with urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read()
-        return json.loads(raw.decode("utf-8", errors="replace") or "{}")
-    except HTTPError as e:
-        # Handle rate limiting nicely
-        if e.code == 429:
-            retry_after = e.headers.get("Retry-After", "")
-            raise RuntimeError(f"HTTP 429 rate-limited (Retry-After={retry_after})")
-        raise RuntimeError(f"HTTPError {e.code}: {e.reason}")
-    except URLError as e:
-        raise RuntimeError(f"URLError: {e}")
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"JSONDecodeError: {e}")
-
+# ------------------------------------------------------------
+# Cache
+# ------------------------------------------------------------
 def ensure_cache_path(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -141,46 +111,126 @@ def save_cache(path: Path, obj: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
-def umod_search_url(query: str, *, page: int = 1) -> str:
-    # categories[]=rust matches what uMod staff recommend in examples (urlencoded in their post) :contentReference[oaicite:4]{index=4}
+# ------------------------------------------------------------
+# HTTP with 429 handling + rate-limit headers
+# ------------------------------------------------------------
+@dataclass
+class HttpResult:
+    data: Any
+    headers: Dict[str, str]
+
+def _headers_dict(h) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        for k, v in h.items():
+            out[str(k)] = str(v)
+    except Exception:
+        pass
+    return out
+
+def _retry_after_seconds(headers: Dict[str, str]) -> Optional[int]:
+    for k in ("Retry-After", "X-Retry-After"):
+        v = headers.get(k)
+        if v:
+            try:
+                return int(float(v))
+            except Exception:
+                pass
+    return None
+
+def http_get_json(
+    url: str,
+    *,
+    timeout_s: int,
+    min_interval_s: float,
+    max_retries: int,
+    debug_headers: bool,
+) -> HttpResult:
+    # naive min-interval limiter (per-process)
+    now = time.monotonic()
+    last = getattr(http_get_json, "_last_call", 0.0)
+    dt = now - last
+    if dt < min_interval_s:
+        time.sleep(min_interval_s - dt)
+
+    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+
+    attempt = 0
+    while True:
+        attempt += 1
+        setattr(http_get_json, "_last_call", time.monotonic())
+        try:
+            with urlopen(req, timeout=timeout_s) as resp:
+                raw = resp.read()
+                hdrs = _headers_dict(resp.headers)
+            if debug_headers:
+                rl = {k: hdrs.get(k, "") for k in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After", "X-Retry-After")}
+                print(f"DEBUG headers: {rl}", file=sys.stderr)
+            obj = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+
+            # If server says remaining=0 and provides retry-after, we can be polite before next call
+            try:
+                rem = int(hdrs.get("X-RateLimit-Remaining", "999999"))
+            except Exception:
+                rem = 999999
+            ra = _retry_after_seconds(hdrs)
+            if rem == 0 and ra:
+                time.sleep(max(0, ra))
+
+            return HttpResult(data=obj, headers=hdrs)
+
+        except HTTPError as e:
+            hdrs = _headers_dict(e.headers)
+            if e.code == 429:
+                ra = _retry_after_seconds(hdrs)
+                if ra is None:
+                    ra = 30
+                if attempt <= max_retries:
+                    # obey Retry-After and retry
+                    time.sleep(max(0, ra))
+                    continue
+                raise RuntimeError(f"HTTP 429 rate-limited (Retry-After={ra}) after {max_retries} retries")
+            if e.code == 404:
+                raise FileNotFoundError("404 not found")
+            raise RuntimeError(f"HTTPError {e.code}: {e.reason}")
+
+        except URLError as e:
+            if attempt <= max_retries:
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(f"URLError: {e}")
+
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"JSONDecodeError: {e}")
+
+# ------------------------------------------------------------
+# Matching / URLs
+# ------------------------------------------------------------
+def stem_noext(filename: str) -> str:
+    return Path(filename).stem
+
+def umod_direct_json_url(stem: str) -> str:
+    # Works for many plugins: Vanish.json, AdminNoLoot.json etc.
+    return UMOD_PLUGIN_JSON.format(name=stem)
+
+def umod_search_url(query: str) -> str:
     params = [
         ("query", query),
-        ("page", str(page)),
+        ("page", "1"),
         ("sort", "title"),
         ("sortdir", "asc"),
         ("filter", ""),
         ("categories[]", "rust"),
     ]
-    return f"{UMOD_SEARCH_BASE}?{urlencode(params)}"
+    return f"{UMOD_SEARCH_JSON}?{urlencode(params)}"
 
-def cached_search(query: str, cache: Dict[str, Any], cache_ttl_s: int, cache_path: Path) -> Dict[str, Any]:
-    key = f"q:{query}"
-    now = int(time.time())
-    ent = cache.get(key)
-    if isinstance(ent, dict):
-        ts = int(ent.get("ts", 0) or 0)
-        if ts and (now - ts) <= cache_ttl_s and "data" in ent:
-            return ent["data"]
-
-    # Not cached / stale
-    url = umod_search_url(query, page=1)
-    data = http_get_json(url)
-    cache[key] = {"ts": now, "data": data}
-    save_cache(cache_path, cache)
-    return data
-
-def best_match_for_plugin(
-    local: Dict[str, Any],
-    search_data: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    filename = str(local.get("filename") or "")
-    file_stem = stem_noext(filename)
-    local_name = str(local.get("name") or "")
-    local_author = str(local.get("author") or "")
-
+def best_match_from_search(local_filename: str, search_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     items = search_data.get("data") if isinstance(search_data, dict) else None
     if not isinstance(items, list):
         return None
+
+    fn = local_filename.lower()
+    stem = stem_noext(local_filename).lower()
 
     best = None
     best_score = -1
@@ -188,78 +238,121 @@ def best_match_for_plugin(
     for it in items:
         if not isinstance(it, dict):
             continue
-
         score = 0
         dl = str(it.get("download_url") or "")
-        dl_base = Path(dl).name if dl else ""
-        title = str(it.get("title") or "")
-        name = str(it.get("name") or "")
-        author = str(it.get("author") or "")
+        dl_base = Path(dl).name.lower() if dl else ""
+        title = str(it.get("title") or "").lower()
+        name = str(it.get("name") or "").lower()
 
-        # Strongest: exact filename match from download_url
-        if dl_base and dl_base.lower() == filename.lower():
+        if dl_base == fn:
             score += 100
-
-        # Next: normalized comparisons
-        if local_name and norm(title) == norm(local_name):
+        if title.replace(" ", "") == stem.replace(" ", ""):
             score += 30
-        if norm(name) == norm(file_stem):
+        if name.replace(" ", "") == stem.replace(" ", ""):
             score += 25
-        if norm(title) == norm(file_stem):
-            score += 20
-
-        # Author (weaker; authors can be multi/merged)
-        if local_author and norm(author) == norm(local_author):
-            score += 10
-
-        # Tiny bonus if query found something that looks “Rust plugin-y”
-        if "rust" in (str(it.get("category_tags") or "") + "," + str(it.get("tags_all") or "")).lower():
-            score += 2
 
         if score > best_score:
             best_score = score
             best = it
 
-    # Require some minimal confidence unless we got the filename match.
-    if best and best_score >= 20:
-        return best
-    return best if (best and best_score >= 100) else None
+    return best if (best and best_score >= 25) else None
 
 # ------------------------------------------------------------
-# Output
+# ANSI colors (toggle)
 # ------------------------------------------------------------
-def print_table(rows: List[Dict[str, Any]]) -> None:
+ANSI = {
+    "reset": "\x1b[0m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "red": "\x1b[31m",
+    "cyan": "\x1b[36m",
+    "dim": "\x1b[2m",
+}
+
+def want_color(mode: str) -> bool:
+    mode = (mode or "auto").lower()
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return sys.stdout.isatty()
+
+def color_status(s: str, *, use: bool) -> str:
+    if not use:
+        return s
+    if s == "OK":
+        return f"{ANSI['green']}{s}{ANSI['reset']}"
+    if s == "OUTDATED":
+        return f"{ANSI['yellow']}{s}{ANSI['reset']}"
+    # UNKNOWN / ERROR
+    if s.startswith("ERROR"):
+        return f"{ANSI['red']}{s}{ANSI['reset']}"
+    if s.startswith("UNKNOWN"):
+        return f"{ANSI['red']}{s}{ANSI['reset']}"
+    return s
+
+# ------------------------------------------------------------
+# Output table
+# ------------------------------------------------------------
+def print_table(rows: List[Dict[str, Any]], *, use_color: bool) -> None:
     cols = ["filename", "local", "remote", "status", "remote_url", "remote_dl"]
     widths = {c: len(c) for c in cols}
 
     def s(v: Any) -> str:
         return "-" if v is None else str(v)
 
+    # compute widths without ANSI
     for r in rows:
         for c in cols:
             vv = s(r.get(c))
-            vv = (vv[:90] + "...") if (c in ("remote_url", "remote_dl") and len(vv) > 93) else vv
-            widths[c] = min(max(widths[c], len(vv)), 100)
+            if c in ("remote_url", "remote_dl") and len(vv) > 93:
+                vv = vv[:90] + "..."
+            widths[c] = min(max(widths[c], len(vv)), 110)
 
     header = "  ".join(c.ljust(widths[c]) for c in cols)
     print(header)
     print("-" * len(header))
+
     for r in rows:
         parts = []
         for c in cols:
             vv = s(r.get(c))
-            vv = (vv[:90] + "...") if (c in ("remote_url", "remote_dl") and len(vv) > 93) else vv
-            parts.append(vv.ljust(widths[c]))
-        print("  ".join(parts))
+            if c == "status":
+                vv = color_status(vv, use=use_color)
+            if c in ("remote_url", "remote_dl"):
+                raw = s(r.get(c))
+                if len(raw) > 93:
+                    raw = raw[:90] + "..."
+                vv = raw if not use_color else raw  # keep urls plain
+            parts.append(vv.ljust(widths[c]) if c != "status" else vv)
+        # status column may contain ANSI; don't ljust it
+        # rebuild line with fixed spacing except status:
+        line = []
+        for i, c in enumerate(cols):
+            if c == "status":
+                line.append(parts[i])
+            else:
+                line.append(parts[i].ljust(widths[c]))
+        print("  ".join(line))
 
+# ------------------------------------------------------------
+# Main logic
+# ------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("plugins_dir", nargs="?", default=".", help="oxide/plugins directory (default: .)")
     ap.add_argument("--recursive", action="store_true", help="scan recursively for *.cs")
     ap.add_argument("--cache", default=str(CACHE_FILE_DEFAULT), help=f"cache file (default: {CACHE_FILE_DEFAULT})")
     ap.add_argument("--cache-ttl", type=int, default=CACHE_TTL_SECONDS_DEFAULT, help="cache TTL seconds")
-    ap.add_argument("--sleep", type=float, default=0.25, help="sleep seconds between queries (rate limit friendliness)")
+    ap.add_argument("--timeout", type=int, default=12, help="HTTP timeout seconds")
+    ap.add_argument("--min-interval", type=float, default=0.6, help="minimum seconds between HTTP requests")
+    ap.add_argument("--max-retries", type=int, default=6, help="max retries for transient errors / 429")
     ap.add_argument("--outdated-only", action="store_true", help="only show outdated plugins")
+    ap.add_argument("--fallback-search", action="store_true", help="if direct .json 404s, try search.json (slower; may rate-limit)")
+    ap.add_argument("--progress", action="store_true", help="show progress lines (default: on if TTY)")
+    ap.add_argument("--no-progress", action="store_true", help="disable progress lines")
+    ap.add_argument("--color", default="auto", choices=["auto", "always", "never"], help="ANSI colors for status")
+    ap.add_argument("--debug-headers", action="store_true", help="print rate-limit headers to stderr")
     ap.add_argument("--json", dest="as_json", action="store_true", help="output JSON")
     args = ap.parse_args()
 
@@ -272,88 +365,136 @@ def main() -> int:
         print(f"No plugins found in directory: {plugins_dir}")
         return 0
 
+    show_progress = args.progress or (sys.stderr.isatty() and not args.no_progress)
+    use_color = want_color(args.color)
+
+    print(f"Found {len(locals_)} plugins in {plugins_dir} -- now checking uMod...", file=sys.stderr)
+
     out_rows: List[Dict[str, Any]] = []
-    errors = 0
+    any_outdated = False
+    any_unknown = False
 
-    for p in locals_:
+    for i, p in enumerate(locals_, start=1):
         filename = str(p.get("filename") or "")
+        stem = stem_noext(filename)
         local_ver = str(p.get("version") or "") or ""
-        local_name = str(p.get("name") or "") or ""
 
-        # Query choice: filename stem tends to match uMod download URLs best
-        q1 = stem_noext(filename)
-        q2 = local_name.strip()
+        # cache key: direct-json by stem
+        key = f"json:{stem}"
+        now = int(time.time())
+        cached = False
+        data = None
 
-        match = None
-        remote = None
+        ent = cache.get(key)
+        if isinstance(ent, dict):
+            ts = int(ent.get("ts", 0) or 0)
+            if ts and (now - ts) <= int(args.cache_ttl) and "data" in ent:
+                data = ent["data"]
+                cached = True
 
-        try:
-            d1 = cached_search(q1, cache, int(args.cache_ttl), cache_path)
-            match = best_match_for_plugin(p, d1)
-            if not match and q2 and norm(q2) != norm(q1):
-                time.sleep(float(args.sleep))
-                d2 = cached_search(q2, cache, int(args.cache_ttl), cache_path)
-                match = best_match_for_plugin(p, d2)
-        except Exception as e:
-            errors += 1
-            out_rows.append({
-                "filename": filename,
-                "local": local_ver or "-",
-                "remote": "-",
-                "status": f"ERROR: {e}",
-                "remote_url": "-",
-                "remote_dl": "-",
-            })
-            time.sleep(float(args.sleep))
-            continue
+        status = ""
+        remote_ver = "-"
+        remote_url = "-"
+        remote_dl = "-"
 
-        if match:
-            remote_ver = str(match.get("latest_release_version") or "") or ""
-            remote_url = str(match.get("url") or "") or ""
-            remote_dl = str(match.get("download_url") or "") or ""
+        if data is None:
+            url = umod_direct_json_url(stem)
+            try:
+                res = http_get_json(
+                    url,
+                    timeout_s=int(args.timeout),
+                    min_interval_s=float(args.min_interval),
+                    max_retries=int(args.max_retries),
+                    debug_headers=bool(args.debug_headers),
+                )
+                data = res.data
+                cache[key] = {"ts": now, "data": data}
+                save_cache(cache_path, cache)
+            except FileNotFoundError:
+                data = None
+            except Exception as e:
+                status = f"ERROR: {e}"
+                any_unknown = True
 
-            if local_ver and remote_ver:
+        # Fallback to search.json only if asked
+        if data is None and args.fallback_search and not status:
+            try:
+                sres = http_get_json(
+                    umod_search_url(stem),
+                    timeout_s=int(args.timeout),
+                    min_interval_s=float(args.min_interval),
+                    max_retries=int(args.max_retries),
+                    debug_headers=bool(args.debug_headers),
+                )
+                m = best_match_from_search(filename, sres.data if isinstance(sres.data, dict) else {})
+                if m:
+                    remote_ver = str(m.get("latest_release_version") or "-")
+                    remote_url = str(m.get("url") or "-")
+                    remote_dl = str(m.get("download_url") or "-")
+                    data = m  # enough fields for comparison
+                else:
+                    status = "UNKNOWN (no match)"
+                    any_unknown = True
+            except Exception as e:
+                status = f"ERROR: {e}"
+                any_unknown = True
+
+        if data is not None and not status:
+            # direct plugin json has these fields (same as Vanish.json)
+            remote_ver = str(data.get("latest_release_version") or "-")
+            remote_url = str(data.get("url") or "-")
+            remote_dl = str(data.get("download_url") or "-")
+
+            if local_ver != "-" and remote_ver != "-" and local_ver and remote_ver:
                 if local_ver == remote_ver:
                     status = "OK"
                 else:
                     newer = version_is_newer(remote_ver, local_ver)
                     status = "OUTDATED" if (newer is True or newer is None) else "OK"
             else:
-                status = "UNKNOWN"
+                status = "UNKNOWN (missing version)"
+                any_unknown = True
 
-            row = {
-                "filename": filename,
-                "local": local_ver or "-",
-                "remote": remote_ver or "-",
-                "status": status,
-                "remote_url": remote_url or "-",
-                "remote_dl": remote_dl or "-",
-            }
-        else:
-            row = {
-                "filename": filename,
-                "local": local_ver or "-",
-                "remote": "-",
-                "status": "UNKNOWN (no match)",
-                "remote_url": "-",
-                "remote_dl": "-",
-            }
+        if not status:
+            status = "UNKNOWN (no match)"
+            any_unknown = True
 
-        if args.outdated_only:
-            if row["status"] != "OUTDATED":
-                # keep also hard errors if you want; currently hide them in outdated-only mode
-                time.sleep(float(args.sleep))
-                continue
+        if status == "OUTDATED":
+            any_outdated = True
+
+        row = {
+            "filename": filename,
+            "local": local_ver or "-",
+            "remote": remote_ver or "-",
+            "status": status,
+            "remote_url": remote_url or "-",
+            "remote_dl": remote_dl or "-",
+        }
+
+        if args.outdated_only and status != "OUTDATED":
+            if show_progress:
+                tag = "cached" if cached else "net"
+                st = color_status(status, use=use_color)
+                print(f"[{i}/{len(locals_)}] {filename} -- {st} ({tag})", file=sys.stderr)
+            continue
 
         out_rows.append(row)
-        time.sleep(float(args.sleep))
+
+        if show_progress:
+            tag = "cached" if cached else "net"
+            st = color_status(status, use=use_color)
+            print(f"[{i}/{len(locals_)}] {filename} -- {st} ({tag})", file=sys.stderr)
 
     if args.as_json:
         print(json.dumps(out_rows, ensure_ascii=False, indent=2))
-        return 0 if errors == 0 else 1
+    else:
+        print_table(out_rows, use_color=use_color)
 
-    print_table(out_rows)
-    return 0 if errors == 0 else 1
+    if any_unknown:
+        return 2
+    if any_outdated:
+        return 1
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
