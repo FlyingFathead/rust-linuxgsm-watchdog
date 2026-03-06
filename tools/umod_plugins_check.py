@@ -2,12 +2,8 @@
 """
 umod_plugins_check.py
 
-Check local Oxide/uMod Rust plugins (*.cs) against uMod plugin JSON endpoints.
-
-Prefer direct per-plugin JSON:
-  https://umod.org/plugins/<TitleCaseName>.json
-
-This avoids hammering /plugins/search.json per plugin (which rate-limits fast and is legacy).
+Check local Oxide/uMod Rust plugins (*.cs) against uMod plugin JSON endpoints,
+with optional fallback to ChaosCode manifest for plugins that do not match uMod.
 
 Features:
 - cache to disk (TTL)
@@ -15,6 +11,7 @@ Features:
 - min interval throttling
 - progress output
 - optional ANSI colors
+- optional ChaosCode fallback (default: on)
 
 Exit codes:
 - 0: all OK
@@ -54,9 +51,13 @@ USER_AGENT = "rust-linuxgsm-watchdog/umod_plugins_check (stdlib urllib)"
 UMOD_PLUGIN_JSON = "https://umod.org/plugins/{name}.json"
 UMOD_SEARCH_JSON = "https://umod.org/plugins/search.json"
 
+CHAOS_MANIFEST_JSON = "https://chaoscode.io/api/resource_manifest.json"
+
 CACHE_DIR_DEFAULT = HERE.parent / "data" / "cache"
 CACHE_FILE_DEFAULT = CACHE_DIR_DEFAULT / "umod_plugin_json_cache.json"
 CACHE_TTL_SECONDS_DEFAULT = 12 * 3600
+
+CHAOS_CACHE_TTL_SECONDS_DEFAULT = 45 * 60  # manifest updates ~31m; keep a little headroom
 
 # ------------------------------------------------------------
 # Version compare (best-effort)
@@ -186,7 +187,6 @@ def http_get_json(
                 if ra is None:
                     ra = 30
                 if attempt <= max_retries:
-                    # obey Retry-After and retry
                     time.sleep(max(0, ra))
                     continue
                 raise RuntimeError(f"HTTP 429 rate-limited (Retry-After={ra}) after {max_retries} retries")
@@ -210,7 +210,6 @@ def stem_noext(filename: str) -> str:
     return Path(filename).stem
 
 def umod_direct_json_url(stem: str) -> str:
-    # Works for many plugins: Vanish.json, AdminNoLoot.json etc.
     return UMOD_PLUGIN_JSON.format(name=stem)
 
 def umod_search_url(query: str) -> str:
@@ -258,6 +257,64 @@ def best_match_from_search(local_filename: str, search_data: Dict[str, Any]) -> 
     return best if (best and best_score >= 25) else None
 
 # ------------------------------------------------------------
+# ChaosCode manifest loader (cached)
+# ------------------------------------------------------------
+def load_chaos_manifest(
+    cache: Dict[str, Any],
+    cache_path: Path,
+    *,
+    ttl_s: int,
+    timeout_s: int,
+    debug_headers: bool,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns mapping: stem_lower -> resource dict
+    Resource fields (typical):
+      ResourceTitle, ResourceVersion, ResourceFile, ResourceURL, AuthorName
+    """
+    key = "chaos:manifest"
+    now = int(time.time())
+
+    ent = cache.get(key)
+    if isinstance(ent, dict):
+        ts = int(ent.get("ts", 0) or 0)
+        if ts and (now - ts) <= int(ttl_s) and "data" in ent and isinstance(ent["data"], list):
+            manifest_list = ent["data"]
+            return _index_chaos_manifest(manifest_list)
+
+    # Fetch fresh
+    res = http_get_json(
+        CHAOS_MANIFEST_JSON,
+        timeout_s=int(timeout_s),
+        min_interval_s=0.0,  # one call
+        max_retries=3,
+        debug_headers=bool(debug_headers),
+    )
+    manifest_list = res.data
+    if not isinstance(manifest_list, list):
+        raise RuntimeError("Chaos manifest: unexpected JSON shape (expected list)")
+
+    cache[key] = {"ts": now, "data": manifest_list}
+    save_cache(cache_path, cache)
+
+    return _index_chaos_manifest(manifest_list)
+
+def _index_chaos_manifest(manifest_list: List[Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for it in manifest_list:
+        if not isinstance(it, dict):
+            continue
+        rf = str(it.get("ResourceFile") or "").strip()
+        if not rf:
+            continue
+        stem = rf.split(".", 1)[0].strip().lower()
+        if not stem:
+            continue
+        # last-one-wins; fine for our use
+        out[stem] = it
+    return out
+
+# ------------------------------------------------------------
 # ANSI colors (toggle)
 # ------------------------------------------------------------
 ANSI = {
@@ -265,8 +322,6 @@ ANSI = {
     "green": "\x1b[32m",
     "yellow": "\x1b[33m",
     "red": "\x1b[31m",
-    "cyan": "\x1b[36m",
-    "dim": "\x1b[2m",
 }
 
 def want_color(mode: str) -> bool:
@@ -284,10 +339,7 @@ def color_status(s: str, *, use: bool) -> str:
         return f"{ANSI['green']}{s}{ANSI['reset']}"
     if s == "OUTDATED":
         return f"{ANSI['yellow']}{s}{ANSI['reset']}"
-    # UNKNOWN / ERROR
-    if s.startswith("ERROR"):
-        return f"{ANSI['red']}{s}{ANSI['reset']}"
-    if s.startswith("UNKNOWN"):
+    if s.startswith("ERROR") or s.startswith("UNKNOWN"):
         return f"{ANSI['red']}{s}{ANSI['reset']}"
     return s
 
@@ -295,7 +347,7 @@ def color_status(s: str, *, use: bool) -> str:
 # Output table
 # ------------------------------------------------------------
 def print_table(rows: List[Dict[str, Any]], *, use_color: bool) -> None:
-    cols = ["filename", "local", "remote", "status", "remote_url", "remote_dl"]
+    cols = ["filename", "source", "local", "remote", "status", "remote_url"]
     widths = {c: len(c) for c in cols}
 
     def s(v: Any) -> str:
@@ -305,9 +357,9 @@ def print_table(rows: List[Dict[str, Any]], *, use_color: bool) -> None:
     for r in rows:
         for c in cols:
             vv = s(r.get(c))
-            if c in ("remote_url", "remote_dl") and len(vv) > 93:
-                vv = vv[:90] + "..."
-            widths[c] = min(max(widths[c], len(vv)), 110)
+            if c == "remote_url" and len(vv) > 110:
+                vv = vv[:107] + "..."
+            widths[c] = min(max(widths[c], len(vv)), 120)
 
     header = "  ".join(c.ljust(widths[c]) for c in cols)
     print(header)
@@ -319,14 +371,14 @@ def print_table(rows: List[Dict[str, Any]], *, use_color: bool) -> None:
             vv = s(r.get(c))
             if c == "status":
                 vv = color_status(vv, use=use_color)
-            if c in ("remote_url", "remote_dl"):
+            if c == "remote_url":
                 raw = s(r.get(c))
-                if len(raw) > 93:
-                    raw = raw[:90] + "..."
-                vv = raw if not use_color else raw  # keep urls plain
-            parts.append(vv.ljust(widths[c]) if c != "status" else vv)
-        # status column may contain ANSI; don't ljust it
-        # rebuild line with fixed spacing except status:
+                if len(raw) > 110:
+                    raw = raw[:107] + "..."
+                vv = raw  # keep urls plain
+            parts.append(vv)
+
+        # pad all but status (ANSI would break padding)
         line = []
         for i, c in enumerate(cols):
             if c == "status":
@@ -343,7 +395,19 @@ def main() -> int:
     ap.add_argument("plugins_dir", nargs="?", default=".", help="oxide/plugins directory (default: .)")
     ap.add_argument("--recursive", action="store_true", help="scan recursively for *.cs")
     ap.add_argument("--cache", default=str(CACHE_FILE_DEFAULT), help=f"cache file (default: {CACHE_FILE_DEFAULT})")
-    ap.add_argument("--cache-ttl", type=int, default=CACHE_TTL_SECONDS_DEFAULT, help="cache TTL seconds")
+    ap.add_argument("--cache-ttl", type=int, default=CACHE_TTL_SECONDS_DEFAULT, help="uMod cache TTL seconds")
+
+    # Chaos toggle (default: on)
+    try:
+        boolopt = argparse.BooleanOptionalAction  # py3.9+
+        ap.add_argument("--check-chaos", default=True, action=boolopt, help="also check ChaosCode (fallback for uMod-unknown)")
+    except Exception:
+        # fallback if somehow running on older python
+        ap.add_argument("--check-chaos", action="store_true", default=True)
+        ap.add_argument("--no-check-chaos", action="store_true", default=False)
+
+    ap.add_argument("--chaos-cache-ttl", type=int, default=CHAOS_CACHE_TTL_SECONDS_DEFAULT, help="Chaos manifest cache TTL seconds")
+
     ap.add_argument("--timeout", type=int, default=12, help="HTTP timeout seconds")
     ap.add_argument("--min-interval", type=float, default=0.6, help="minimum seconds between HTTP requests")
     ap.add_argument("--max-retries", type=int, default=6, help="max retries for transient errors / 429")
@@ -368,7 +432,32 @@ def main() -> int:
     show_progress = args.progress or (sys.stderr.isatty() and not args.no_progress)
     use_color = want_color(args.color)
 
-    print(f"Found {len(locals_)} plugins in {plugins_dir} -- now checking uMod...", file=sys.stderr)
+    check_chaos = bool(getattr(args, "check_chaos", True))
+    # older-python fallback parsing if both flags exist
+    if hasattr(args, "no_check_chaos") and getattr(args, "no_check_chaos"):
+        check_chaos = False
+
+    chaos_index: Dict[str, Dict[str, Any]] = {}
+    chaos_load_err: Optional[str] = None
+    if check_chaos:
+        try:
+            chaos_index = load_chaos_manifest(
+                cache,
+                cache_path,
+                ttl_s=int(args.chaos_cache_ttl),
+                timeout_s=int(args.timeout),
+                debug_headers=bool(args.debug_headers),
+            )
+        except Exception as e:
+            chaos_load_err = str(e)
+            chaos_index = {}
+
+    hdr = f"Found {len(locals_)} plugins in {plugins_dir} -- checking uMod"
+    if check_chaos:
+        hdr += " (+ ChaosCode fallback)"
+        if chaos_load_err:
+            hdr += f" [Chaos manifest ERROR: {chaos_load_err}]"
+    print(hdr + "...", file=sys.stderr)
 
     out_rows: List[Dict[str, Any]] = []
     any_outdated = False
@@ -377,10 +466,16 @@ def main() -> int:
     for i, p in enumerate(locals_, start=1):
         filename = str(p.get("filename") or "")
         stem = stem_noext(filename)
+        stem_l = stem.lower()
         local_ver = str(p.get("version") or "") or ""
 
-        # cache key: direct-json by stem
-        key = f"json:{stem}"
+        # ---------------- uMod lookup ----------------
+        source = "umod"
+        status = ""
+        remote_ver = "-"
+        remote_url = "-"
+
+        key = f"umod:json:{stem}"
         now = int(time.time())
         cached = False
         data = None
@@ -391,11 +486,6 @@ def main() -> int:
             if ts and (now - ts) <= int(args.cache_ttl) and "data" in ent:
                 data = ent["data"]
                 cached = True
-
-        status = ""
-        remote_ver = "-"
-        remote_url = "-"
-        remote_dl = "-"
 
         if data is None:
             url = umod_direct_json_url(stem)
@@ -416,7 +506,7 @@ def main() -> int:
                 status = f"ERROR: {e}"
                 any_unknown = True
 
-        # Fallback to search.json only if asked
+        # Fallback search.json only if asked
         if data is None and args.fallback_search and not status:
             try:
                 sres = http_get_json(
@@ -430,8 +520,7 @@ def main() -> int:
                 if m:
                     remote_ver = str(m.get("latest_release_version") or "-")
                     remote_url = str(m.get("url") or "-")
-                    remote_dl = str(m.get("download_url") or "-")
-                    data = m  # enough fields for comparison
+                    data = m
                 else:
                     status = "UNKNOWN (no match)"
                     any_unknown = True
@@ -440,10 +529,8 @@ def main() -> int:
                 any_unknown = True
 
         if data is not None and not status:
-            # direct plugin json has these fields (same as Vanish.json)
             remote_ver = str(data.get("latest_release_version") or "-")
             remote_url = str(data.get("url") or "-")
-            remote_dl = str(data.get("download_url") or "-")
 
             if local_ver != "-" and remote_ver != "-" and local_ver and remote_ver:
                 if local_ver == remote_ver:
@@ -455,27 +542,46 @@ def main() -> int:
                 status = "UNKNOWN (missing version)"
                 any_unknown = True
 
+        # If uMod failed/unknown and chaos enabled -> Chaos fallback
+        if (not status or status.startswith("UNKNOWN")) and check_chaos and chaos_index and (not status.startswith("ERROR")):
+            rr = chaos_index.get(stem_l)
+            if isinstance(rr, dict):
+                source = "chaos"
+                remote_ver = str(rr.get("ResourceVersion") or "-")
+                remote_url = str(rr.get("ResourceURL") or "-")
+
+                if local_ver and remote_ver and local_ver != "-" and remote_ver != "-":
+                    if local_ver == remote_ver:
+                        status = "OK"
+                    else:
+                        newer = version_is_newer(remote_ver, local_ver)
+                        status = "OUTDATED" if (newer is True or newer is None) else "OK"
+                else:
+                    status = "UNKNOWN (missing version)"
+                    any_unknown = True
+
         if not status:
             status = "UNKNOWN (no match)"
             any_unknown = True
+            source = "unknown"
 
         if status == "OUTDATED":
             any_outdated = True
 
         row = {
             "filename": filename,
+            "source": source,
             "local": local_ver or "-",
             "remote": remote_ver or "-",
             "status": status,
             "remote_url": remote_url or "-",
-            "remote_dl": remote_dl or "-",
         }
 
         if args.outdated_only and status != "OUTDATED":
             if show_progress:
                 tag = "cached" if cached else "net"
                 st = color_status(status, use=use_color)
-                print(f"[{i}/{len(locals_)}] {filename} -- {st} ({tag})", file=sys.stderr)
+                print(f"[{i}/{len(locals_)}] {filename} [{source}] -- {st} ({tag})", file=sys.stderr)
             continue
 
         out_rows.append(row)
@@ -483,7 +589,7 @@ def main() -> int:
         if show_progress:
             tag = "cached" if cached else "net"
             st = color_status(status, use=use_color)
-            print(f"[{i}/{len(locals_)}] {filename} -- {st} ({tag})", file=sys.stderr)
+            print(f"[{i}/{len(locals_)}] {filename} [{source}] -- {st} ({tag})", file=sys.stderr)
 
     if args.as_json:
         print(json.dumps(out_rows, ensure_ascii=False, indent=2))
