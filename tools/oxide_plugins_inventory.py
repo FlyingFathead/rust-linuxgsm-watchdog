@@ -36,7 +36,12 @@ CS_VSTR = r'@\"(?P<vs>(?:\"\"|[^\"])*?)\"'
 # Info("Name","Author","Version") -- Python re forbids duplicate named groups,
 # so we give the 3 fields unique names.
 INFO_RE = re.compile(
-    r'\[\s*Info\s*\(\s*"(?P<name>(?:\\.|[^"\\])*)"\s*,\s*"(?P<author>(?:\\.|[^"\\])*)"\s*,\s*"(?P<version>(?:\\.|[^"\\])*)"\s*\)\s*\]',
+    r'\[\s*Info\s*\(\s*'
+    r'"(?P<name>(?:\\.|[^"\\])*)"\s*,\s*'
+    r'"(?P<author>(?:\\.|[^"\\])*)"\s*,\s*'
+    r'"(?P<version>(?:\\.|[^"\\])*)"\s*'
+    r'(?:,\s*[^)]*)?\)\s*'          # <-- allows ", ResourceId = 651" etc INSIDE Info(...)
+    r'(?:,\s*[^\]]*)?\]',           # <-- allows ", Description(...)" etc inside the same [...]
     re.MULTILINE,
 )
 
