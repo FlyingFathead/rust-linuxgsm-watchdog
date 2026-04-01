@@ -499,6 +499,8 @@ def _read_envfile_vars(path: str):
         "path": path,
         "exists": False,
         "readable": False,
+        "access_denied": False,
+        "error_kind": "",
         "vars": {},
         "error": "",
     }
@@ -507,15 +509,28 @@ def _read_envfile_vars(path: str):
         p = Path(path)
         result["exists"] = p.exists()
         if not p.exists():
+            result["error_kind"] = "not_found"
             result["error"] = "file not found"
             return result
+
         if not p.is_file():
+            result["error_kind"] = "not_file"
             result["error"] = "not a file"
             return result
 
         text = p.read_text(encoding="utf-8", errors="ignore")
         result["readable"] = True
+        result["error_kind"] = ""
     except Exception as e:
+        err_no = getattr(e, "errno", None)
+
+        if isinstance(e, PermissionError) or err_no in (errno.EACCES, errno.EPERM):
+            result["access_denied"] = True
+            result["error_kind"] = "permission_denied"
+            result["error"] = "permission denied"
+            return result
+
+        result["error_kind"] = "read_error"
         result["error"] = str(e)
         return result
 
@@ -583,6 +598,7 @@ def _resolve_telegram_test_target(cfg, fp=None):
         "systemd": {},
         "env_entries": [],
         "env_results": [],
+        "permission_denied_env_files": [],
     }
 
     # 1) current shell/process env
@@ -655,6 +671,9 @@ def _resolve_telegram_test_target(cfg, fp=None):
         info["optional"] = bool(ent.get("optional"))
         result["env_results"].append(info)
 
+        if info.get("access_denied"):
+            result["permission_denied_env_files"].append(info["path"])
+
         if info["readable"]:
             readable_paths.append(info["path"])
             merged.update(info["vars"])
@@ -672,6 +691,12 @@ def _resolve_telegram_test_target(cfg, fp=None):
         else:
             result["source"] = "systemd EnvironmentFile"
         return result
+
+    if result["permission_denied_env_files"]:
+        result["errors"].append(
+            "systemd EnvironmentFile exists but access was denied to this manual test process: "
+            + ", ".join(result["permission_denied_env_files"])
+        )
 
     if not token:
         result["errors"].append(
@@ -720,6 +745,7 @@ def test_telegram_status(cfg, args, fp=None):
 
     for info in resolved.get("env_results", []):
         path = info.get("path", "")
+
         if info.get("readable"):
             found_vars = []
             if token_env in info.get("vars", {}):
@@ -739,6 +765,12 @@ def test_telegram_status(cfg, args, fp=None):
                     f"(Telegram vars not present there)",
                     fp
                 )
+        elif info.get("access_denied"):
+            opt = "optional " if info.get("optional") else ""
+            log(
+                f"TEST_TELEGRAM_STATUS: {opt}env file found but access denied for this user: {path}",
+                fp
+            )
         else:
             opt = "optional " if info.get("optional") else ""
             err = info.get("error", "unreadable")
@@ -751,19 +783,43 @@ def test_telegram_status(cfg, args, fp=None):
         for err in resolved.get("errors", []):
             log(f"TEST_TELEGRAM_STATUS: ERROR: {err}", fp)
 
-        log("TEST_TELEGRAM_STATUS: conclusion: Telegram credentials could not be resolved for this test run.", fp)
-        log(
-            f"TEST_TELEGRAM_STATUS: fix: either export {token_env} and {chat_ids_env} in the shell before running this command,",
-            fp
-        )
-        log(
-            "TEST_TELEGRAM_STATUS: or put them in the EnvironmentFile used by the watchdog systemd service.",
-            fp
-        )
-        log(
-            "TEST_TELEGRAM_STATUS: if the EnvironmentFile exists but is unreadable here, that usually just means this manual test is running in a different context than systemd.",
-            fp
-        )
+        denied_paths = resolved.get("permission_denied_env_files") or []
+
+        if denied_paths:
+            log(
+                "TEST_TELEGRAM_STATUS: conclusion: this manual test process could not resolve Telegram credentials because access to the systemd EnvironmentFile was denied.",
+                fp
+            )
+            log(
+                "TEST_TELEGRAM_STATUS: note: that does NOT mean the running systemd service itself is missing the credentials.",
+                fp
+            )
+            log(
+                "TEST_TELEGRAM_STATUS: systemd may already have loaded them successfully at service start.",
+                fp
+            )
+            log(
+                f"TEST_TELEGRAM_STATUS: fix for manual testing: either export {token_env} and {chat_ids_env} in this shell before running the test,",
+                fp
+            )
+            log(
+                "TEST_TELEGRAM_STATUS: or run the test in a context that is allowed to read the service EnvironmentFile.",
+                fp
+            )
+        else:
+            log(
+                "TEST_TELEGRAM_STATUS: conclusion: Telegram credentials could not be resolved for this test run.",
+                fp
+            )
+            log(
+                f"TEST_TELEGRAM_STATUS: fix: either export {token_env} and {chat_ids_env} in the shell before running this command,",
+                fp
+            )
+            log(
+                "TEST_TELEGRAM_STATUS: or put them in the EnvironmentFile used by the watchdog systemd service.",
+                fp
+            )
+
         return 2
 
     try:
