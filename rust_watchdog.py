@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3633,7 +3633,7 @@ def main():
         pid=os.getpid(),
         started_at=ts(),
     )
-    
+
     # One-time forced wipe info on startup
     forced_wipe_enabled = parse_bool(cfg.get("enable_forced_wipe_highlight"), True)
     last_forced_wipe_log = 0.0

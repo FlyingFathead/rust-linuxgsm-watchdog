@@ -481,6 +481,12 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.3.8
+  **Fixed / Added:**
+  - Fixed startup alert ordering so `watchdog_started` is emitted only after the watchdog successfully acquires its lock.
+  - Prevented non-winning / aborted instances from sending misleading startup notifications.
+  - Startup/restart notifications now come from the actual live watchdog instance instead of the pre-lock path.
+  - Included extra startup alert context (`pid`, `started_at`, `dry_run`) in the emitted startup event.
 - v0.3.7
   **Fixed / Added:**
   - Restored zero-cooldown defaults for restart/update-related alert events in the shipped config.
