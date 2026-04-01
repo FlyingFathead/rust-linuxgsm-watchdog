@@ -481,6 +481,12 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.3.6
+  **Fixed / Added:**
+  - Improved `--test-telegram-status` with better systemd `EnvironmentFile` diagnostics and clearer manual-test failure reporting.
+  - Added safe Rust server PID / start-time / uptime reporting to Telegram status output without exposing full cmdlines.
+  - Added duplicate-aware RustDedicated process selection for status reporting.
+  - Fixed Telegram status helper config placement by using the watchdog’s top-level config keys for systemd fallback options.
 - v0.3.5
   **Fixed / Added:**
   - Added robust config JSON parse diagnostics for invalid / empty / whitespace-only config files.
