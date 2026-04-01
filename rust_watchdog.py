@@ -697,12 +697,86 @@ def _deep_merge(base, override):
             out[k] = v
     return out
 
-def load_cfg(path):
+def _format_json_error_context(text: str, lineno: int, colno: int, radius: int = 2) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return "(no text content)"
+
+    out = []
+    start = max(1, lineno - radius)
+    end = min(len(lines), lineno + radius)
+
+    for n in range(start, end + 1):
+        line = lines[n - 1]
+        prefix = ">>" if n == lineno else "  "
+        out.append(f"{prefix} {n:4d} | {line}")
+        if n == lineno:
+            caret_pad = " " * (colno + 7)  # align under content after '>> 1234 | '
+            out.append(f"{caret_pad}^")
+    return "\n".join(out)
+
+
+def load_cfg(path, fp=None):
     cfg = dict(DEFAULTS)
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        cfg = _deep_merge(cfg, data)
+
+    if not path:
+        return cfg
+
+    cfg_path = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+    if not os.path.exists(cfg_path):
+        # Missing config is OK: defaults only
+        return cfg
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8-sig") as f:
+            raw = f.read()
+    except Exception as e:
+        fatal(f"config: cannot read '{cfg_path}': {e}", fp=fp)
+
+    if raw is None or raw == "":
+        fatal(
+            f"config: file exists but is empty: {cfg_path}\n"
+            f"Fix: restore valid JSON or delete the file if you want defaults only.",
+            fp=fp
+        )
+
+    if not raw.strip():
+        fatal(
+            f"config: file contains only whitespace: {cfg_path}\n"
+            f"Fix: restore valid JSON or delete the file if you want defaults only.",
+            fp=fp
+        )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        first_bytes = raw.encode("utf-8", errors="replace")[:64].hex(" ")
+        context = _format_json_error_context(raw, e.lineno, e.colno)
+        fatal(
+            "config: invalid JSON in file:\n"
+            f"  path:   {cfg_path}\n"
+            f"  line:   {e.lineno}\n"
+            f"  column: {e.colno}\n"
+            f"  error:  {e.msg}\n"
+            f"  pos:    {e.pos}\n"
+            "\n"
+            "Context:\n"
+            f"{context}\n"
+            "\n"
+            f"First bytes (hex): {first_bytes}",
+            fp=fp
+        )
+    except Exception as e:
+        fatal(f"config: failed to parse '{cfg_path}': {e}", fp=fp)
+
+    if not isinstance(data, dict):
+        fatal(
+            f"config: top-level JSON must be an object/dict, got {type(data).__name__}: {cfg_path}",
+            fp=fp
+        )
+
+    cfg = _deep_merge(cfg, data)
     return cfg
 
 def parse_bool(v, default=True):
@@ -1087,6 +1161,22 @@ def fatal(msg, code=2, fp=None):
     print(sep, file=sys.stderr)
 
     raise SystemExit(code)
+
+def fatal_config_parse(path, msg, fp=None):
+    print("", file=sys.stderr)
+    print("-" * 72, file=sys.stderr)
+    print("rust-linuxgsm-watchdog: config load failed", file=sys.stderr)
+    print("-" * 72, file=sys.stderr)
+    print(f"Config: {path}", file=sys.stderr)
+    print(msg, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Common causes:", file=sys.stderr)
+    print("  - empty file", file=sys.stderr)
+    print("  - truncated file after a bad edit / failed copy", file=sys.stderr)
+    print("  - invalid JSON syntax (missing comma, stray comment, trailing comma)", file=sys.stderr)
+    print("  - wrong encoding / weird bytes at the beginning", file=sys.stderr)
+    print("-" * 72, file=sys.stderr)
+    raise SystemExit(2)
 
 def ensure_dir(path, what, fp=None):
     """
