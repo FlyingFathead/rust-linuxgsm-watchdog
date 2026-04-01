@@ -12,6 +12,7 @@ import argparse
 from dataclasses import dataclass
 import errno
 import getpass
+import html
 import json
 import os
 from pathlib import Path
@@ -298,6 +299,126 @@ def _tcp_fail_code(e: Exception) -> str:
 # ALERTS (optional module)
 # ---------------------------------------------------------
 ALERTS = None
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _read_lockfile_pid(lock_path: str):
+    try:
+        s = Path(lock_path).read_text(encoding="utf-8", errors="ignore").strip()
+        pid = int(s)
+        return pid if _pid_alive(pid) else None
+    except Exception:
+        return None
+
+
+def _proc_started_at(pid: int) -> str:
+    if not pid:
+        return "unknown"
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
+
+def test_telegram_status(cfg, args, fp=None):
+    """
+    Send a direct Telegram status message and exit.
+    This intentionally bypasses AlertManager cooldown/dedupe so a test is always a test.
+    """
+    if not ALERTS or not getattr(ALERTS, "enabled", False):
+        log("TEST_TELEGRAM_STATUS: alerts not enabled or backend init failed", fp)
+        return 2
+
+    tg_backends = [
+        b for b in getattr(ALERTS, "backends", [])
+        if getattr(b, "name", "") == "telegram"
+    ]
+    if not tg_backends:
+        log("TEST_TELEGRAM_STATUS: no usable Telegram backend configured", fp)
+        return 2
+
+    def _safe_cfg_label(path: str) -> str:
+        try:
+            return os.path.basename(os.path.abspath(path)) or str(path)
+        except Exception:
+            return str(path)
+
+    def _extract_primary_cause(evidence) -> str:
+        for line in (evidence or []):
+            if isinstance(line, str) and line.startswith("PRIMARY_CAUSE:"):
+                return line[len("PRIMARY_CAUSE:"):].strip()
+        return ""
+
+    live_pid = _read_lockfile_pid(str(cfg.get("lockfile") or ""))
+    live_since = _proc_started_at(live_pid) if live_pid else "not running"
+
+    server_dir = str(cfg.get("server_dir") or "")
+    rustserver_path = os.path.join(server_dir, "rustserver")
+
+    try:
+        state, evidence = health_report(cfg, server_dir, rustserver_path, fp=None)
+        primary = _extract_primary_cause(evidence)
+    except Exception as e:
+        state = "UNKNOWN"
+        primary = f"health_report failed -- {e}"
+
+    now_s = ts()
+    cfg_label = _safe_cfg_label(getattr(args, "config", "rust_watchdog.json"))
+    dry_run_s = str(bool(cfg.get("dry_run", False))).lower()
+
+    rendered_lines = [
+        "🧪 <b>rust-linuxgsm-watchdog -- Telegram status test</b>",
+        f"<code>time={html.escape(now_s)}</code>",
+        f"<code>version={html.escape(__version__)}</code>",
+        f"<code>server_status={html.escape(state)}</code>",
+    ]
+
+    if primary and state != "RUNNING":
+        rendered_lines.append(f"<code>server_primary={html.escape(primary)}</code>")
+
+    rendered_lines.extend([
+        # f"<code>config={html.escape(cfg_label)}</code>",
+        f"<code>watchdog_pid={live_pid if live_pid else 'not running'}</code>",
+        f"<code>watchdog_running_since={html.escape(live_since)}</code>",
+        f"<code>dry_run={html.escape(dry_run_s)}</code>",
+    ])
+
+    rendered = "\n".join(rendered_lines)
+
+    ok_any = False
+    for b in tg_backends:
+        try:
+            ok = b.send(None, rendered)
+            ok_any = ok_any or bool(ok)
+            if not ok:
+                log(
+                    f"TEST_TELEGRAM_STATUS: backend send failed: "
+                    f"{getattr(b, 'last_error', 'unknown error')}",
+                    fp
+                )
+        except Exception as e:
+            log(f"TEST_TELEGRAM_STATUS: backend error: {e}", fp)
+
+    if ok_any:
+        log("TEST_TELEGRAM_STATUS: sent OK", fp)
+        return 0
+
+    log("TEST_TELEGRAM_STATUS: no Telegram backend succeeded", fp)
+    return 2
 
 def init_alerts(cfg, fp=None):
     global ALERTS
@@ -2759,6 +2880,11 @@ def main():
                     help="validate SmoothRestarter bridge wiring and print what would be sent; then exit")
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
         help="same as --test-smoothrestarter but actually sends the ceremony via RCON; then exit")
+    ap.add_argument(
+        "--test-telegram-status",
+        action="store_true",
+        help="send a direct Telegram status test message and exit",
+    )    
     args = ap.parse_args()
 
     if args.version:
@@ -2794,6 +2920,21 @@ def main():
     init_alerts(cfg, fp)
     alert("watchdog_started", f"rust-linuxgsm-watchdog v{__version__} started", fp=fp,
         identity=cfg.get("identity"), dry_run=cfg.get("dry_run"))
+
+    # Telegram status test alert
+    if args.test_telegram_status:
+        rc = test_telegram_status(cfg, args, fp=fp)
+        try:
+            if ALERTS:
+                if hasattr(ALERTS, "close"):
+                    ALERTS.close()
+                elif hasattr(ALERTS, "stop"):
+                    ALERTS.stop()
+        except Exception:
+            pass
+        if fp:
+            fp.close()
+        raise SystemExit(rc)
 
     # One-time dependency hint
     ok_ws, ws_err = websocket_dep_status()
