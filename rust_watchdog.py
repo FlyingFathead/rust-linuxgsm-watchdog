@@ -3541,11 +3541,6 @@ def main():
             fp.close()
         raise SystemExit(rc)
 
-    # init alerts if in use
-    init_alerts(cfg, fp)
-    alert("watchdog_started", f"rust-linuxgsm-watchdog v{__version__} started", fp=fp,
-        identity=cfg.get("identity"), dry_run=cfg.get("dry_run"))
-
     # One-time dependency hint
     ok_ws, ws_err = websocket_dep_status()
     if not ok_ws:
@@ -3618,12 +3613,27 @@ def main():
         cfg["dry_run"] = True
 
     if not acquire_lock(cfg["lockfile"], fp):
+        if fp:
+            fp.close()
         sys.exit(1)
+
+    # init alerts only after we actually own the lock
+    init_alerts(cfg, fp)
 
     log(f"Rust Watchdog v{__version__} by FlyingFathead started (dry_run={cfg['dry_run']})", fp)
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
 
+    alert(
+        "watchdog_started",
+        f"rust-linuxgsm-watchdog v{__version__} started",
+        fp=fp,
+        identity=cfg.get("identity"),
+        dry_run=cfg.get("dry_run"),
+        pid=os.getpid(),
+        started_at=ts(),
+    )
+    
     # One-time forced wipe info on startup
     forced_wipe_enabled = parse_bool(cfg.get("enable_forced_wipe_highlight"), True)
     last_forced_wipe_log = 0.0
