@@ -481,6 +481,11 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.3.7
+  **Fixed / Added:**
+  - Restored zero-cooldown defaults for restart/update-related alert events in the shipped config.
+  - Prevented `restart_requested` and related update flow alerts from being unintentionally suppressed by the global default alert cooldown.
+  - Kept the global alert cooldown available for noisier events while allowing immediate restart/update notifications by default.
 - v0.3.6
   **Fixed / Added:**
   - Improved `--test-telegram-status` with better systemd `EnvironmentFile` diagnostics and clearer manual-test failure reporting.
