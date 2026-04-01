@@ -17,8 +17,17 @@ from urllib.error import URLError, HTTPError
 TELEGRAM_LIMIT = 4096
 
 DEFAULT_EMOJI_BY_EVENT = {
+    "watchdog_started": "🟢",
+    "startup_ok": "✅",
+    "server_down": "🔴",
+    "server_recovered": "✅",
+    "confirmed_down": "☠️",    
     "recovery_attempted": "⚠️",
-    "confirmed_down": "☠️",
+    "recovery_failed": "🚨",
+    "update_available": "⬆️",
+    "update_applied": "✅",
+    "update_held": "⏸️",
+    "restart_requested": "🔁",
 }
 
 DEFAULT_EMOJI_BY_LEVEL = {
@@ -28,9 +37,44 @@ DEFAULT_EMOJI_BY_LEVEL = {
     "CRITICAL": "☠️",
 }
 
+DEFAULT_EVENT_TITLES = {
+    "watchdog_started": "Watchdog started",
+    "startup_ok": "Startup OK",
+    "server_down": "Server down",
+    "server_recovered": "Server recovered",
+    "recovery_attempted": "Recovery attempted",
+    "recovery_failed": "Recovery failed",
+    "update_available": "Rust update available",
+    "update_applied": "Update applied",
+    "update_held": "Update held",
+    "restart_requested": "Restart requested",
+}
+
+DEFAULT_EVENT_BODIES = {
+    "watchdog_started": "watchdog loop online",
+    "startup_ok": "server looks healthy (process + RCON ok)",
+    "server_down": "server confirmed down; starting recovery",
+    "server_recovered": "server is running again after cooldown",
+    "recovery_attempted": "recovery sequence finished",
+    "recovery_failed": "recovery finished, but the server still does not look healthy",
+    "update_available": "Rust update detected",
+    "update_applied": "update/restart sequence completed",
+    "update_held": "update detected, but restart is being held",
+    "restart_requested": "restart has been scheduled/requested",
+}
+
 # ---------------------------------------
 # HELPERS
 # ---------------------------------------
+
+def _normalize_level_map(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (d or {}).items():
+        kk = str(k).upper()
+        if kk == "WARN":
+            kk = "WARNING"
+        out[kk] = v
+    return out
 
 def _parse_int_list(s: str) -> List[int]:
     s = (s or "").strip()
@@ -234,13 +278,13 @@ class AlertManager:
         self.version_default = str(self.cfg.get("version", "")).strip()
 
         cfg_e_event = self.cfg.get("emoji_by_event", {}) or {}
-        cfg_e_level = self.cfg.get("emoji_by_level", {}) or {}
+        cfg_e_level = _normalize_level_map(self.cfg.get("emoji_by_level", {}) or {})
 
         self.emoji_by_event = {**DEFAULT_EMOJI_BY_EVENT, **cfg_e_event}
         self.emoji_by_level = {**DEFAULT_EMOJI_BY_LEVEL, **cfg_e_level}
 
-        self.event_titles = self.cfg.get("event_titles", {}) or {}
-        self.event_bodies = self.cfg.get("event_bodies", {}) or {}
+        self.event_titles = {**DEFAULT_EVENT_TITLES, **(self.cfg.get("event_titles", {}) or {})}
+        self.event_bodies = {**DEFAULT_EVENT_BODIES, **(self.cfg.get("event_bodies", {}) or {})}
 
         self._q: "queue.Queue[Alert]" = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()

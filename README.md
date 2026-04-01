@@ -61,9 +61,25 @@ Optional (only needed for WebRCON features like `--test-rcon-say` and the Smooth
 
 ---
 
-## Config
+## Config / Usage
 
-Example `rust_watchdog.json`:
+Note: you do NOT need to copy the full example config.
+The watchdog loads built-in defaults from the Python code and then merges the file passed with `--config` on top.
+
+So a minimal custom config is valid, as long as it includes the keys you actually want to override.
+
+Important: alert-related defaults are partly defined in `rust_watchdog_alerts.py`, so if you enable alerts with a minimal config, you should at least set:
+
+```json
+{
+  "alerts": {
+    "enabled": true,
+    "backends": ["telegram"]
+  }
+}
+```
+
+Here's another example `rust_watchdog.json`:
 
 ```json
 {
@@ -348,8 +364,8 @@ Keep that token secret.
 2. On the server, run:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456789:AA..."
-curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | jq
+export RUST_WD_TELEGRAM_TOKEN="123456789:AA..."
+curl -s "https://api.telegram.org/bot${RUST_WD_TELEGRAM_TOKEN}/getUpdates" | jq
 ```
 
 Look for something like:
@@ -359,35 +375,35 @@ Look for something like:
 You can also extract the latest chat id quickly:
 
 ```bash
-curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" \
+curl -s "https://api.telegram.org/bot${RUST_WD_TELEGRAM_TOKEN}/getUpdates" \
   | jq '.result[-1].message.chat.id'
 ```
 
 #### Option B: Group chat
 
 1. Add the bot to your group.
-2. In the group, send a command so the bot definitely “sees” it (privacy mode won’t block commands):
+2. In the group, send a command so the bot definitely "sees" it (privacy mode will not block commands):
 
    * `/start`
 3. Then run the same `getUpdates` command above and read the group `chat.id` (usually a **negative** number).
 
-### 3) Quick “does Telegram even work from this server” test
+### 3) Quick "does Telegram even work from this server" test
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456789:AA..."
-export TELEGRAM_CHAT_ID="123456789"   # or -1001234567890 for a group
+export RUST_WD_TELEGRAM_TOKEN="123456789:AA..."
+export RUST_WD_TELEGRAM_CHAT_IDS="123456789"   # or "-1001234567890" for a group
 
-curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+curl -sS -X POST "https://api.telegram.org/bot${RUST_WD_TELEGRAM_TOKEN}/sendMessage" \
+  -d "chat_id=123456789" \
   --data-urlencode "text=rust-linuxgsm-watchdog: test message" \
   | jq
 ```
 
-If it returns `"ok": true`, you’re good.
+For a group test, replace `123456789` in `-d "chat_id=123456789"` with your negative group chat id.
 
 ### 4) Store secrets safely (recommended)
 
-Don’t hardcode the token in a public config. Use an env file readable only by root:
+Do not hardcode the token in a public config. Use an env file readable only by root:
 
 ```bash
 sudo install -m 600 /dev/null /etc/default/rust-watchdog
@@ -397,8 +413,14 @@ sudo nano /etc/default/rust-watchdog
 Put:
 
 ```bash
-TELEGRAM_BOT_TOKEN="123456789:AA..."
-TELEGRAM_CHAT_ID="-1001234567890"
+RUST_WD_TELEGRAM_TOKEN="123456789:AA..."
+RUST_WD_TELEGRAM_CHAT_IDS="-1001234567890"
+```
+
+If you want multiple Telegram destinations, separate them with commas or spaces, for example:
+
+```bash
+RUST_WD_TELEGRAM_CHAT_IDS="-1001234567890,123456789"
 ```
 
 Then in your `rust-watchdog.service`, add:
@@ -416,41 +438,33 @@ sudo systemctl restart rust-watchdog.service
 
 ### 5) Configure the watchdog
 
-**Config key names depend on the version.** If you’re unsure, just search the code:
+The current config uses **env var names**, not raw secrets in JSON.
 
-```bash
-grep -nRi "telegram" rust_watchdog.py
-```
-
-Typical configuration patterns look like one of these:
-
-#### Pattern A (flat keys)
-
-```json
-{
-  "enable_alerts": true,
-  "alerts_backend": "telegram",
-  "telegram_bot_token": "$TELEGRAM_BOT_TOKEN",
-  "telegram_chat_id": "$TELEGRAM_CHAT_ID"
-}
-```
-
-#### Pattern B (nested)
+Example:
 
 ```json
 {
   "alerts": {
     "enabled": true,
-    "backend": "telegram",
+    "backends": ["telegram"],
     "telegram": {
-      "bot_token": "$TELEGRAM_BOT_TOKEN",
-      "chat_id": "$TELEGRAM_CHAT_ID"
+      "token_env": "RUST_WD_TELEGRAM_TOKEN",
+      "chat_ids_env": "RUST_WD_TELEGRAM_CHAT_IDS",
+      "parse_mode": "HTML",
+      "disable_web_preview": true,
+      "timeout_s": 8,
+      "preflight_getme": true
     }
   }
 }
 ```
 
-> Note: This project expands `$VARS` in config strings, so using environment variables keeps secrets out of the JSON.
+Notes:
+
+* `token_env` = the name of the environment variable holding the bot token
+* `chat_ids_env` = the name of the environment variable holding one or more Telegram chat IDs
+* chat IDs may be separated by commas and/or whitespace
+* this is **not** `$VARS` expansion inside config values -- the watchdog reads the env var names from config and then resolves them with `os.getenv()`
 
 ### 6) Verify alerts end-to-end
 
@@ -462,11 +476,26 @@ Run a one-shot cycle (or whatever minimal run you prefer) and watch logs:
 journalctl -u rust-watchdog.service -f
 ```
 
-If Telegram is misconfigured, you should see a clear error (bad token/chat_id, blocked outbound HTTPS, etc.).
+If Telegram is misconfigured, you should see a clear error (bad token/chat ids, blocked outbound HTTPS, etc.).
 
 ---
 
 ### History
+- v0.3.4
+  **Fixed / Added:**
+  - Improved Telegram alert/event semantics and cleaned up alert naming (`server_down` instead of stale `confirmed_down`; normalized `WARNING` level naming).
+  - Added richer alert coverage for watchdog lifecycle and update-watch flow:
+    - `startup_ok`
+    - `update_available`
+    - `update_held`
+    - `restart_requested`
+  - Confirmed-down alerts now include the primary detected failure cause when available (for example process missing / identity mismatch / RCON endpoint problems), so restart/recovery reasons are visible in Telegram instead of just "server went down".
+  - Update-triggered restart requests now include a reason/path in alerts (for example SmoothRestarter vs watchdog fallback), making restart behavior less opaque.
+  - Added deep-merge config loading for nested config sections instead of the old mostly-shallow merge behavior.
+  - Cleaned up alert config structure and docs:
+    - human-readable event titles instead of emoji-only titles
+    - normalized `emoji_by_level` keys
+    - Telegram env var names/documentation aligned to `RUST_WD_TELEGRAM_TOKEN` and `RUST_WD_TELEGRAM_CHAT_IDS`
 - v0.3.3
   **Fixed / Added:**
   - Prevent multiple watchdog instances from running at once (fixes “double processes” / duplicate recovery behavior).

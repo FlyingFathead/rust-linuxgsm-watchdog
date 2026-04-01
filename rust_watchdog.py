@@ -33,7 +33,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -688,17 +688,21 @@ def normalize_cfg_paths(cfg: dict, config_path: str) -> dict:
 # --------------------------------------------------------
 # CONFIG LOADER
 # --------------------------------------------------------
+def _deep_merge(base, override):
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
 def load_cfg(path):
     cfg = dict(DEFAULTS)
     if path and os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # shallow merge + nested merge for timeouts
-        cfg.update({k: v for k, v in data.items() if k != "timeouts"})
-        if "timeouts" in data and isinstance(data["timeouts"], dict):
-            t = dict(cfg.get("timeouts", {}))
-            t.update(data["timeouts"])
-            cfg["timeouts"] = t
+        cfg = _deep_merge(cfg, data)
     return cfg
 
 def parse_bool(v, default=True):
@@ -2829,6 +2833,8 @@ def main():
     last_update_check = 0.0
     last_restart_request = 0.0
 
+    startup_ok_sent = False
+
     try:
         while True:
             if stop_requested:
@@ -2868,6 +2874,16 @@ def main():
             log(f"HEALTH: {state}", fp)
             for line in evidence:
                 log(f"  {line}", fp)
+
+            # Send startup OK
+            if state == "RUNNING" and not startup_ok_sent:
+                alert(
+                    "startup_ok",
+                    level="info",
+                    fp=fp,
+                    identity=cfg.get("identity"),
+                )
+                startup_ok_sent = True
 
             # Forced wipe highlighter (rate-limited)
             if forced_wipe_enabled:
@@ -2916,8 +2932,24 @@ def main():
                     if verdict is True:
                         if hold:
                             log(f"UPDATE_WATCH: update available, but HOLDING until wipe ({reason})", fp)
+                            alert(
+                                "update_held",
+                                "Rust update detected, but restart is being held",
+                                level="info",
+                                fp=fp,
+                                identity=cfg.get("identity"),
+                                hold_reason=reason,
+                            )
                         else:
                             log("UPDATE_WATCH: update available", fp)
+                            alert(
+                                "update_available",
+                                "Rust update detected",
+                                level="info",
+                                fp=fp,
+                                identity=cfg.get("identity"),
+                                source="linuxgsm check-update",
+                            )
 
                             cooldown = int(cfg.get("restart_request_cooldown_seconds", 3600))
                             if (now - last_restart_request) < cooldown:
@@ -2960,6 +2992,7 @@ def main():
                                     )
 
                                     ok = request_smooth_restart(cfg, server_dir, rustserver_path, fp)
+
                                     if ok:
                                         last_restart_request = now
                                         log(
@@ -2967,8 +3000,28 @@ def main():
                                             f"(delay={sr_delay}s)",
                                             fp
                                         )
+                                        alert(
+                                            "restart_requested",
+                                            "SmoothRestarter restart requested",
+                                            level="warning",
+                                            fp=fp,
+                                            identity=cfg.get("identity"),
+                                            delay_seconds=sr_delay,
+                                            path="smoothrestarter",
+                                            reason="update detected",
+                                        )
+
                                     else:
                                         log("SMOOTH_BRIDGE: failed -> falling back to no-SR countdown + restart NOW", fp)
+                                        alert(
+                                            "restart_requested",
+                                            "Immediate restart/update sequence requested",
+                                            level="warning",
+                                            fp=fp,
+                                            identity=cfg.get("identity"),
+                                            path="watchdog-fallback",
+                                            reason="update detected",
+                                        )
                                         update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=fp)
 
                                         last_restart_request = now
@@ -2981,6 +3034,15 @@ def main():
 
                                 else:
                                     # No SR: do crude countdown + stop/update/mu/restart immediately
+                                    alert(
+                                        "restart_requested",
+                                        "Immediate restart/update sequence requested",
+                                        level="warning",
+                                        fp=fp,
+                                        identity=cfg.get("identity"),
+                                        path="watchdog-fallback",
+                                        reason="update detected",
+                                    )
                                     update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=fp)
 
                                     last_restart_request = now
@@ -2998,13 +3060,16 @@ def main():
 
             if state == "DOWN" and down_streak >= int(cfg["down_confirmations"]):
                 log("CONFIRMED DOWN -> recovery sequence", fp)
+                primary = next((l for l in evidence if l.startswith("PRIMARY_CAUSE:")), "")
 
                 alert(
                     "server_down",
                     f"Server '{cfg.get('identity')}' confirmed DOWN -- starting recovery",
                     level="warning",
                     fp=fp,
-                    identity=cfg.get("identity")
+                    identity=cfg.get("identity"),
+                    primary_cause=primary,
+                    reason="health_report down_confirmed",
                 )
 
                 steps = list(cfg["recovery_steps"])

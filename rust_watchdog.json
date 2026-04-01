@@ -22,7 +22,7 @@
   "rcon_port": 28016,
   "tcp_timeout": 2.0,
 
-  "enable_update_watch": false,
+  "enable_update_watch": true,
   "update_check_interval_seconds": 600,
   "update_check_timeout": 60,
 
@@ -72,7 +72,7 @@
   "timeouts": { "update": 1800, "mu": 900, "restart": 600 },
 
   "alerts": {
-    "enabled": false,
+    "enabled": true,
     "backends": ["telegram"],
     "cooldown_seconds_default": 900,
     "dedupe_seconds": 300,
@@ -80,7 +80,7 @@
     "include_identity": true,
     "emoji_by_level": {
       "INFO": "ℹ️",
-      "WARN": "⚠️",
+      "WARNING": "⚠️",
       "ERROR": "🚨",
       "CRITICAL": "🛑"
     },
@@ -92,21 +92,33 @@
       "recovery_attempted": "⚠️",
       "recovery_failed": "🚨",
       "update_available": "⬆️",
-      "update_applied": "✅"
+      "update_applied": "✅",
+      "update_held": "⏸️",
+      "restart_requested": "🔁"
     },
     "event_titles": {
-      "watchdog_started": "🟢",
-      "startup_ok": "✅",
-      "server_down": "🔴",
-      "server_recovered": "✅",
-      "recovery_attempted": "⚠️",
-      "recovery_failed": "🚨",
-      "update_available": "⬆️",
-      "update_applied": "✅"
+      "watchdog_started": "Watchdog started",
+      "startup_ok": "Startup OK",
+      "server_down": "Server down",
+      "server_recovered": "Server recovered",
+      "recovery_attempted": "Recovery attempted",
+      "recovery_failed": "Recovery failed",
+      "update_available": "Rust update available",
+      "update_applied": "Update applied",
+      "update_held": "Update held",
+      "restart_requested": "Restart requested"
     },
     "event_bodies": {
       "watchdog_started": "watchdog loop online",
-      "startup_ok": "server looks healthy (process + RCON ok)"
+      "startup_ok": "server looks healthy (process + RCON ok)",
+      "server_down": "server confirmed down; starting recovery",
+      "server_recovered": "server is running again after cooldown",
+      "recovery_attempted": "recovery sequence finished",
+      "recovery_failed": "recovery finished, but server health is still bad",
+      "update_available": "Rust update detected",
+      "update_applied": "update/restart sequence completed",
+      "update_held": "update detected, but restart is being held",
+      "restart_requested": "restart has been scheduled/requested"
     },
     "telegram": {
       "token_env": "RUST_WD_TELEGRAM_TOKEN",
