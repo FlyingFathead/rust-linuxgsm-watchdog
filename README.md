@@ -481,6 +481,11 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.3.5
+  **Fixed / Added:**
+  - Added robust config JSON parse diagnostics for invalid / empty / whitespace-only config files.
+  - Startup errors now show line, column, nearby context, and first-byte hex preview to expose pasted shell junk / corrupted config content quickly.
+  - Config loader now reads with UTF-8 BOM tolerance (`utf-8-sig`).
 - v0.3.4
   **Fixed / Added:**
   - Improved Telegram alert/event semantics and cleaned up alert naming (`server_down` instead of stale `confirmed_down`; normalized `WARNING` level naming).
