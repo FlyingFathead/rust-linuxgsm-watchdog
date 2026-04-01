@@ -361,6 +361,80 @@ def _parse_int_list_local(s: str):
             pass
     return out
 
+def get_server_process_info(cfg):
+    """
+    Return a safe summary for the RustDedicated process tied to this identity.
+
+    Result keys:
+      pid: int | None
+      running: bool
+      ambiguous: bool
+      match_count: int
+      selected_by: str
+      exe_name: str
+      started_at: str
+      uptime_seconds: int | None
+      uptime_human: str
+    """
+    identity = str(cfg.get("identity") or "").strip()
+    try:
+        server_port = int(cfg.get("server_port", 28015))
+    except Exception:
+        server_port = 28015
+    use_listen_check = parse_bool(cfg.get("dupe_identity_check_listen_port"), True)
+
+    info = {
+        "pid": None,
+        "running": False,
+        "ambiguous": False,
+        "match_count": 0,
+        "selected_by": "",
+        "exe_name": "unknown",
+        "started_at": "not running",
+        "uptime_seconds": None,
+        "uptime_human": "not running",
+    }
+
+    if not identity:
+        return info
+
+    hits = find_rustdedicated_identity_matches(identity)
+    info["match_count"] = len(hits)
+
+    if not hits:
+        return info
+
+    chosen_pid = None
+
+    if len(hits) == 1:
+        chosen_pid = hits[0][0]
+        info["selected_by"] = "identity"
+    else:
+        if use_listen_check:
+            listeners = [pid for pid, _line in hits if pid_listens_udp_port(pid, server_port)]
+            if len(listeners) == 1:
+                chosen_pid = listeners[0]
+                info["selected_by"] = f"identity+udp:{server_port}"
+            elif len(listeners) > 1:
+                info["ambiguous"] = True
+                info["selected_by"] = f"multiple listeners on udp:{server_port}"
+                return info
+
+        if chosen_pid is None:
+            info["ambiguous"] = True
+            info["selected_by"] = "multiple identity matches"
+            return info
+
+    info["pid"] = chosen_pid
+    info["running"] = True
+    info["exe_name"] = _proc_exe_name(chosen_pid)
+    info["started_at"] = _proc_started_at(chosen_pid)
+
+    up_s = _proc_elapsed_seconds(chosen_pid)
+    info["uptime_seconds"] = up_s
+    info["uptime_human"] = _human_seconds(up_s) if up_s is not None else "unknown"
+
+    return info
 
 def _systemd_unit_status(unit_name: str):
     info = {
@@ -439,6 +513,44 @@ def _systemd_unit_status(unit_name: str):
 
     return info
 
+def _proc_elapsed_seconds(pid: int):
+    if not pid:
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "etimes=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if not out:
+            return None
+        return int(out)
+    except Exception:
+        return None
+
+def _human_seconds(total: int) -> str:
+    if total is None:
+        return "unknown"
+    total = int(total)
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+
+    if d > 0:
+        return f"{d}d {h}h {m}m {s}s"
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def _proc_exe_name(pid: int) -> str:
+    if not pid:
+        return "unknown"
+    try:
+        return os.path.basename(os.readlink(f"/proc/{pid}/exe")) or "unknown"
+    except Exception:
+        return "unknown"
 
 def _parse_systemd_environment_files(service_path: str):
     """
@@ -835,6 +947,7 @@ def test_telegram_status(cfg, args, fp=None):
 
     server_dir = str(cfg.get("server_dir") or "")
     rustserver_path = os.path.join(server_dir, "rustserver")
+    server_proc = get_server_process_info(cfg)
 
     def _extract_primary_cause(evidence):
         for line in (evidence or []):
@@ -877,6 +990,25 @@ def test_telegram_status(cfg, args, fp=None):
 
     if resolved.get("source"):
         rendered_lines.append(f"<code>telegram_source={html.escape(str(resolved['source']))}</code>")
+
+    if server_proc.get("running"):
+        rendered_lines.extend([
+            f"<code>server_exe={html.escape(server_proc.get('exe_name', 'unknown'))}</code>",
+            f"<code>server_pid={server_proc.get('pid')}</code>",
+            f"<code>server_running_since={html.escape(server_proc.get('started_at', 'unknown'))}</code>",
+            f"<code>server_uptime={html.escape(server_proc.get('uptime_human', 'unknown'))}</code>",
+        ])
+    elif server_proc.get("ambiguous"):
+        rendered_lines.extend([
+            f"<code>server_pid=ambiguous</code>",
+            f"<code>server_matches={server_proc.get('match_count', 0)}</code>",
+            f"<code>server_select={html.escape(server_proc.get('selected_by', 'unknown'))}</code>",
+        ])
+    else:
+        rendered_lines.extend([
+            f"<code>server_pid=not running</code>",
+            f"<code>server_exe=RustDedicated</code>",
+        ])
 
     rendered = "\n".join(rendered_lines)
 

@@ -12,9 +12,6 @@
   "cooldown_seconds": 120,
   "down_confirmations": 2,
 
-  "Daily restarts": [],
-  "Restart when new Oxide.Rust is out": false,
-
   "check_process_identity": true,
 
   "check_tcp_rcon": true,
@@ -71,6 +68,11 @@
   "recovery_steps": ["update", "mu", "restart"],
   "timeouts": { "update": 1800, "mu": 900, "restart": 600 },
 
+  "watchdog_systemd_unit_name": "rust-watchdog.service",
+  "watchdog_systemd_service_path": "/etc/systemd/system/rust-watchdog.service",
+  "test_telegram_status_try_systemd_env_fallback": true,
+  "test_telegram_status_check_systemd": true,
+
   "alerts": {
     "enabled": true,
     "backends": ["telegram"],
@@ -126,13 +128,7 @@
       "parse_mode": "HTML",
       "disable_web_preview": true,
       "timeout_s": 8,
-      "preflight_getme": true,
-
-    "watchdog_systemd_unit_name": "rust-watchdog.service",
-    "watchdog_systemd_service_path": "/etc/systemd/system/rust-watchdog.service",
-    "test_telegram_status_try_systemd_env_fallback": true,
-    "test_telegram_status_check_systemd": true
-
+      "preflight_getme": true
     }
   }
 }
