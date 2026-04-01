@@ -221,6 +221,14 @@ DEFAULTS = {
     "smoothrestarter_config_path": "",
     "smoothrestarter_plugin_path": "",
 
+    # ---------------------------------------------------------
+    # Telegram test helper / systemd fallback inspection
+    # ---------------------------------------------------------
+    "watchdog_systemd_unit_name": "rust-watchdog.service",
+    "watchdog_systemd_service_path": "/etc/systemd/system/rust-watchdog.service",
+    "test_telegram_status_try_systemd_env_fallback": True,
+    "test_telegram_status_check_systemd": True,
+
 }
 
 STATUS_RE = re.compile(r"^\s*Status:\s*(\S+)\s*$", re.IGNORECASE)
@@ -334,40 +342,449 @@ def _proc_started_at(pid: int) -> str:
     except Exception:
         return "unknown"
 
+def _bool_tf(v) -> str:
+    return "true" if bool(v) else "false"
+
+
+def _parse_int_list_local(s: str):
+    out = []
+    s = (s or "").strip()
+    if not s:
+        return out
+    for chunk in s.replace(",", " ").split():
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            out.append(int(chunk))
+        except Exception:
+            pass
+    return out
+
+
+def _systemd_unit_status(unit_name: str):
+    info = {
+        "unit_name": unit_name or "",
+        "checked": False,
+        "known": False,
+        "active": False,
+        "enabled": "unknown",
+        "load_state": "unknown",
+        "active_state": "unknown",
+        "sub_state": "unknown",
+        "error": "",
+    }
+
+    if not unit_name:
+        info["error"] = "unit name empty"
+        return info
+
+    if not shutil.which("systemctl"):
+        info["error"] = "systemctl not found"
+        return info
+
+    info["checked"] = True
+
+    try:
+        p = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                unit_name,
+                "--property=LoadState,ActiveState,SubState",
+                "--no-pager",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        out = (p.stdout or "").strip()
+
+        for line in out.splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k == "LoadState":
+                info["load_state"] = v or "unknown"
+            elif k == "ActiveState":
+                info["active_state"] = v or "unknown"
+            elif k == "SubState":
+                info["sub_state"] = v or "unknown"
+
+        info["known"] = info["load_state"] not in ("", "unknown", "not-found")
+        info["active"] = (info["active_state"] == "active")
+
+        if p.returncode != 0 and not out and not info["known"]:
+            info["error"] = f"systemctl show rc={p.returncode}"
+
+    except Exception as e:
+        info["error"] = str(e)
+
+    try:
+        p2 = subprocess.run(
+            ["systemctl", "is-enabled", unit_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        enabled_out = (p2.stdout or "").strip()
+        if enabled_out:
+            info["enabled"] = enabled_out.splitlines()[-1].strip()
+    except Exception:
+        pass
+
+    return info
+
+
+def _parse_systemd_environment_files(service_path: str):
+    """
+    Return (entries, err)
+    entries: [{"path": "/etc/default/rust-watchdog", "optional": True}, ...]
+    """
+    try:
+        text = Path(service_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        return [], str(e)
+
+    entries = []
+    seen = set()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, rhs = line.split("=", 1)
+        if key.strip().lower() != "environmentfile":
+            continue
+
+        try:
+            tokens = shlex.split(rhs, posix=True)
+        except Exception:
+            tokens = [rhs.strip()]
+
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+
+            optional = False
+            if tok.startswith("-"):
+                optional = True
+                tok = tok[1:].strip()
+
+            tok = os.path.expandvars(os.path.expanduser(tok))
+            if not tok:
+                continue
+
+            if tok in seen:
+                continue
+            seen.add(tok)
+            entries.append({"path": tok, "optional": optional})
+
+    return entries, ""
+
+def _read_envfile_vars(path: str):
+    """
+    Best-effort parse for simple EnvironmentFile syntax:
+      KEY=value
+      KEY="value"
+      export KEY=value
+    """
+    result = {
+        "path": path,
+        "exists": False,
+        "readable": False,
+        "vars": {},
+        "error": "",
+    }
+
+    try:
+        p = Path(path)
+        result["exists"] = p.exists()
+        if not p.exists():
+            result["error"] = "file not found"
+            return result
+        if not p.is_file():
+            result["error"] = "not a file"
+            return result
+
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        result["readable"] = True
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+
+        key = m.group(1)
+        value = m.group(2).strip()
+
+        if not value:
+            result["vars"][key] = ""
+            continue
+
+        try:
+            toks = shlex.split(value, posix=True)
+            value = " ".join(toks) if toks else ""
+        except Exception:
+            if len(value) >= 2 and (
+                (value[0] == value[-1] == '"') or
+                (value[0] == value[-1] == "'")
+            ):
+                value = value[1:-1]
+
+        result["vars"][key] = value
+
+    return result
+
+def _resolve_telegram_test_target(cfg, fp=None):
+    """
+    Resolve Telegram token/chat_ids for --test-telegram-status.
+
+    Order:
+      1) current process environment
+      2) configured systemd unit -> EnvironmentFile fallback
+    """
+    alerts_cfg = (cfg.get("alerts") or {})
+    tg_cfg = (alerts_cfg.get("telegram") or {})
+
+    token_env = str(tg_cfg.get("token_env", "RUST_WD_TELEGRAM_TOKEN")).strip() or "RUST_WD_TELEGRAM_TOKEN"
+    chat_ids_env = str(tg_cfg.get("chat_ids_env", "RUST_WD_TELEGRAM_CHAT_IDS")).strip() or "RUST_WD_TELEGRAM_CHAT_IDS"
+
+    unit_name = str(cfg.get("watchdog_systemd_unit_name") or "rust-watchdog.service").strip()
+    service_path = str(cfg.get("watchdog_systemd_service_path") or "/etc/systemd/system/rust-watchdog.service").strip()
+
+    result = {
+        "ok": False,
+        "token_env": token_env,
+        "chat_ids_env": chat_ids_env,
+        "token": "",
+        "chat_ids": [],
+        "source": "",
+        "notes": [],
+        "errors": [],
+        "unit_name": unit_name,
+        "service_path": service_path,
+        "systemd": {},
+        "env_entries": [],
+        "env_results": [],
+    }
+
+    # 1) current shell/process env
+    env_token = (os.getenv(token_env, "") or "").strip()
+    env_chat_ids_raw = (os.getenv(chat_ids_env, "") or "").strip()
+    env_chat_ids = _parse_int_list_local(env_chat_ids_raw)
+
+    if env_token and env_chat_ids:
+        result["ok"] = True
+        result["token"] = env_token
+        result["chat_ids"] = env_chat_ids
+        result["source"] = "current process environment"
+        result["notes"].append(
+            f"found Telegram credentials in current environment: {token_env}, {chat_ids_env}"
+        )
+        return result
+
+    if env_token and not env_chat_ids:
+        result["notes"].append(
+            f"found {token_env} in current environment, but {chat_ids_env} is missing/invalid there"
+        )
+    elif (not env_token) and env_chat_ids:
+        result["notes"].append(
+            f"found {chat_ids_env} in current environment, but {token_env} is missing there"
+        )
+    else:
+        result["notes"].append(
+            f"Telegram credentials not present in current environment: {token_env}, {chat_ids_env}"
+        )
+
+    if not parse_bool(cfg.get("test_telegram_status_try_systemd_env_fallback"), True):
+        result["errors"].append("systemd env-file fallback is disabled by config")
+        return result
+
+    if parse_bool(cfg.get("test_telegram_status_check_systemd"), True):
+        result["systemd"] = _systemd_unit_status(unit_name)
+
+    if not service_path:
+        result["errors"].append("systemd service path is empty")
+        return result
+
+    if not os.path.exists(service_path):
+        result["errors"].append(f"systemd unit file not found: {service_path}")
+        return result
+
+    result["notes"].append(f"found systemd unit file: {service_path}")
+
+    env_entries, env_err = _parse_systemd_environment_files(service_path)
+    if env_err:
+        result["errors"].append(f"could not read systemd unit file: {env_err}")
+        return result
+
+    if not env_entries:
+        result["errors"].append(
+            f"no EnvironmentFile entries found in systemd unit: {service_path}"
+        )
+        return result
+
+    result["env_entries"] = env_entries
+    result["notes"].append(
+        "found EnvironmentFile entries: " +
+        ", ".join(x["path"] for x in env_entries)
+    )
+
+    merged = {}
+    readable_paths = []
+
+    for ent in env_entries:
+        info = _read_envfile_vars(ent["path"])
+        info["optional"] = bool(ent.get("optional"))
+        result["env_results"].append(info)
+
+        if info["readable"]:
+            readable_paths.append(info["path"])
+            merged.update(info["vars"])
+
+    token = env_token or str(merged.get(token_env, "") or "").strip()
+    chat_ids_raw = env_chat_ids_raw or str(merged.get(chat_ids_env, "") or "").strip()
+    chat_ids = env_chat_ids if env_chat_ids else _parse_int_list_local(chat_ids_raw)
+
+    if token and chat_ids:
+        result["ok"] = True
+        result["token"] = token
+        result["chat_ids"] = chat_ids
+        if readable_paths:
+            result["source"] = f"systemd EnvironmentFile ({', '.join(readable_paths)})"
+        else:
+            result["source"] = "systemd EnvironmentFile"
+        return result
+
+    if not token:
+        result["errors"].append(
+            f"could not resolve Telegram token variable '{token_env}' "
+            f"from current environment or readable systemd EnvironmentFile entries"
+        )
+    if not chat_ids:
+        result["errors"].append(
+            f"could not resolve Telegram chat IDs variable '{chat_ids_env}' "
+            f"from current environment or readable systemd EnvironmentFile entries"
+        )
+
+    return result
+
 def test_telegram_status(cfg, args, fp=None):
     """
     Send a direct Telegram status message and exit.
-    This intentionally bypasses AlertManager cooldown/dedupe so a test is always a test.
+
+    This path does NOT depend on AlertManager being enabled.
+    It resolves Telegram credentials from:
+      1) current process environment
+      2) systemd unit EnvironmentFile fallback
     """
-    if not ALERTS or not getattr(ALERTS, "enabled", False):
-        log("TEST_TELEGRAM_STATUS: alerts not enabled or backend init failed", fp)
+    resolved = _resolve_telegram_test_target(cfg, fp=fp)
+
+    token_env = resolved["token_env"]
+    chat_ids_env = resolved["chat_ids_env"]
+
+    for note in resolved.get("notes", []):
+        log(f"TEST_TELEGRAM_STATUS: {note}", fp)
+
+    systemd_info = resolved.get("systemd") or {}
+    if systemd_info.get("checked"):
+        log(
+            "TEST_TELEGRAM_STATUS: "
+            f"systemd unit={systemd_info.get('unit_name')!s} "
+            f"known={_bool_tf(systemd_info.get('known'))} "
+            f"active={_bool_tf(systemd_info.get('active'))} "
+            f"enabled={systemd_info.get('enabled', 'unknown')} "
+            f"load_state={systemd_info.get('load_state', 'unknown')} "
+            f"sub_state={systemd_info.get('sub_state', 'unknown')}",
+            fp
+        )
+        if systemd_info.get("error"):
+            log(f"TEST_TELEGRAM_STATUS: systemd note: {systemd_info['error']}", fp)
+
+    for info in resolved.get("env_results", []):
+        path = info.get("path", "")
+        if info.get("readable"):
+            found_vars = []
+            if token_env in info.get("vars", {}):
+                found_vars.append(token_env)
+            if chat_ids_env in info.get("vars", {}):
+                found_vars.append(chat_ids_env)
+
+            if found_vars:
+                log(
+                    f"TEST_TELEGRAM_STATUS: readable env file: {path} "
+                    f"(found {', '.join(found_vars)})",
+                    fp
+                )
+            else:
+                log(
+                    f"TEST_TELEGRAM_STATUS: readable env file: {path} "
+                    f"(Telegram vars not present there)",
+                    fp
+                )
+        else:
+            opt = "optional " if info.get("optional") else ""
+            err = info.get("error", "unreadable")
+            log(
+                f"TEST_TELEGRAM_STATUS: {opt}env file not readable: {path} -- {err}",
+                fp
+            )
+
+    if not resolved.get("ok"):
+        for err in resolved.get("errors", []):
+            log(f"TEST_TELEGRAM_STATUS: ERROR: {err}", fp)
+
+        log("TEST_TELEGRAM_STATUS: conclusion: Telegram credentials could not be resolved for this test run.", fp)
+        log(
+            f"TEST_TELEGRAM_STATUS: fix: either export {token_env} and {chat_ids_env} in the shell before running this command,",
+            fp
+        )
+        log(
+            "TEST_TELEGRAM_STATUS: or put them in the EnvironmentFile used by the watchdog systemd service.",
+            fp
+        )
+        log(
+            "TEST_TELEGRAM_STATUS: if the EnvironmentFile exists but is unreadable here, that usually just means this manual test is running in a different context than systemd.",
+            fp
+        )
         return 2
 
-    tg_backends = [
-        b for b in getattr(ALERTS, "backends", [])
-        if getattr(b, "name", "") == "telegram"
-    ]
-    if not tg_backends:
-        log("TEST_TELEGRAM_STATUS: no usable Telegram backend configured", fp)
+    try:
+        if PROJECT_DIR not in sys.path:
+            sys.path.insert(0, PROJECT_DIR)
+        from rust_watchdog_alerts import TelegramBackend
+    except Exception as e:
+        log(f"TEST_TELEGRAM_STATUS: ERROR: could not import Telegram backend: {e}", fp)
         return 2
-
-    def _safe_cfg_label(path: str) -> str:
-        try:
-            return os.path.basename(os.path.abspath(path)) or str(path)
-        except Exception:
-            return str(path)
-
-    def _extract_primary_cause(evidence) -> str:
-        for line in (evidence or []):
-            if isinstance(line, str) and line.startswith("PRIMARY_CAUSE:"):
-                return line[len("PRIMARY_CAUSE:"):].strip()
-        return ""
 
     live_pid = _read_lockfile_pid(str(cfg.get("lockfile") or ""))
     live_since = _proc_started_at(live_pid) if live_pid else "not running"
 
     server_dir = str(cfg.get("server_dir") or "")
     rustserver_path = os.path.join(server_dir, "rustserver")
+
+    def _extract_primary_cause(evidence):
+        for line in (evidence or []):
+            if isinstance(line, str) and line.startswith("PRIMARY_CAUSE:"):
+                return line[len("PRIMARY_CAUSE:"):].strip()
+        return ""
 
     try:
         state, evidence = health_report(cfg, server_dir, rustserver_path, fp=None)
@@ -377,7 +794,6 @@ def test_telegram_status(cfg, args, fp=None):
         primary = f"health_report failed -- {e}"
 
     now_s = ts()
-    cfg_label = _safe_cfg_label(getattr(args, "config", "rust_watchdog.json"))
     dry_run_s = str(bool(cfg.get("dry_run", False))).lower()
 
     rendered_lines = [
@@ -391,33 +807,41 @@ def test_telegram_status(cfg, args, fp=None):
         rendered_lines.append(f"<code>server_primary={html.escape(primary)}</code>")
 
     rendered_lines.extend([
-        # f"<code>config={html.escape(cfg_label)}</code>",
+        f"<code>watchdog_running={_bool_tf(bool(live_pid))}</code>",
         f"<code>watchdog_pid={live_pid if live_pid else 'not running'}</code>",
         f"<code>watchdog_running_since={html.escape(live_since)}</code>",
         f"<code>dry_run={html.escape(dry_run_s)}</code>",
     ])
 
+    if systemd_info.get("checked"):
+        rendered_lines.extend([
+            f"<code>systemd_known={_bool_tf(systemd_info.get('known'))}</code>",
+            f"<code>systemd_active={_bool_tf(systemd_info.get('active'))}</code>",
+        ])
+
+    if resolved.get("source"):
+        rendered_lines.append(f"<code>telegram_source={html.escape(str(resolved['source']))}</code>")
+
     rendered = "\n".join(rendered_lines)
 
-    ok_any = False
-    for b in tg_backends:
-        try:
-            ok = b.send(None, rendered)
-            ok_any = ok_any or bool(ok)
-            if not ok:
-                log(
-                    f"TEST_TELEGRAM_STATUS: backend send failed: "
-                    f"{getattr(b, 'last_error', 'unknown error')}",
-                    fp
-                )
-        except Exception as e:
-            log(f"TEST_TELEGRAM_STATUS: backend error: {e}", fp)
+    tg_cfg = ((cfg.get("alerts") or {}).get("telegram") or {})
+    backend = TelegramBackend(
+        token=resolved["token"],
+        chat_ids=resolved["chat_ids"],
+        parse_mode=str(tg_cfg.get("parse_mode", "HTML")),
+        disable_web_preview=bool(tg_cfg.get("disable_web_preview", True)),
+        timeout_s=int(tg_cfg.get("timeout_s", 8)),
+    )
 
-    if ok_any:
+    ok = backend.send(None, rendered)
+    if ok:
         log("TEST_TELEGRAM_STATUS: sent OK", fp)
         return 0
 
-    log("TEST_TELEGRAM_STATUS: no Telegram backend succeeded", fp)
+    log(
+        f"TEST_TELEGRAM_STATUS: send failed: {getattr(backend, 'last_error', 'unknown error')}",
+        fp
+    )
     return 2
 
 def init_alerts(cfg, fp=None):
@@ -448,12 +872,16 @@ def init_alerts(cfg, fp=None):
         return None
 
     try:
-        # log_fn(level, msg)
         ALERTS = AlertManager(
             cfg,
             log_fn=lambda level, msg: log(f"ALERTS: {level}: {msg}", fp)
         )
-        log("ALERTS: enabled", fp)
+
+        if getattr(ALERTS, "enabled", False):
+            log("ALERTS: enabled", fp)
+        else:
+            log("ALERTS: disabled (no usable backends)", fp)
+
         return ALERTS
     except Exception as e:
         log(f"ALERTS: disabled (init failed): {e}", fp)
@@ -2916,25 +3344,19 @@ def main():
     # Auto-clear stale dupe pause files created by our dupe-guard (if safe)
     autoclear_stale_dupe_pause_on_startup(cfg, fp)
 
+    # Telegram status test path:
+    # do this BEFORE init_alerts(), so the test can diagnose missing env vars cleanly
+    # instead of being gated by AlertManager startup.
+    if args.test_telegram_status:
+        rc = test_telegram_status(cfg, args, fp=fp)
+        if fp:
+            fp.close()
+        raise SystemExit(rc)
+
     # init alerts if in use
     init_alerts(cfg, fp)
     alert("watchdog_started", f"rust-linuxgsm-watchdog v{__version__} started", fp=fp,
         identity=cfg.get("identity"), dry_run=cfg.get("dry_run"))
-
-    # Telegram status test alert
-    if args.test_telegram_status:
-        rc = test_telegram_status(cfg, args, fp=fp)
-        try:
-            if ALERTS:
-                if hasattr(ALERTS, "close"):
-                    ALERTS.close()
-                elif hasattr(ALERTS, "stop"):
-                    ALERTS.stop()
-        except Exception:
-            pass
-        if fp:
-            fp.close()
-        raise SystemExit(rc)
 
     # One-time dependency hint
     ok_ws, ws_err = websocket_dep_status()

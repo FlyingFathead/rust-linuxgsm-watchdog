@@ -126,7 +126,13 @@
       "parse_mode": "HTML",
       "disable_web_preview": true,
       "timeout_s": 8,
-      "preflight_getme": true
+      "preflight_getme": true,
+
+    "watchdog_systemd_unit_name": "rust-watchdog.service",
+    "watchdog_systemd_service_path": "/etc/systemd/system/rust-watchdog.service",
+    "test_telegram_status_try_systemd_env_fallback": true,
+    "test_telegram_status_check_systemd": true
+
     }
   }
 }
