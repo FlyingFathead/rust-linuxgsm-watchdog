@@ -73,13 +73,29 @@
   "test_telegram_status_try_systemd_env_fallback": true,
   "test_telegram_status_check_systemd": true,
 
-  "alerts": {
-    "enabled": true,
-    "backends": ["telegram"],
-    "cooldown_seconds_default": 900,
-    "dedupe_seconds": 300,
-    "include_host": true,
-    "include_identity": true,
+"alerts": {
+  "enabled": true,
+  "backends": ["telegram"],
+
+  "cooldown_seconds_default": 900,
+  "cooldowns": {
+    "watchdog_started": 0,
+    "startup_ok": 0,
+
+    "update_available": 0,
+    "update_held": 0,
+    "restart_requested": 0,
+    "update_applied": 0,
+
+    "server_down": 0,
+    "server_recovered": 0,
+    "recovery_attempted": 0,
+    "recovery_failed": 0
+  },
+
+  "dedupe_seconds": 300,
+  "include_host": true,
+  "include_identity": true,
     "emoji_by_level": {
       "INFO": "ℹ️",
       "WARNING": "⚠️",
