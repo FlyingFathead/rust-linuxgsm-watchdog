@@ -2,7 +2,11 @@
 
 A watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM** to keep your server up, running and up to date in a more automated way than what [LinuxGSM](https://linuxgsm.com/) offers by default.
 
-This program is stdlib-only by default. If you enable WebRCON features (tests / SmoothRestarter bridge), it uses `websocket-client`. It polls server health and, if the server is *confirmed down*, runs a recovery sequence, i.e.:
+This program is stdlib-only unless WebRCON features are used. Authenticated
+wipe-timestamp discovery is enabled by default, and WebRCON tests plus the
+SmoothRestarter bridge are optional; these features use `websocket-client`. It
+polls server health and, if the server is *confirmed down*, runs a recovery
+sequence, i.e.:
 
 1) `./rustserver update`  
 2) `./rustserver mu` (Oxide update via LinuxGSM mods)  
@@ -48,7 +52,8 @@ Optional (disabled by default): `./rustserver details` parsing exists for debugg
 - Python 3.9+ (uses `zoneinfo`; install `tzdata` on minimal hosts if your timezone DB is missing)
 - A working LinuxGSM Rust install where `server_dir` contains an executable `./rustserver`
 
-Optional (only needed for WebRCON features like `--test-rcon-say` and the SmoothRestarter bridge):
+Optional (needed for authenticated wipe-timestamp discovery and other WebRCON
+features such as `--test-rcon-say` and the SmoothRestarter bridge):
 - `websocket-client` (install via `requirements.txt`, or `pip install websocket-client`) 
 
 ---
@@ -68,7 +73,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.4) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.5) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -114,6 +119,10 @@ Here's another example `rust_watchdog.json`:
   "rcon_port": 28016,
   "tcp_timeout": 2.0,
 
+  "wipe_timestamp_rcon_enabled": true,
+  "wipe_timestamp_filesystem_fallback_enabled": true,
+  "wipe_timestamp_interval_seconds": 600,
+
   "check_lgsm_details": false,
   "details_timeout": 20,
 
@@ -130,6 +139,14 @@ Notes:
 * `dry_run`: logs what it *would* do, but never runs recovery steps.
 * `down_confirmations`: prevents one bad poll from causing a recovery.
 * `timeouts`: per-step hard limits so SteamCMD slowness doesn’t hang the watchdog forever.
+* `wipe_timestamp_rcon_enabled`: read the current save creation time from
+  authenticated WebRCON `serverinfo` and persist it as the last map-wipe time.
+* `wipe_timestamp_filesystem_fallback_enabled`: if RCON cannot supply a valid
+  timestamp, use the newest `.map` mtime under the derived LinuxGSM
+  `serverfiles/server/<identity>/` directory. Active `.sav` mtimes are never
+  used because ordinary autosaves keep changing them.
+* `wipe_timestamp_interval_seconds`: how often to reconcile the primary or
+  fallback value while the Rust server is healthy.
 
 ---
 
@@ -446,8 +463,11 @@ When `forced_wipe_action` is `off`, the persistent reminder is on by default.
 After the monthly schedule passes, the watchdog logs and sends a UTF-8 `⚠️`
 warning every `forced_wipe_reminder_repeat_minutes` until that cycle has a
 recorded wipe. The wording deliberately says **no completed wipe is recorded**:
-the watchdog cannot reliably infer an externally performed wipe from a running
-server or a Steam build number.
+Steam build numbers alone cannot prove that a wipe occurred. By default, the
+watchdog also queries authenticated WebRCON `serverinfo.SaveCreatedTime`, which
+does identify when the current map/save was created. If that timestamp belongs
+to the active Facepunch cycle, the reminder and any pending duplicate automatic
+wipe are suppressed.
 
 The automatic path records the exact successful wipe-command time. After a
 manual `full-wipe` or `map-wipe`, record either the current time or the actual
@@ -467,6 +487,26 @@ The state retains `last_wipe_at`, `last_wipe_source`, `last_wipe_kind`,
 Both ledgers are stored in the configured `forced_wipe_state_file`. The restart
 time is taken from the live `RustDedicated` process start time via Linux
 `/proc`, then persisted so a later server-down alert can still show it.
+The wipe time is primarily read from the nested JSON returned by authenticated
+WebRCON `serverinfo.SaveCreatedTime`, at startup and then every
+`wipe_timestamp_interval_seconds` while Rust is healthy. This requires the
+optional `websocket-client` dependency and working RCON credentials. A
+discovered historical/external wipe is recorded with
+`last_wipe_source: rcon-save-created` and `last_wipe_kind: unknown`, because
+SaveCreatedTime cannot distinguish `map-wipe` from `full-wipe`. Explicit
+manual/automatic wipe-kind metadata is retained when it is already known.
+
+If RCON is unavailable or its response has no valid `SaveCreatedTime`, the
+default-on filesystem fallback reads the newest `.map` file mtime beneath the
+LinuxGSM server identity directory derived from `server_dir` and `identity`.
+LinuxGSM deletes and recreates `*.map` and `*.sav*` for both map and full wipes,
+but the watchdog deliberately ignores `.sav` mtimes because ordinary saves keep
+changing them. LinuxGSM full wipes additionally delete `*.db` except
+`player.tokens.db`; database timestamps are not used because those files may be
+created or modified well after the wipe as players and plugins become active.
+A fallback observation is recorded with
+`last_wipe_source: filesystem-map-mtime` and `last_wipe_kind: unknown`. RCON
+always wins when both sources are available.
 
 Status renders the UTC timestamps and long-form ages:
 
@@ -483,17 +523,24 @@ last_restart_source: rust-process-start
 Every normal watchdog alert receives a separate status footnote by default:
 
 ```text
-Server last wiped: 2026-08-06 18:23:00 UTC (20 days, 3 hours, 12 minutes ago)
+Server last wiped: 2026-08-06 18:23:00 UTC (RCON) (20 days, 3 hours, 12 minutes ago)
 Server last restarted: 2026-08-06 18:24:15 UTC (20 days, 3 hours, 10 minutes ago)
 ```
+
+The wipe line identifies the source actually used: `(RCON)` for
+`serverinfo.SaveCreatedTime`, `(map file mtime)` for the filesystem fallback,
+`(manual record)` for `--mark-forced-wipe-done`, or
+`(watchdog automatic wipe)` when the watchdog performed the wipe. Legacy
+records without a stored source omit the source label.
 
 The Telegram HTML renderer wraps each line in `<i>...</i>`, Telegram Markdown
 uses `_..._`, and the existing Discord renderer uses Markdown italics. The
 elapsed footnote is excluded from alert deduplication, so a changing minute
 count does not defeat the existing dedupe policy.
 
-If no prior timestamp can be established, the watchdog says so instead of
-guessing from a save-file mtime or Steam build time:
+If RCON and the `.map` fallback are both unavailable and no prior timestamp has
+been persisted, the watchdog says so instead of guessing from a save-file
+mtime or Steam build time:
 
 ```text
 Server last wiped: unknown (no wipe timestamp recorded)
@@ -768,6 +815,18 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.5
+  **Fixed / Added:**
+  - Added default-on reconciliation of the last map-wipe timestamp from authenticated WebRCON `serverinfo.SaveCreatedTime`.
+  - Decodes Rust's outer WebRCON response and the JSON document nested in its `Message` field.
+  - Queries the timestamp before the first alert and periodically while the server is healthy.
+  - Added a default-on LinuxGSM `.map` mtime fallback when RCON is unavailable or invalid; RCON remains authoritative.
+  - Alert footnotes identify the timestamp source as `(RCON)` or `(map file mtime)`; manual and watchdog-recorded wipes are labeled separately.
+  - Deliberately ignores active `.sav` mtimes because autosaves continuously modify them.
+  - Persists discovered timestamps with `last_wipe_source: rcon-save-created` and `last_wipe_kind: unknown`.
+  - Retains known `map-wipe` or `full-wipe` metadata when RCON observes the same wipe shortly after an explicit manual or automatic record.
+  - Suppresses forced-wipe reminders and pending duplicate automatic wipes when the current Facepunch cycle is already wiped.
+  - Added validation and regression coverage for nested responses, malformed or future timestamps, persistence, metadata preservation, and cycle completion.
 - v0.4.4
   **Fixed / Added:**
   - Declared `0.4.4` once in `rust_watchdog.py` and added `(v0.4.4)` to every normal alert header and the direct Telegram status-test header.

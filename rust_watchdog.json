@@ -19,6 +19,10 @@
   "rcon_port": 28016,
   "tcp_timeout": 2.0,
 
+  "wipe_timestamp_rcon_enabled": true,
+  "wipe_timestamp_filesystem_fallback_enabled": true,
+  "wipe_timestamp_interval_seconds": 600,
+
   "enable_update_watch": true,
   "update_check_interval_seconds": 600,
   "update_check_timeout": 60,

@@ -27,6 +27,7 @@ class AlertFootnoteRenderTests(unittest.TestCase):
             fields={
                 "_footnote_lines": [
                     "Server last wiped: 2026-07-31 18:09:00 UTC "
+                    "(RCON) "
                     "(5 days, 23 hours, 51 minutes ago)",
                     "Server last restarted: unknown "
                     "(no Rust process start timestamp recorded)",
@@ -39,6 +40,7 @@ class AlertFootnoteRenderTests(unittest.TestCase):
         rendered = self.manager._render_html(self.alert)
         self.assertIn(
             "\n\n<i>Server last wiped: 2026-07-31 18:09:00 UTC "
+            "(RCON) "
             "(5 days, 23 hours, 51 minutes ago)</i>\n"
             "<i>Server last restarted: unknown "
             "(no Rust process start timestamp recorded)</i>",
@@ -50,6 +52,7 @@ class AlertFootnoteRenderTests(unittest.TestCase):
         rendered = self.manager._render_plain(self.alert)
         self.assertIn(
             "\n\n*Server last wiped: 2026-07-31 18:09:00 UTC "
+            "(RCON) "
             "(5 days, 23 hours, 51 minutes ago)*\n"
             "*Server last restarted: unknown "
             "(no Rust process start timestamp recorded)*",
@@ -63,6 +66,7 @@ class AlertFootnoteRenderTests(unittest.TestCase):
         )
         self.assertIn(
             "\n\n_Server last wiped: 2026-07-31 18:09:00 UTC "
+            "(RCON) "
             "(5 days, 23 hours, 51 minutes ago)_",
             rendered,
         )

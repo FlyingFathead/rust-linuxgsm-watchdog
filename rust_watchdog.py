@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 
 def _runtime_version():
@@ -173,6 +173,15 @@ DEFAULTS = {
     "rcon_host": "127.0.0.1",
     "rcon_port": 28016,
     "tcp_timeout": 2.0,
+
+    # Read Rust's authoritative current save creation time from
+    # `serverinfo.SaveCreatedTime` over authenticated WebRCON. This is the
+    # primary source for reconstructing the last map-wipe timestamp.
+    "wipe_timestamp_rcon_enabled": True,
+    # If RCON is unavailable, use the newest stable .map file mtime under the
+    # LinuxGSM server identity directory. Active .sav mtimes are never used.
+    "wipe_timestamp_filesystem_fallback_enabled": True,
+    "wipe_timestamp_interval_seconds": 600,
 
     "check_lgsm_details": False,      # parse ./rustserver details output (usually only for debugging)
     "details_timeout": 20,
@@ -2174,6 +2183,104 @@ class ForcedWipeCoordinator:
         self.state["start_done"] = True
         self._save(now_utc)
 
+    def observe_server_wipe(
+        self,
+        wiped_at: str,
+        now_utc: datetime,
+        *,
+        source: str = "rcon-save-created",
+    ) -> bool:
+        """
+        Reconcile a wipe timestamp observed from the running Rust server.
+
+        SaveCreatedTime proves when the current map/save was created, but it
+        cannot distinguish map-wipe from full-wipe. Explicit manual/automatic
+        metadata is therefore retained when the timestamp is already known.
+        """
+        parsed = _parse_utc_iso(str(wiped_at or ""))
+        if parsed is None or parsed > now_utc + timedelta(minutes=1):
+            return False
+
+        info = self._ensure_cycle(now_utc)
+        normalized = _utc_iso(parsed)
+        existing = _parse_utc_iso(
+            str(self.state.get("last_wipe_at") or "")
+        )
+        changed = False
+
+        explicit_kind = str(
+            self.state.get("last_wipe_kind") or ""
+        ).strip().lower()
+        explicit_source = str(
+            self.state.get("last_wipe_source") or ""
+        ).strip()
+        same_explicit_wipe = bool(
+            existing is not None
+            and parsed > existing
+            and (parsed - existing) <= timedelta(minutes=15)
+            and explicit_kind in ("map-wipe", "full-wipe")
+            and explicit_source
+        )
+
+        if existing is None or parsed > existing:
+            self.state["last_wipe_at"] = normalized
+            if not same_explicit_wipe:
+                self.state["last_wipe_source"] = str(
+                    source or "rcon-save-created"
+                )
+                self.state["last_wipe_kind"] = "unknown"
+            changed = True
+        elif parsed == existing:
+            if not self.state.get("last_wipe_source"):
+                self.state["last_wipe_source"] = str(
+                    source or "rcon-save-created"
+                )
+                changed = True
+            if not self.state.get("last_wipe_kind"):
+                self.state["last_wipe_kind"] = "unknown"
+                changed = True
+        else:
+            # Never replace a newer explicit/persisted observation with an
+            # older save timestamp (for example after restoring a backup).
+            return False
+
+        tolerance_m = max(
+            0,
+            int(
+                self.cfg.get(
+                    "forced_wipe_early_release_tolerance_minutes",
+                    15,
+                )
+            ),
+        )
+        completes_cycle = bool(
+            parsed.astimezone(info["tz"]).date()
+            == info["wipe_tz_dt"].date()
+            or parsed
+            >= info["wipe_utc_dt"] - timedelta(minutes=tolerance_m)
+        )
+        if completes_cycle:
+            completion_source = str(source or "rcon-save-created")
+            cycle_updates = {
+                "pending": False,
+                "wipe_done": True,
+                "wipe_done_at": normalized,
+                "start_done": True,
+                "completed": True,
+                "completed_at": _utc_iso(now_utc),
+                "completion_source": completion_source,
+                "failed_step": "",
+                "last_error": "",
+            }
+            for key, value in cycle_updates.items():
+                if self.state.get(key) != value:
+                    self.state[key] = value
+                    changed = True
+
+        if not changed:
+            return False
+        return self._save(now_utc)
+
     def observe_server_restart(
         self,
         restarted_at: str,
@@ -2432,6 +2539,205 @@ def _refresh_server_restart_ledger(
     return restarted_at
 
 
+def _refresh_server_wipe_ledger_from_rcon(
+    cfg: dict,
+    coordinator: ForcedWipeCoordinator,
+    *,
+    now_utc: datetime = None,
+    fp=None,
+    log_failure: bool = False,
+) -> tuple:
+    """
+    Query `serverinfo` and reconcile its nested SaveCreatedTime value.
+
+    Returns (ok, normalized_timestamp, changed_or_error).
+    """
+    if not parse_bool(cfg.get("wipe_timestamp_rcon_enabled"), True):
+        return (False, "", "disabled")
+    if coordinator is None:
+        return (False, "", "coordinator unavailable")
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    ok, response = rcon_send(cfg, "serverinfo", fp=fp)
+    if not ok:
+        error = str(response or "RCON serverinfo failed")
+        if log_failure:
+            log(
+                "WIPE_TIMESTAMP: RCON serverinfo unavailable: "
+                f"{error}",
+                fp,
+            )
+        return (False, "", error)
+
+    wiped_at = extract_serverinfo_save_created_time(response)
+    if not wiped_at:
+        error = "serverinfo response has no valid SaveCreatedTime"
+        if log_failure:
+            log(f"WIPE_TIMESTAMP: {error}", fp)
+        return (False, "", error)
+
+    parsed = _parse_utc_iso(wiped_at)
+    if parsed is None or parsed > now_utc + timedelta(minutes=1):
+        error = f"invalid or future SaveCreatedTime: {wiped_at}"
+        if log_failure:
+            log(f"WIPE_TIMESTAMP: {error}", fp)
+        return (False, "", error)
+
+    changed = coordinator.observe_server_wipe(
+        wiped_at,
+        now_utc,
+        source="rcon-save-created",
+    )
+    if changed:
+        log(
+            "WIPE_TIMESTAMP: reconciled RCON "
+            f"serverinfo.SaveCreatedTime={wiped_at}",
+            fp,
+        )
+    return (True, wiped_at, changed)
+
+
+def _linuxgsm_server_identity_dir(cfg: dict) -> str:
+    server_dir = str(cfg.get("server_dir") or "").strip()
+    identity = str(cfg.get("identity") or "").strip()
+    if not server_dir or not identity:
+        return ""
+    return os.path.join(
+        os.path.abspath(os.path.expanduser(server_dir)),
+        "serverfiles",
+        "server",
+        identity,
+    )
+
+
+def _filesystem_map_wipe_timestamp(cfg: dict) -> tuple:
+    """
+    Return the newest LinuxGSM identity-directory .map mtime and its path.
+
+    LinuxGSM deletes every .map and .sav* file for both map and full wipes.
+    A recreated .map file normally remains unchanged during play, unlike the
+    active .sav file. The .map mtime is therefore the conservative filesystem
+    fallback when authenticated RCON cannot provide SaveCreatedTime.
+    """
+    identity_dir = _linuxgsm_server_identity_dir(cfg)
+    if not identity_dir:
+        return ("", "server identity directory unavailable")
+    if not os.path.isdir(identity_dir):
+        return ("", f"server identity directory not found: {identity_dir}")
+
+    newest = None
+    try:
+        for root, _dirs, names in os.walk(identity_dir):
+            for name in names:
+                if not name.lower().endswith(".map"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    mtime = float(os.stat(path).st_mtime)
+                except OSError:
+                    continue
+                if newest is None or mtime > newest[0]:
+                    newest = (mtime, path)
+    except OSError as e:
+        return ("", f"could not scan {identity_dir}: {e}")
+
+    if newest is None:
+        return ("", f"no .map file found under {identity_dir}")
+    try:
+        wiped_at = datetime.fromtimestamp(
+            newest[0],
+            tz=timezone.utc,
+        )
+    except (OSError, OverflowError, ValueError) as e:
+        return ("", f"invalid .map mtime for {newest[1]}: {e}")
+    return (_utc_iso(wiped_at), newest[1])
+
+
+def _refresh_server_wipe_ledger_from_filesystem(
+    cfg: dict,
+    coordinator: ForcedWipeCoordinator,
+    *,
+    now_utc: datetime = None,
+    fp=None,
+    log_failure: bool = False,
+) -> tuple:
+    """
+    Reconcile the newest stable LinuxGSM .map mtime as a fallback source.
+
+    Returns (ok, normalized_timestamp, changed_or_error).
+    """
+    if not parse_bool(
+        cfg.get("wipe_timestamp_filesystem_fallback_enabled"),
+        True,
+    ):
+        return (False, "", "disabled")
+    if coordinator is None:
+        return (False, "", "coordinator unavailable")
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    wiped_at, detail = _filesystem_map_wipe_timestamp(cfg)
+    if not wiped_at:
+        if log_failure:
+            log(f"WIPE_TIMESTAMP: filesystem fallback unavailable: {detail}", fp)
+        return (False, "", detail)
+
+    parsed = _parse_utc_iso(wiped_at)
+    if parsed is None or parsed > now_utc + timedelta(minutes=1):
+        error = f"invalid or future .map mtime: {wiped_at} ({detail})"
+        if log_failure:
+            log(f"WIPE_TIMESTAMP: {error}", fp)
+        return (False, "", error)
+
+    changed = coordinator.observe_server_wipe(
+        wiped_at,
+        now_utc,
+        source="filesystem-map-mtime",
+    )
+    if changed:
+        log(
+            "WIPE_TIMESTAMP: reconciled LinuxGSM "
+            f".map mtime={wiped_at} ({detail})",
+            fp,
+        )
+    return (True, wiped_at, changed)
+
+
+def _refresh_server_wipe_ledger(
+    cfg: dict,
+    coordinator: ForcedWipeCoordinator,
+    *,
+    now_utc: datetime = None,
+    fp=None,
+    log_failure: bool = False,
+) -> tuple:
+    """Use authenticated RCON first, then the LinuxGSM filesystem fallback."""
+    if parse_bool(cfg.get("wipe_timestamp_rcon_enabled"), True):
+        rcon_result = _refresh_server_wipe_ledger_from_rcon(
+            cfg,
+            coordinator,
+            now_utc=now_utc,
+            fp=fp,
+            log_failure=False,
+        )
+        if rcon_result[0]:
+            return rcon_result
+        if log_failure:
+            log(
+                "WIPE_TIMESTAMP: RCON serverinfo unavailable "
+                f"({rcon_result[2]}); trying filesystem fallback",
+                fp,
+            )
+
+    filesystem_result = _refresh_server_wipe_ledger_from_filesystem(
+        cfg,
+        coordinator,
+        now_utc=now_utc,
+        fp=fp,
+        log_failure=log_failure,
+    )
+    return filesystem_result
+
+
 def _load_status_ledger(cfg: dict) -> dict:
     path = str(cfg.get("forced_wipe_state_file") or "").strip()
     if not path:
@@ -2442,6 +2748,17 @@ def _load_status_ledger(cfg: dict) -> dict:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
+
+
+def _wipe_source_label(source: str) -> str:
+    normalized = str(source or "").strip()
+    labels = {
+        "rcon-save-created": "RCON",
+        "filesystem-map-mtime": "map file mtime",
+        "manual": "manual record",
+        "automatic": "watchdog automatic wipe",
+    }
+    return labels.get(normalized.lower(), normalized)
 
 
 def _build_alert_status_footnotes(
@@ -2482,8 +2799,12 @@ def _build_alert_status_footnotes(
         wiped_at = str(state.get("last_wipe_at") or "")
         rendered_at = _status_timestamp(wiped_at)
         if rendered_at:
+            source_label = _wipe_source_label(
+                str(state.get("last_wipe_source") or "")
+            )
+            source_suffix = f" ({source_label})" if source_label else ""
             lines.append(
-                f"Server last wiped: {rendered_at} "
+                f"Server last wiped: {rendered_at}{source_suffix} "
                 f"({_elapsed_ago(wiped_at, now_utc)})"
             )
         else:
@@ -3443,6 +3764,29 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         if uto <= 0:
             fatal("config: update_check_timeout must be > 0", fp=fp)
 
+    if (
+        parse_bool(cfg.get("wipe_timestamp_rcon_enabled"), True)
+        or parse_bool(
+            cfg.get("wipe_timestamp_filesystem_fallback_enabled"),
+            True,
+        )
+    ):
+        try:
+            wipe_timestamp_interval = int(
+                cfg.get("wipe_timestamp_interval_seconds", 600)
+            )
+        except Exception as e:
+            fatal(
+                "config: wipe_timestamp_interval_seconds must be "
+                f"an integer: {e}",
+                fp=fp,
+            )
+        if wipe_timestamp_interval <= 0:
+            fatal(
+                "config: wipe_timestamp_interval_seconds must be > 0",
+                fp=fp,
+            )
+
     forced_wipe_action = str(cfg.get("forced_wipe_action", "off")).strip().lower()
     forced_wipe_reminder_enabled = parse_bool(
         cfg.get("forced_wipe_reminder_enabled"), True
@@ -3607,6 +3951,26 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
                 f"every {reminder_repeat_m}m until completion is recorded",
                 fp,
             )
+    if parse_bool(cfg.get("wipe_timestamp_rcon_enabled"), True):
+        log(
+            "  OK: primary wipe timestamp source: "
+            "RCON serverinfo.SaveCreatedTime",
+            fp,
+        )
+    else:
+        log("  NOTE: primary RCON wipe timestamp discovery disabled", fp)
+    if parse_bool(
+        cfg.get("wipe_timestamp_filesystem_fallback_enabled"),
+        True,
+    ):
+        log(
+            "  OK: fallback wipe timestamp source: newest LinuxGSM .map "
+            f"mtime under {_linuxgsm_server_identity_dir(cfg)} "
+            f"(check every {int(cfg.get('wipe_timestamp_interval_seconds', 600))}s)",
+            fp,
+        )
+    else:
+        log("  NOTE: filesystem wipe timestamp fallback disabled", fp)
 
     if logfile:
         log(f"  OK: logfile open: {logfile}", fp)
@@ -4132,6 +4496,83 @@ def rcon_extract_message(resp: str) -> str:
     except Exception:
         pass
     return strip_ansi(s).strip()
+
+
+def _parse_rust_save_created_time(value: str) -> str:
+    """
+    Parse Rust serverinfo.SaveCreatedTime and return canonical UTC ISO-8601.
+
+    Rust currently emits invariant US month/day order without a timezone. The
+    value represents UTC; ISO-8601 is also accepted for forward compatibility.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    parsed_iso = _parse_utc_iso(raw)
+    if parsed_iso is not None:
+        return _utc_iso(parsed_iso)
+
+    for fmt in (
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S.%f",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M:%S.%f %p",
+    ):
+        try:
+            parsed = datetime.strptime(raw, fmt).replace(
+                tzinfo=timezone.utc
+            )
+            return _utc_iso(parsed)
+        except ValueError:
+            continue
+    return ""
+
+
+def extract_serverinfo_save_created_time(resp: str) -> str:
+    """
+    Decode the outer WebRCON frame and its JSON-encoded Message payload.
+
+    Returns a normalized UTC timestamp, or an empty string when the response
+    does not contain a valid SaveCreatedTime.
+    """
+    raw = str(resp or "").strip()
+    if not raw:
+        return ""
+    try:
+        outer = json.loads(raw)
+    except Exception:
+        return ""
+
+    candidates = outer if isinstance(outer, list) else [outer]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        inner = candidate
+        message = candidate.get(
+            "Message",
+            candidate.get("message"),
+        )
+        if isinstance(message, dict):
+            inner = message
+        elif isinstance(message, str) and message.strip():
+            try:
+                decoded = json.loads(message)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, dict):
+                inner = decoded
+
+        value = inner.get(
+            "SaveCreatedTime",
+            inner.get("saveCreatedTime"),
+        )
+        normalized = _parse_rust_save_created_time(value)
+        if normalized:
+            return normalized
+    return ""
+
 
 def rcon_send(cfg, command: str, fp=None):
     """
@@ -5573,7 +6014,8 @@ def main():
     if not ok_ws:
         log(
             f"DEPS: websocket-client missing ({ws_err}) -- RCON features disabled "
-            f"(--test-rcon-say and RCON SmoothRestarter bridge won't work).",
+            f"(wipe timestamp discovery, --test-rcon-say, and the RCON "
+            f"SmoothRestarter bridge won't work).",
             fp
         )
 
@@ -5653,6 +6095,24 @@ def main():
     )
     STATUS_COORDINATOR = forced_wipe
     _refresh_server_restart_ledger(cfg, forced_wipe)
+    last_wipe_timestamp_check = 0.0
+    if (
+        parse_bool(cfg.get("wipe_timestamp_rcon_enabled"), True)
+        or parse_bool(
+            cfg.get("wipe_timestamp_filesystem_fallback_enabled"),
+            True,
+        )
+    ):
+        wipe_timestamp_ok, _wiped_at, _wipe_detail = (
+            _refresh_server_wipe_ledger(
+                cfg,
+                forced_wipe,
+                fp=fp,
+                log_failure=True,
+            )
+        )
+        if wipe_timestamp_ok:
+            last_wipe_timestamp_check = time.monotonic()
 
     log(f"Rust Watchdog v{__version__} by FlyingFathead started (dry_run={cfg['dry_run']})", fp)
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
@@ -5777,6 +6237,39 @@ def main():
                 log(f"  {line}", fp)
             if state == "RUNNING":
                 _refresh_server_restart_ledger(cfg, forced_wipe)
+                if (
+                    parse_bool(
+                        cfg.get("wipe_timestamp_rcon_enabled"),
+                        True,
+                    )
+                    or parse_bool(
+                        cfg.get(
+                            "wipe_timestamp_filesystem_fallback_enabled"
+                        ),
+                        True,
+                    )
+                ):
+                    now_wipe_check = time.monotonic()
+                    wipe_check_interval = int(
+                        cfg.get(
+                            "wipe_timestamp_interval_seconds",
+                            600,
+                        )
+                    )
+                    if (
+                        last_wipe_timestamp_check <= 0
+                        or (
+                            now_wipe_check
+                            - last_wipe_timestamp_check
+                        )
+                        >= wipe_check_interval
+                    ):
+                        _refresh_server_wipe_ledger(
+                            cfg,
+                            forced_wipe,
+                            fp=fp,
+                        )
+                        last_wipe_timestamp_check = now_wipe_check
 
             # Send startup OK
             if state == "RUNNING" and not startup_ok_sent:

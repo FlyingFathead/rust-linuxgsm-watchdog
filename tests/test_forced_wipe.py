@@ -394,6 +394,7 @@ class ForcedWipeReminderTests(unittest.TestCase):
     def test_alert_footnote_uses_long_elapsed_time(self):
         c = self.coordinator()
         c.state["last_wipe_at"] = "2026-07-31T18:09:00Z"
+        c.state["last_wipe_source"] = "manual"
         c.state["last_restart_at"] = "2026-07-31T18:09:00Z"
         with mock.patch.object(
             wd,
@@ -409,6 +410,7 @@ class ForcedWipeReminderTests(unittest.TestCase):
             lines,
             [
                 "Server last wiped: 2026-07-31 18:09:00 UTC "
+                "(manual record) "
                 "(5 days, 23 hours, 51 minutes ago)",
                 "Server last restarted: 2026-07-31 18:09:00 UTC "
                 "(5 days, 23 hours, 51 minutes ago)",
