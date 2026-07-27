@@ -42,29 +42,29 @@ class AlertVersionTests(unittest.TestCase):
             rust_watchdog.ALERTS = previous
 
         self.assertEqual(captured["version"], rust_watchdog.__version__)
-        self.assertEqual(rust_watchdog._runtime_version_label(), "v0.4.8")
+        self.assertEqual(rust_watchdog._runtime_version_label(), "v0.4.9")
 
     def test_versioned_label_is_used_by_every_renderer(self):
         alert = self._alert(rust_watchdog.__version__)
 
         self.assertTrue(
             self.manager._render_html(alert).startswith(
-                "🟢 <b>rust-linuxgsm-watchdog (v0.4.8)</b> -- "
+                "🟢 <b>rust-linuxgsm-watchdog (v0.4.9)</b> -- "
                 "<b>started</b>"
             )
         )
         self.assertTrue(
             self.manager._render_plain(alert).startswith(
-                "🟢 rust-linuxgsm-watchdog (v0.4.8) -- started"
+                "🟢 rust-linuxgsm-watchdog (v0.4.9) -- started"
             )
         )
         self.assertTrue(
             self.manager._render_telegram_markdown(alert, v2=False).startswith(
-                "🟢 *rust-linuxgsm-watchdog (v0.4.8)* -- *started*"
+                "🟢 *rust-linuxgsm-watchdog (v0.4.9)* -- *started*"
             )
         )
         self.assertIn(
-            r"rust\-linuxgsm\-watchdog \(v0\.4\.8\)",
+            r"rust\-linuxgsm\-watchdog \(v0\.4\.9\)",
             self.manager._render_telegram_markdown(alert, v2=True),
         )
 

@@ -105,7 +105,7 @@ class ViewConfigTests(unittest.TestCase):
                     completed.stderr,
                 )
                 self.assertIn(
-                    "Rust Watchdog v0.4.8 -- effective configuration",
+                    "Rust Watchdog v0.4.9 -- effective configuration",
                     completed.stdout,
                 )
                 self.assertFalse(lockfile.exists())
@@ -127,7 +127,7 @@ class ViewConfigTests(unittest.TestCase):
             )
 
         rendered = stream.getvalue()
-        self.assertIn("⚙ Rust Watchdog v0.4.8", rendered)
+        self.assertIn("⚙ Rust Watchdog v0.4.9", rendered)
         self.assertIn("\033[1;36m", rendered)
 
     def test_no_color_disables_ansi_without_disabling_utf8(self):
@@ -145,7 +145,7 @@ class ViewConfigTests(unittest.TestCase):
             )
 
         rendered = stream.getvalue()
-        self.assertIn("⚙ Rust Watchdog v0.4.8", rendered)
+        self.assertIn("⚙ Rust Watchdog v0.4.9", rendered)
         self.assertNotIn("\033[", rendered)
 
 

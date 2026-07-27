@@ -1081,6 +1081,34 @@ class PluginUpdateValidationTests(unittest.TestCase):
 
 
 class PluginUpdateOutputTests(unittest.TestCase):
+    def test_plugin_compile_completion_is_exact_and_terminal(self):
+        pending = (
+            "Plugin compilation is already queued: HeliRide\n"
+            "UberTool was compiled successfully in 500ms"
+        )
+        succeeded = (
+            pending
+            + "\nHeliRide was compiled successfully in 625ms"
+        )
+        failed = (
+            pending
+            + "\nError while compiling HeliRide: missing ClientRPCPlayer"
+        )
+
+        self.assertFalse(
+            checker._plugin_compile_completed(pending, "HeliRide")
+        )
+        self.assertTrue(
+            checker._plugin_compile_completed(succeeded, "HeliRide")
+        )
+        self.assertTrue(
+            checker._plugin_compile_completed(failed, "HeliRide")
+        )
+        self.assertEqual(
+            checker._reload_compile_failure(failed, "HeliRide"),
+            "Error while compiling HeliRide: missing ClientRPCPlayer",
+        )
+
     def test_force_requires_a_single_plugin_target(self):
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             with self.assertRaises(SystemExit) as raised:
@@ -1944,6 +1972,102 @@ class PluginUpdateOutputTests(unittest.TestCase):
             progress.call_args.args[3],
             "FAILED TO COMPILE",
         )
+        command_call = rcon_send.call_args_list[1]
+        self.assertEqual(command_call.args[1], "oxide.load Kits")
+        self.assertEqual(command_call.kwargs["timeout_s"], 120)
+        completion_matcher = command_call.kwargs["response_matcher"]
+        self.assertFalse(completion_matcher("oxide.load accepted"))
+        self.assertFalse(
+            completion_matcher("HeliRide was compiled successfully")
+        )
+        self.assertTrue(
+            completion_matcher(
+                "Error while compiling Kits: bad overload"
+            )
+        )
+
+    def test_full_inventory_reports_49_loaded_and_three_compile_failures(self):
+        loaded = [f"Plugin{index:02d}" for index in range(1, 50)]
+        broken = ["HeliRide", "NpcHorses", "UberTool"]
+        inventory_text = "\n".join(
+            [
+                (
+                    f'{index:02d} "{name}" (1.0.0) by Example '
+                    f"- {name}.cs"
+                )
+                for index, name in enumerate(loaded, start=1)
+            ]
+            + [
+                (
+                    f"{index:02d} {name} - Failed to compile: "
+                    "compatibility error"
+                )
+                for index, name in enumerate(broken, start=50)
+            ]
+        )
+
+        def send(_cfg, command, **kwargs):
+            if command == "oxide.plugins":
+                return True, inventory_text
+            plugin_name = command.rsplit(" ", 1)[-1]
+            if plugin_name in broken:
+                response = (
+                    f"Error while compiling {plugin_name}: "
+                    "compatibility error"
+                )
+            else:
+                response = (
+                    f"{plugin_name} was compiled successfully in 100ms"
+                )
+            self.assertTrue(kwargs["response_matcher"](response))
+            self.assertEqual(kwargs["timeout_s"], 120)
+            return True, response
+
+        rcon_send = mock.Mock(side_effect=send)
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        requested = [
+            (f"{name}.cs", "1.0.0")
+            for name in loaded + broken
+        ]
+        activation_records = []
+
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ):
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                requested,
+                activation_records=activation_records,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(len(activation_records), 52)
+        self.assertEqual(
+            sum(record["status"] == "OK" for record in activation_records),
+            49,
+        )
+        self.assertEqual(
+            sum(
+                record["status"] == "FAILED TO COMPILE"
+                for record in activation_records
+            ),
+            3,
+        )
+        for plugin_name in broken:
+            self.assertIn(
+                f"{plugin_name}.cs: Error while compiling {plugin_name}",
+                response,
+            )
+        self.assertEqual(rcon_send.call_count, 54)
 
     def test_individual_reload_rejects_missing_expected_inventory_version(self):
         rcon_send = mock.Mock(

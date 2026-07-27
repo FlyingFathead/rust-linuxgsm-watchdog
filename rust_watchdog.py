@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 
 
 def _runtime_version():
@@ -4861,7 +4861,14 @@ def extract_serverinfo_save_created_time(resp: str) -> str:
     return ""
 
 
-def rcon_send(cfg, command: str, fp=None):
+def rcon_send(
+    cfg,
+    command: str,
+    fp=None,
+    *,
+    response_matcher=None,
+    timeout_s=5.0,
+):
     """
     Send a command via Rust WebRCON and return (ok, response_text).
 
@@ -4870,6 +4877,9 @@ def rcon_send(cfg, command: str, fp=None):
       Using epoch *milliseconds* can overflow/mismatch and you'll never see a match,
       which breaks plugin checks (oxide.plugins / sr status).
     - We therefore generate a 31-bit safe Identifier and wait for the matching frame.
+    - When response_matcher is supplied, a matching command-reply frame is only an
+      acknowledgement. Keep the socket open and collect console frames until the
+      matcher confirms that the asynchronous command has actually completed.
     """
     ip, port, pw, src = get_rcon_endpoint(cfg, fp=fp)
     if not (ip and port and pw):
@@ -4901,9 +4911,27 @@ def rcon_send(cfg, command: str, fp=None):
         ws.settimeout(1.0)  # short recv timeout; we loop ourselves
         ws.send(json.dumps(payload))
 
-        deadline = time.monotonic() + 5.0
+        try:
+            command_timeout = max(0.1, float(timeout_s))
+        except (TypeError, ValueError):
+            command_timeout = 5.0
+        deadline = time.monotonic() + command_timeout
         last = ""
         candidate_generic = ""
+        collected_messages = []
+
+        def collect_message(value):
+            message = strip_ansi(str(value or "")).strip()
+            if not message:
+                return False
+            collected_messages.append(message)
+            if response_matcher is None:
+                return False
+            combined = "\n".join(collected_messages)
+            try:
+                return bool(response_matcher(combined))
+            except Exception as e:
+                raise RuntimeError(f"RCON response matcher failed: {e}") from e
 
         while time.monotonic() < deadline:
             try:
@@ -4925,19 +4953,36 @@ def rcon_send(cfg, command: str, fp=None):
                 obj = json.loads(resp)
             except Exception:
                 # Non-JSON response: treat as reply
-                return (True, resp)
+                if response_matcher is None:
+                    return (True, resp)
+                if collect_message(resp):
+                    return (True, "\n".join(collected_messages))
+                continue
 
             # Sometimes we might get a list/array; scan it for our Identifier
             if isinstance(obj, list):
                 for it in obj:
                     if not isinstance(it, dict):
                         continue
+                    t = str(
+                        it.get("Type", it.get("type", "")) or ""
+                    ).strip().lower()
+                    msg = it.get(
+                        "Message",
+                        it.get("message", it.get("Text", it.get("text", ""))),
+                    )
+                    if response_matcher is not None and t not in (
+                        "serverinfo",
+                        "chat",
+                    ):
+                        if collect_message(msg):
+                            return (True, "\n".join(collected_messages))
                     rid = it.get("Identifier", it.get("identifier", None))
                     try:
                         rid_i = int(rid) if rid is not None else None
                     except Exception:
                         rid_i = None
-                    if rid_i == ident:
+                    if rid_i == ident and response_matcher is None:
                         return (True, resp)
                 continue
 
@@ -4950,7 +4995,7 @@ def rcon_send(cfg, command: str, fp=None):
             except Exception:
                 rid_i = None
 
-            if rid_i == ident:
+            if rid_i == ident and response_matcher is None:
                 return (True, resp)
 
             # Ignore noise frames
@@ -4959,10 +5004,29 @@ def rcon_send(cfg, command: str, fp=None):
                 continue
 
             # Fallback candidate: Generic frames with a Message (some servers are sloppy about Identifier)
-            msg = obj.get("Message", obj.get("message", ""))
+            msg = obj.get(
+                "Message",
+                obj.get("message", obj.get("Text", obj.get("text", ""))),
+            )
+            if response_matcher is not None:
+                if collect_message(msg):
+                    return (True, "\n".join(collected_messages))
+                continue
             if msg and (t == "" or t == "generic"):
                 candidate_generic = resp
                 continue
+
+        if response_matcher is not None:
+            received = "\n".join(collected_messages).strip()
+            detail = (
+                f"RCON recv timeout after {command_timeout:g}s waiting for "
+                f"terminal response to {command!r}"
+            )
+            if received:
+                detail += f"\n{received}"
+            elif last:
+                detail += f" (last={strip_ansi(str(last))[:200]})"
+            return (False, detail)
 
         if candidate_generic:
             return (True, candidate_generic)

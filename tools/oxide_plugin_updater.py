@@ -126,6 +126,7 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
         "port": 28016,
         "password": "",
         "password_environment_variable": "RUST_RCON_PASSWORD",
+        "command_timeout_seconds": 120,
     },
     "logging": {
         "enabled": True,
@@ -356,6 +357,8 @@ def validate_updater_config(config: Dict[str, Any]) -> None:
         "state.reload_history_limit":
             (config["state"].get("reload_history_limit"), 0),
         "rcon.port": (config["rcon"].get("port"), 1),
+        "rcon.command_timeout_seconds":
+            (config["rcon"].get("command_timeout_seconds"), 1),
     }
     for name, (value, minimum) in integer_minimums.items():
         if isinstance(value, bool) or not isinstance(value, int):
@@ -2067,13 +2070,35 @@ def _rcon_response_text(watchdog: Any, response: Any) -> str:
     return str(response or "").strip()
 
 
-def _reload_compile_failure(text: str) -> str:
+def _line_mentions_plugin(line: str, plugin_name: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(plugin_name)}"
+            rf"(?![A-Za-z0-9_.-])",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _reload_compile_failure(
+    text: str,
+    plugin_name: str = "",
+) -> str:
     """Return the useful compiler-error line, or an empty string."""
     lines = [line.strip() for line in str(text or "").splitlines()]
     for line in lines:
-        if re.search(r"\bfailed to compile\b", line, re.IGNORECASE):
+        if plugin_name and not _line_mentions_plugin(line, plugin_name):
+            continue
+        if re.search(
+            r"\b(?:failed to compile|error while compiling)\b",
+            line,
+            re.IGNORECASE,
+        ):
             return line
     for line in lines:
+        if plugin_name and not _line_mentions_plugin(line, plugin_name):
+            continue
         if re.search(
             r"\b(?:compiler error|compilation failed)\b",
             line,
@@ -2081,6 +2106,23 @@ def _reload_compile_failure(text: str) -> str:
         ):
             return line
     return ""
+
+
+def _plugin_compile_completed(text: str, plugin_name: str) -> bool:
+    """Return true only for this plugin's terminal compiler result."""
+    if _reload_compile_failure(text, plugin_name):
+        return True
+    for line in str(text or "").splitlines():
+        if (
+            _line_mentions_plugin(line, plugin_name)
+            and re.search(
+                r"\bcompiled successfully\b",
+                line,
+                re.IGNORECASE,
+            )
+        ):
+            return True
+    return False
 
 
 def _inventory_lines_for_plugin(
@@ -2144,6 +2186,14 @@ def reload_updated_plugins(
         port = int(rcon_config.get("port", 0))
     except (TypeError, ValueError):
         return False, "RCON port must be an integer"
+    try:
+        command_timeout_seconds = int(
+            rcon_config.get("command_timeout_seconds", 120)
+        )
+    except (TypeError, ValueError):
+        return False, "RCON command timeout must be an integer"
+    if command_timeout_seconds < 1:
+        return False, "RCON command timeout must be at least 1 second"
 
     project_root = str(HERE.parent)
     if project_root not in sys.path:
@@ -2207,11 +2257,22 @@ def reload_updated_plugins(
         action = "reload" if currently_loaded else "load"
         command = f"oxide.{action} {plugin_name}"
         try:
-            ok, response = watchdog.rcon_send(cfg, command)
+            ok, response = watchdog.rcon_send(
+                cfg,
+                command,
+                response_matcher=(
+                    lambda text, target=plugin_name:
+                        _plugin_compile_completed(text, target)
+                ),
+                timeout_s=command_timeout_seconds,
+            )
         except Exception as e:
             ok, response = False, f"RCON {action} raised an exception: {e}"
         response_text = _rcon_response_text(watchdog, response)
-        compile_failure = _reload_compile_failure(response_text)
+        compile_failure = _reload_compile_failure(
+            response_text,
+            plugin_name,
+        )
         if not ok:
             status = "RCON FAILED"
             detail = response_text or "no response"
