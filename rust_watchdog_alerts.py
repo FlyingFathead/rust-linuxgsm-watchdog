@@ -28,6 +28,11 @@ DEFAULT_EMOJI_BY_EVENT = {
     "update_applied": "✅",
     "update_held": "⏸️",
     "restart_requested": "🔁",
+    "forced_wipe_armed": "🧨",
+    "forced_wipe_started": "💥",
+    "forced_wipe_completed": "✅",
+    "forced_wipe_failed": "🚨",
+    "forced_wipe_due": "⚠️",
 }
 
 DEFAULT_EMOJI_BY_LEVEL = {
@@ -48,6 +53,11 @@ DEFAULT_EVENT_TITLES = {
     "update_applied": "Update applied",
     "update_held": "Update held",
     "restart_requested": "Restart requested",
+    "forced_wipe_armed": "Forced wipe armed",
+    "forced_wipe_started": "Forced wipe started",
+    "forced_wipe_completed": "Forced wipe completed",
+    "forced_wipe_failed": "Forced wipe failed",
+    "forced_wipe_due": "Forced wipe due",
 }
 
 DEFAULT_EVENT_BODIES = {
@@ -61,6 +71,11 @@ DEFAULT_EVENT_BODIES = {
     "update_applied": "update/restart sequence completed",
     "update_held": "update detected, but restart is being held",
     "restart_requested": "restart has been scheduled/requested",
+    "forced_wipe_armed": "monthly release build identified",
+    "forced_wipe_started": "backup/update/mod-update/wipe/start sequence started",
+    "forced_wipe_completed": "wipe completed and server health verified",
+    "forced_wipe_failed": "automatic wipe sequence stopped before completion",
+    "forced_wipe_due": "scheduled monthly wipe window has arrived without a recorded wipe",
 }
 
 # ---------------------------------------
@@ -132,6 +147,12 @@ def _hostname() -> str:
         return socket.gethostname()
     except Exception:
         return "unknown-host"
+
+
+def _telegram_markdown_escape(value: Any, *, v2: bool) -> str:
+    s = str(value)
+    chars = r"_*[]()~`>#+-=|{}.!\\" if v2 else r"_*[`\\"
+    return "".join(("\\" + ch) if ch in chars else ch for ch in s)
 
 
 @dataclass
@@ -252,6 +273,13 @@ class AlertManager:
             if mapped:
                 return str(mapped)
         return body
+
+    @staticmethod
+    def _footnote_lines_for(alert: Alert) -> List[str]:
+        raw = alert.fields.get("_footnote_lines")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(line).strip() for line in raw if str(line).strip()]
 
     def __init__(
         self,
@@ -464,7 +492,7 @@ class AlertManager:
         # Add a few structured fields (keep it short)
         extras = []
         for k, v in (alert.fields or {}).items():
-            if k in ("identity",):
+            if k in ("identity", "app", "version") or str(k).startswith("_"):
                 continue
             if v is None:
                 continue
@@ -477,9 +505,14 @@ class AlertManager:
         if extras:
             parts.append("<code>" + html.escape(" | ".join(extras)) + "</code>")
 
+        footnotes = self._footnote_lines_for(alert)
+        if footnotes:
+            parts.append("")
+            parts.extend(f"<i>{html.escape(line)}</i>" for line in footnotes)
+
         return "\n".join(parts)
 
-    def _render_plain(self, alert: Alert) -> str:
+    def _render_plain(self, alert: Alert, *, include_footnotes: bool = True) -> str:
         ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert.ts))
         emoji = self._emoji_for(alert)
         label = self._app_label_for(alert)
@@ -500,7 +533,7 @@ class AlertManager:
 
         extras = []
         for k, v in (alert.fields or {}).items():
-            if k in ("identity", "app", "version"):
+            if k in ("identity", "app", "version") or str(k).startswith("_"):
                 continue
             if v is None:
                 continue
@@ -513,12 +546,67 @@ class AlertManager:
         if extras:
             parts.append(" | ".join(extras))
 
+        if include_footnotes:
+            footnotes = self._footnote_lines_for(alert)
+            if footnotes:
+                parts.append("")
+                # The existing Discord backend renders these as Markdown
+                # italics. A truly plain backend still gets a visibly separate
+                # footnote block.
+                parts.extend(f"*{line}*" for line in footnotes)
+
+        return "\n".join(parts)
+
+    def _render_telegram_markdown(self, alert: Alert, *, v2: bool) -> str:
+        esc = lambda value: _telegram_markdown_escape(value, v2=v2)
+        ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert.ts))
+        emoji = self._emoji_for(alert)
+        label = self._app_label_for(alert)
+        title = self._title_for(alert)
+        parts: List[str] = [
+            f"{esc(emoji)} *{esc(label)}* -- *{esc(title)}*",
+            f"`{esc(ts_s)}`",
+        ]
+
+        if self.include_host:
+            parts.append(f"`{esc('host=' + _hostname())}`")
+
+        if self.include_identity:
+            ident = alert.fields.get("identity")
+            if ident:
+                parts.append(f"`{esc('identity=' + str(ident))}`")
+
+        body = self._body_for(alert)
+        if body:
+            parts.append(esc(body))
+
+        extras = []
+        for k, v in (alert.fields or {}).items():
+            if k in ("identity", "app", "version") or str(k).startswith("_"):
+                continue
+            if v is None:
+                continue
+            s = str(v)
+            if len(s) > 200:
+                s = s[:200] + "..."
+            extras.append(f"{k}={s}")
+            if len(extras) >= 8:
+                break
+        if extras:
+            parts.append(f"`{esc(' | '.join(extras))}`")
+
+        footnotes = self._footnote_lines_for(alert)
+        if footnotes:
+            parts.append("")
+            parts.extend(f"_{esc(line)}_" for line in footnotes)
+
         return "\n".join(parts)
 
     def _render(self, alert: Alert) -> str:
         # If Telegram backend uses HTML, render HTML; Discord gets plain.
-        # We render per-backend at send time, but dedupe should be stable -- use plain for dedupe key.
-        return self._render_plain(alert)
+        # We render per-backend at send time, but dedupe should be stable. The
+        # elapsed-time footnote changes every minute and must not defeat dedupe.
+        return self._render_plain(alert, include_footnotes=False)
 
     def _should_suppress(self, alert: Alert, rendered_key: str) -> bool:
         event = alert.event
@@ -567,8 +655,17 @@ class AlertManager:
                 ok_any = False
                 for b in self.backends:
                     try:
-                        if isinstance(b, TelegramBackend) and b.parse_mode.upper() == "HTML":
-                            rendered = self._render_html(alert)
+                        if isinstance(b, TelegramBackend):
+                            parse_mode = b.parse_mode.upper()
+                            if parse_mode == "HTML":
+                                rendered = self._render_html(alert)
+                            elif parse_mode in ("MARKDOWN", "MARKDOWNV2"):
+                                rendered = self._render_telegram_markdown(
+                                    alert,
+                                    v2=(parse_mode == "MARKDOWNV2"),
+                                )
+                            else:
+                                rendered = self._render_plain(alert)
                         else:
                             rendered = self._render_plain(alert)
                         ok = b.send(alert, rendered)

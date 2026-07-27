@@ -34,11 +34,12 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.3.8"
+__version__ = "0.4.3"
 
 SMOOTHRESTARTER_URL = "https://umod.org/plugins/smooth-restarter"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_FOR_HINTS = None
+STATUS_COORDINATOR = None
 DEFAULTS = {
     "server_dir": "/home/rustserver",
     "identity": "rustserver",
@@ -93,6 +94,29 @@ DEFAULTS = {
     # Optional: if server is DOWN during pre-wipe hold, skip update/mu and just restart
     "forced_wipe_recovery_restart_only_prewipe": True,
 
+    # ---------------------------------------------------------
+    # Optional automatic forced-wipe action
+    # ---------------------------------------------------------
+    # Destructive behavior is deliberately opt-in for upgrades.
+    # Values: "off" | "map-wipe" | "full-wipe"
+    "forced_wipe_action": "off",
+    "forced_wipe_trigger": "new-build-after-schedule",
+    "forced_wipe_early_release_tolerance_minutes": 15,
+    "forced_wipe_action_window_minutes": 360,
+    "forced_wipe_backup_before": True,
+    "forced_wipe_backup_required": True,
+    "forced_wipe_verify_update_current": True,
+    "forced_wipe_state_file": os.path.join(PROJECT_DIR, "data", "state", "forced_wipe.json"),
+
+    # With automatic deletion off, keep warning after the monthly schedule
+    # passes until an administrator records that the manual wipe is complete.
+    "forced_wipe_reminder_enabled": True,
+    "forced_wipe_reminder_repeat_minutes": 30,
+    "forced_wipe_reminder_message_template":
+        "⚠️ FORCED WIPE DUE: cycle {cycle} entered its scheduled wipe window "
+        "at {wipe_tz} ({tz_name}); no completed wipe is recorded and "
+        "forced_wipe_action={action}.",
+
     # Cadence schedule (time-to-wipe -> log interval)
     # Each entry can include:
     #   - dt_gt_seconds: match if dt_seconds > this
@@ -144,6 +168,9 @@ DEFAULTS = {
         "restart": 600,
         "start": 600,
         "stop": 120,
+        "backup": 1800,
+        "full-wipe": 600,
+        "map-wipe": 600,
     },
 
     # ---------------------------------------------------------
@@ -235,9 +262,32 @@ STATUS_RE = re.compile(r"^\s*Status:\s*(\S+)\s*$", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 UPDATE_YES_RE = re.compile(r"\b(update available|update required|available:\s*yes)\b", re.IGNORECASE)
 UPDATE_NO_RE  = re.compile(r"\b(no update available|available:\s*no|already up to date|up to date)\b", re.IGNORECASE)
+LOCAL_BUILD_RE = re.compile(r"\bLocal\s+build:\s*([0-9]+)\b", re.IGNORECASE)
+REMOTE_BUILD_RE = re.compile(r"\bRemote\s+build:\s*([0-9]+)\b", re.IGNORECASE)
 RCON_PW_RE = re.compile(r'(\+rcon\.password\s+)(\".*?\"|\S+)', re.IGNORECASE)
 UNKNOWN_CMD_RE = re.compile(r"\bunknown\s+(command|console\s+command)\b", re.IGNORECASE)
 SR_NAME_RE = re.compile(r"\bsmooth\s*restarter\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class UpdateCheckResult:
+    verdict: object
+    local_build: str = ""
+    remote_build: str = ""
+    command: str = ""
+
+
+@dataclass(frozen=True)
+class ForcedWipeDecision:
+    enabled: bool = False
+    cycle: str = ""
+    scheduled_utc: str = ""
+    armed_now: bool = False
+    pending: bool = False
+    action_due: bool = False
+    hold: bool = False
+    reason: str = ""
+    candidate_remote_build: str = ""
 
 # ---------------------------------------------------------
 # HEALTH DIAGNOSIS (mapping: "what went to shit" -> hint)
@@ -373,6 +423,7 @@ def get_server_process_info(cfg):
       selected_by: str
       exe_name: str
       started_at: str
+      started_at_utc: str
       uptime_seconds: int | None
       uptime_human: str
     """
@@ -391,6 +442,7 @@ def get_server_process_info(cfg):
         "selected_by": "",
         "exe_name": "unknown",
         "started_at": "not running",
+        "started_at_utc": "",
         "uptime_seconds": None,
         "uptime_human": "not running",
     }
@@ -433,6 +485,7 @@ def get_server_process_info(cfg):
     up_s = _proc_elapsed_seconds(chosen_pid)
     info["uptime_seconds"] = up_s
     info["uptime_human"] = _human_seconds(up_s) if up_s is not None else "unknown"
+    info["started_at_utc"] = _proc_started_at_utc(chosen_pid)
 
     return info
 
@@ -527,6 +580,72 @@ def _proc_elapsed_seconds(pid: int):
         return int(out)
     except Exception:
         return None
+
+
+def _proc_started_at_utc(pid: int) -> str:
+    """
+    Resolve a Linux process start time without locale-dependent `ps` parsing.
+
+    /proc/<pid>/stat field 22 is the process start time in clock ticks since
+    boot; /proc/stat btime is the boot time as a Unix timestamp.
+    """
+    if not pid:
+        return ""
+    try:
+        stat_text = Path(f"/proc/{int(pid)}/stat").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        right_paren = stat_text.rfind(")")
+        if right_paren < 0:
+            return ""
+        fields_after_comm = stat_text[right_paren + 2:].split()
+        # fields_after_comm[0] is field 3 (state), therefore field 22 is 19.
+        start_ticks = int(fields_after_comm[19])
+        ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+
+        boot_epoch = None
+        with open("/proc/stat", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    boot_epoch = int(line.split()[1])
+                    break
+        if boot_epoch is None or ticks_per_second <= 0:
+            return ""
+
+        started_epoch = boot_epoch + (start_ticks / ticks_per_second)
+        return _utc_iso(datetime.fromtimestamp(started_epoch, timezone.utc))
+    except Exception:
+        pass
+
+    # Fallback for restricted/containerized environments where ps can see the
+    # target process but this process cannot read the matching /proc entry.
+    try:
+        env = dict(os.environ)
+        env["LC_ALL"] = "C"
+        out = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        ).strip()
+        if out:
+            local_naive = datetime.strptime(
+                " ".join(out.split()),
+                "%a %b %d %H:%M:%S %Y",
+            )
+            return _utc_iso(local_naive.astimezone())
+    except Exception:
+        pass
+
+    # Last resort. Integer elapsed seconds are slightly less exact than the two
+    # sources above, but still establish the correct restart minute.
+    elapsed = _proc_elapsed_seconds(pid)
+    if elapsed is not None:
+        return _utc_iso(
+            datetime.now(timezone.utc) - timedelta(seconds=max(0, elapsed))
+        )
+    return ""
 
 def _human_seconds(total: int) -> str:
     if total is None:
@@ -1083,13 +1202,24 @@ def alert(event: str, message: str = "", level: str = "info", fp=None, **ctx):
     if not ALERTS:
         return
     try:
+        fields = dict(ctx or {})
+        try:
+            footnotes = _build_alert_status_footnotes(
+                CFG_FOR_HINTS or {},
+                coordinator=STATUS_COORDINATOR,
+            )
+            if footnotes:
+                fields["_footnote_lines"] = footnotes
+        except Exception as e:
+            log(f"ALERTS: status footnote failed: {e}", fp)
+
         lvl = str(level or "info").upper()
         ALERTS.emit(
             event=str(event or "event"),
             level=lvl,
             title=str(event or "event"),
             text=str(message or ""),
-            **ctx
+            **fields
         )
     except Exception as e:
         # don't spam; just one line
@@ -1212,16 +1342,20 @@ def _first_thursday_dt(year: int, month: int, *, hour: int, minute: int, tz) -> 
     delta = (target - d0.weekday()) % 7
     return d0 + timedelta(days=delta)
 
-def next_forced_wipe(now_utc: datetime, cfg, fp=None):
+def _forced_wipe_schedule(now_utc: datetime, cfg, fp=None, *, post_window_minutes: int = 0):
     """
-    Compute next "monthly forced wipe baseline":
+    Compute the relevant monthly forced-wipe schedule:
       first Thursday of month @ forced_wipe_hour:forced_wipe_minute in forced_wipe_tz.
 
-    Returns dict with:
-      - wipe_tz_dt (aware, in forced wipe tz)
-      - wipe_utc_dt (aware, in UTC)
-      - tz (tz object)
+    The current month's schedule remains relevant through post_window_minutes.
+    This is important after release time: callers can still see and act on the
+    current wipe instead of jumping immediately to next month.
     """
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
     tz_name = str(cfg.get("forced_wipe_tz") or "Europe/London")
     tz = _get_tz(tz_name, fp=fp)
 
@@ -1230,7 +1364,10 @@ def next_forced_wipe(now_utc: datetime, cfg, fp=None):
 
     now_tz = now_utc.astimezone(tz)
     cand = _first_thursday_dt(now_tz.year, now_tz.month, hour=hour, minute=minute, tz=tz)
-    if now_tz >= cand:
+    cand_utc = cand.astimezone(timezone.utc)
+    keep_until = cand_utc + timedelta(minutes=max(0, int(post_window_minutes)))
+
+    if now_utc > keep_until:
         # next month
         y = now_tz.year
         m = now_tz.month + 1
@@ -1238,9 +1375,64 @@ def next_forced_wipe(now_utc: datetime, cfg, fp=None):
             y += 1
             m = 1
         cand = _first_thursday_dt(y, m, hour=hour, minute=minute, tz=tz)
+        cand_utc = cand.astimezone(timezone.utc)
 
-    cand_utc = cand.astimezone(timezone.utc)
-    return {"wipe_tz_dt": cand, "wipe_utc_dt": cand_utc, "tz": tz, "tz_name": tz_name}
+    return {
+        "wipe_tz_dt": cand,
+        "wipe_utc_dt": cand_utc,
+        "tz": tz,
+        "tz_name": tz_name,
+        "cycle": cand.strftime("%Y-%m"),
+    }
+
+
+def _forced_wipe_calendar_cycle(now_utc: datetime, cfg, fp=None):
+    """
+    Return this calendar month's forced-wipe schedule in the configured zone.
+
+    Unlike next_forced_wipe(), this deliberately keeps the current month after
+    the highlight/action window ends. Persistent state and manual completion
+    acknowledgement belong to the monthly cycle, not only to a short release
+    window.
+    """
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    tz_name = str(cfg.get("forced_wipe_tz") or "Europe/London")
+    tz = _get_tz(tz_name, fp=fp)
+    now_tz = now_utc.astimezone(tz)
+    hour = int(cfg.get("forced_wipe_hour", 19))
+    minute = int(cfg.get("forced_wipe_minute", 0))
+    wipe_tz = _first_thursday_dt(
+        now_tz.year,
+        now_tz.month,
+        hour=hour,
+        minute=minute,
+        tz=tz,
+    )
+    return {
+        "wipe_tz_dt": wipe_tz,
+        "wipe_utc_dt": wipe_tz.astimezone(timezone.utc),
+        "tz": tz,
+        "tz_name": tz_name,
+        "cycle": wipe_tz.strftime("%Y-%m"),
+    }
+
+
+def next_forced_wipe(now_utc: datetime, cfg, fp=None):
+    """
+    Return the current wipe while its configured highlight window is active,
+    otherwise the next scheduled wipe.
+    """
+    window_m = int(cfg.get("forced_wipe_window_minutes", 180))
+    return _forced_wipe_schedule(
+        now_utc,
+        cfg,
+        fp=fp,
+        post_window_minutes=max(0, window_m),
+    )
 
 def _pick_forced_wipe_interval(cfg, dt_seconds: float) -> int:
     """
@@ -1366,7 +1558,9 @@ def in_forced_wipe_update_hold(cfg, now_utc: datetime, fp=None):
     if hold_m <= 0:
         return (False, "")
 
-    info = next_forced_wipe(now_utc, cfg, fp=fp)
+    # A zero-length post window keeps the current schedule at the exact release
+    # instant but moves to next month immediately afterwards.
+    info = _forced_wipe_schedule(now_utc, cfg, fp=fp, post_window_minutes=0)
     wipe_utc = info["wipe_utc_dt"]
     dt = wipe_utc - now_utc
 
@@ -1375,6 +1569,783 @@ def in_forced_wipe_update_hold(cfg, now_utc: datetime, fp=None):
         return (True, f"within {hold_m}m of wipe ({when} {info.get('tz_name','')})")
 
     return (False, "")
+
+
+def _utc_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: str):
+    try:
+        s = str(value or "").strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _elapsed_ago(value: str, now_utc: datetime) -> str:
+    then = _parse_utc_iso(value)
+    if then is None:
+        return "unknown"
+    seconds = max(0, int((now_utc - then).total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+
+    def unit(n: int, name: str) -> str:
+        return f"{n} {name}" + ("" if n == 1 else "s")
+
+    if days:
+        return (
+            f"{unit(days, 'day')}, {unit(hours, 'hour')}, "
+            f"{unit(minutes, 'minute')} ago"
+        )
+    if hours:
+        return f"{unit(hours, 'hour')}, {unit(minutes, 'minute')} ago"
+    if minutes:
+        return f"{unit(minutes, 'minute')} ago"
+    return "less than 1 minute ago"
+
+
+def _status_timestamp(value: str) -> str:
+    parsed = _parse_utc_iso(value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+class ForcedWipeCoordinator:
+    """
+    Persistent once-per-cycle forced-wipe state.
+
+    A wipe can only become pending when a new remote Steam build is observed
+    around/after the scheduled release and a prior remote-build fence exists.
+    Once wipe_done is saved, retries may start the server but never wipe again.
+    """
+
+    VALID_ACTIONS = ("off", "map-wipe", "full-wipe")
+    VALID_TRIGGERS = ("new-build-after-schedule",)
+
+    def __init__(self, cfg: dict, fp=None, *, persist: bool = True):
+        self.cfg = cfg
+        self.fp = fp
+        self.action = str(cfg.get("forced_wipe_action", "off")).strip().lower()
+        self.trigger = str(
+            cfg.get("forced_wipe_trigger", "new-build-after-schedule")
+        ).strip().lower()
+        self.state_path = str(cfg.get("forced_wipe_state_file") or "").strip()
+        self.persist = bool(persist and self.state_path)
+        self.last_save_ok = True
+        self.state = self._empty_state()
+        self._load()
+
+    @property
+    def enabled(self) -> bool:
+        return self.action in ("map-wipe", "full-wipe")
+
+    @staticmethod
+    def _empty_state() -> dict:
+        return {
+            "schema_version": 3,
+            "cycle": "",
+            "scheduled_utc": "",
+            "prewipe_remote_build": "",
+            "candidate_remote_build": "",
+            "candidate_seen_at": "",
+            "latest_local_build": "",
+            "latest_remote_build": "",
+            "latest_update_verdict": "",
+            "latest_build_seen_at": "",
+            "armed_action": "",
+            "pending": False,
+            "started_at": "",
+            "wipe_started_at": "",
+            "wipe_done": False,
+            "wipe_done_at": "",
+            "start_done": False,
+            "completed": False,
+            "completed_at": "",
+            "completion_source": "",
+            "last_wipe_at": "",
+            "last_wipe_source": "",
+            "last_wipe_kind": "",
+            "last_restart_at": "",
+            "last_restart_source": "",
+            "reminder_last_sent_at": "",
+            "failed_step": "",
+            "last_error": "",
+            "updated_at": "",
+        }
+
+    def _load(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                state = self._empty_state()
+                state.update(obj)
+                state["schema_version"] = 3
+                for key in (
+                    "pending",
+                    "wipe_done",
+                    "start_done",
+                    "completed",
+                ):
+                    if not isinstance(state.get(key), bool):
+                        state[key] = False
+                for key in (
+                    "cycle",
+                    "scheduled_utc",
+                    "prewipe_remote_build",
+                    "candidate_remote_build",
+                    "candidate_seen_at",
+                    "latest_local_build",
+                    "latest_remote_build",
+                    "latest_update_verdict",
+                    "latest_build_seen_at",
+                    "armed_action",
+                    "started_at",
+                    "wipe_started_at",
+                    "wipe_done_at",
+                    "completed_at",
+                    "completion_source",
+                    "last_wipe_at",
+                    "last_wipe_source",
+                    "last_wipe_kind",
+                    "last_restart_at",
+                    "last_restart_source",
+                    "reminder_last_sent_at",
+                    "failed_step",
+                    "last_error",
+                    "updated_at",
+                ):
+                    if not isinstance(state.get(key), str):
+                        state[key] = ""
+
+                pending_valid = bool(
+                    re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", state["cycle"])
+                    and _parse_utc_iso(state["scheduled_utc"])
+                    and state["candidate_remote_build"]
+                    and state["armed_action"] in ("map-wipe", "full-wipe")
+                )
+                if state["pending"] and not pending_valid:
+                    log(
+                        "FORCED_WIPE: invalid pending state ignored; "
+                        "required cycle/schedule/build/action fields are missing",
+                        self.fp,
+                    )
+                    ledger = {
+                        key: state.get(key, "")
+                        for key in (
+                            "last_wipe_at",
+                            "last_wipe_source",
+                            "last_wipe_kind",
+                            "last_restart_at",
+                            "last_restart_source",
+                        )
+                    }
+                    state = self._empty_state()
+                    state.update(ledger)
+                if (
+                    state.get("completed")
+                    and not state.get("last_wipe_at")
+                ):
+                    state["last_wipe_at"] = str(
+                        state.get("wipe_done_at")
+                        or state.get("completed_at")
+                        or ""
+                    )
+                    state["last_wipe_source"] = str(
+                        state.get("completion_source") or "legacy"
+                    )
+                    state["last_wipe_kind"] = str(
+                        state.get("armed_action") or "unknown"
+                    )
+                self.state = state
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log(f"FORCED_WIPE: state load failed; using empty state: {e}", self.fp)
+
+    def _save(self, now_utc: datetime = None) -> bool:
+        if not self.persist:
+            self.last_save_ok = True
+            return True
+        try:
+            now_utc = now_utc or datetime.now(timezone.utc)
+            self.state["updated_at"] = _utc_iso(now_utc)
+            parent = os.path.dirname(os.path.abspath(self.state_path)) or "."
+            os.makedirs(parent, exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, self.state_path)
+            try:
+                dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                # The file itself was fsynced and atomically replaced. Some
+                # filesystems do not support directory fsync.
+                pass
+            self.last_save_ok = True
+            return True
+        except Exception as e:
+            self.last_save_ok = False
+            log(f"FORCED_WIPE: state save failed: {e}", self.fp)
+            return False
+
+    def _stored_unfinished_schedule(self):
+        if not self.state.get("pending") or self.state.get("completed"):
+            return None
+        scheduled = _parse_utc_iso(self.state.get("scheduled_utc", ""))
+        cycle = str(self.state.get("cycle") or "")
+        if not scheduled or not cycle:
+            return None
+        tz_name = str(self.cfg.get("forced_wipe_tz") or "Europe/London")
+        tz = _get_tz(tz_name, fp=self.fp)
+        return {
+            "wipe_utc_dt": scheduled,
+            "wipe_tz_dt": scheduled.astimezone(tz),
+            "tz": tz,
+            "tz_name": tz_name,
+            "cycle": cycle,
+        }
+
+    def _schedule(self, now_utc: datetime):
+        unfinished = self._stored_unfinished_schedule()
+        if unfinished:
+            return unfinished
+        return _forced_wipe_calendar_cycle(now_utc, self.cfg, fp=self.fp)
+
+    def _ensure_cycle(self, now_utc: datetime):
+        info = self._schedule(now_utc)
+        cycle = str(info["cycle"])
+        if str(self.state.get("cycle") or "") != cycle:
+            last_wipe = {
+                key: str(self.state.get(key) or "")
+                for key in (
+                    "last_wipe_at",
+                    "last_wipe_source",
+                    "last_wipe_kind",
+                    "last_restart_at",
+                    "last_restart_source",
+                )
+            }
+            self.state = self._empty_state()
+            self.state.update(last_wipe)
+            self.state["cycle"] = cycle
+            self.state["scheduled_utc"] = _utc_iso(info["wipe_utc_dt"])
+            self._save(now_utc)
+        elif not self.state.get("scheduled_utc"):
+            self.state["scheduled_utc"] = _utc_iso(info["wipe_utc_dt"])
+            self._save(now_utc)
+        return info
+
+    def observe_update(self, result: UpdateCheckResult, now_utc: datetime) -> ForcedWipeDecision:
+        reminder_enabled = parse_bool(
+            self.cfg.get("forced_wipe_reminder_enabled"), True
+        )
+        if (
+            not self.enabled
+            and not reminder_enabled
+        ) or self.trigger not in self.VALID_TRIGGERS:
+            return ForcedWipeDecision(enabled=False)
+
+        info = self._ensure_cycle(now_utc)
+        scheduled = info["wipe_utc_dt"]
+        cycle = str(info["cycle"])
+        remote = str(result.remote_build or "").strip()
+        local = str(result.local_build or "").strip()
+
+        verdict_label = (
+            "available"
+            if result.verdict is True
+            else "current"
+            if result.verdict is False
+            else "unknown"
+        )
+        build_state_changed = False
+        for key, value in (
+            ("latest_local_build", local),
+            ("latest_remote_build", remote),
+            ("latest_update_verdict", verdict_label),
+        ):
+            if value and self.state.get(key) != value:
+                self.state[key] = value
+                build_state_changed = True
+        if local or remote:
+            seen_at = _utc_iso(now_utc)
+            if self.state.get("latest_build_seen_at") != seen_at:
+                self.state["latest_build_seen_at"] = seen_at
+                build_state_changed = True
+        if build_state_changed:
+            self._save(now_utc)
+
+        base = {
+            "enabled": self.enabled,
+            "cycle": cycle,
+            "scheduled_utc": _utc_iso(scheduled),
+            "pending": bool(self.state.get("pending")),
+            "candidate_remote_build": str(self.state.get("candidate_remote_build") or ""),
+        }
+
+        if not self.enabled:
+            return ForcedWipeDecision(**base)
+
+        if not remote:
+            pending = bool(self.state.get("pending"))
+            return ForcedWipeDecision(
+                **base,
+                action_due=bool(
+                    pending
+                    and not self.state.get("completed")
+                    and now_utc >= scheduled
+                ),
+                hold=bool(pending and now_utc < scheduled),
+                reason=(
+                    "armed state retained despite missing build IDs"
+                    if pending
+                    else ""
+                ),
+            )
+
+        if self.state.get("completed"):
+            return ForcedWipeDecision(**base)
+
+        tolerance_m = max(
+            0, int(self.cfg.get("forced_wipe_early_release_tolerance_minutes", 15))
+        )
+        action_window_m = max(
+            1, int(self.cfg.get("forced_wipe_action_window_minutes", 360))
+        )
+        earliest_candidate = scheduled - timedelta(minutes=tolerance_m)
+        action_end = scheduled + timedelta(minutes=action_window_m)
+        armed_now = False
+        reason = ""
+
+        if now_utc < earliest_candidate:
+            if self.state.get("prewipe_remote_build") != remote:
+                self.state["prewipe_remote_build"] = remote
+                self._save(now_utc)
+        elif now_utc <= action_end and not self.state.get("wipe_done"):
+            baseline = str(self.state.get("prewipe_remote_build") or "")
+            if not baseline:
+                # Starting inside the release window is ambiguous. Establish a
+                # fence but do not turn a possibly old update into a wipe.
+                self.state["prewipe_remote_build"] = remote
+                self._save(now_utc)
+                reason = "no pre-release build fence; refusing to arm"
+            elif result.verdict is True and remote != baseline:
+                if not self.state.get("pending"):
+                    armed_now = True
+                    self.state["pending"] = True
+                    self.state["candidate_seen_at"] = _utc_iso(now_utc)
+                    self.state["armed_action"] = self.action
+                self.state["candidate_remote_build"] = remote
+                self.state["failed_step"] = ""
+                self.state["last_error"] = ""
+                self._save(now_utc)
+                reason = f"remote build changed {baseline} -> {remote}"
+
+        pending = bool(self.state.get("pending"))
+        action_due = pending and not self.state.get("completed") and now_utc >= scheduled
+        prewipe_hold, hold_reason = in_forced_wipe_update_hold(
+            self.cfg, now_utc, fp=self.fp
+        )
+        hold = bool((pending and now_utc < scheduled) or (result.verdict is True and prewipe_hold))
+        if hold and not reason:
+            reason = hold_reason or "candidate observed before scheduled release time"
+
+        return ForcedWipeDecision(
+            enabled=self.enabled,
+            cycle=cycle,
+            scheduled_utc=_utc_iso(scheduled),
+            armed_now=armed_now,
+            pending=pending,
+            action_due=action_due,
+            hold=hold,
+            reason=reason,
+            candidate_remote_build=str(self.state.get("candidate_remote_build") or ""),
+        )
+
+    def needs_recovery(self, now_utc: datetime) -> bool:
+        if not self.enabled:
+            return False
+        info = self._ensure_cycle(now_utc)
+        return bool(
+            self.state.get("pending")
+            and not self.state.get("completed")
+            and now_utc >= info["wipe_utc_dt"]
+        )
+
+    def mark_started(self, now_utc: datetime) -> bool:
+        changed = not bool(self.state.get("started_at"))
+        if changed:
+            self.state["started_at"] = _utc_iso(now_utc)
+            self._save(now_utc)
+        return changed
+
+    def mark_wipe_done(self, now_utc: datetime) -> bool:
+        self.state["wipe_done"] = True
+        self.state["wipe_done_at"] = _utc_iso(now_utc)
+        self.state["last_wipe_at"] = _utc_iso(now_utc)
+        self.state["last_wipe_source"] = "automatic"
+        self.state["last_wipe_kind"] = str(
+            self.state.get("armed_action") or self.action or "unknown"
+        )
+        self.state["failed_step"] = ""
+        self.state["last_error"] = ""
+        return self._save(now_utc)
+
+    def mark_wipe_started(self, now_utc: datetime) -> bool:
+        self.state["wipe_started_at"] = _utc_iso(now_utc)
+        return self._save(now_utc)
+
+    def mark_start_done(self, now_utc: datetime) -> None:
+        self.state["start_done"] = True
+        self._save(now_utc)
+
+    def observe_server_restart(
+        self,
+        restarted_at: str,
+        now_utc: datetime,
+        *,
+        source: str = "process-observed",
+    ) -> bool:
+        parsed = _parse_utc_iso(restarted_at)
+        if parsed is None:
+            return False
+        if parsed > now_utc + timedelta(minutes=1):
+            return False
+        normalized = _utc_iso(parsed)
+        if (
+            self.state.get("last_restart_at") == normalized
+            and self.state.get("last_restart_source") == source
+        ):
+            return False
+        self.state["last_restart_at"] = normalized
+        self.state["last_restart_source"] = str(source or "process-observed")
+        return self._save(now_utc)
+
+    def mark_failed(self, step: str, error: str, now_utc: datetime) -> None:
+        self.state["failed_step"] = str(step or "")
+        self.state["last_error"] = str(error or "")[:1000]
+        self._save(now_utc)
+
+    def finish_if_running(self, now_utc: datetime) -> bool:
+        self._ensure_cycle(now_utc)
+        if (
+            self.state.get("pending")
+            and self.state.get("wipe_done")
+            and not self.state.get("completed")
+        ):
+            self.state["pending"] = False
+            self.state["completed"] = True
+            self.state["completed_at"] = _utc_iso(now_utc)
+            self.state["completion_source"] = "automatic"
+            self.state["failed_step"] = ""
+            self.state["last_error"] = ""
+            self._save(now_utc)
+            return True
+        return False
+
+    def reminder_status(self, now_utc: datetime) -> dict:
+        info = self._ensure_cycle(now_utc)
+        enabled = parse_bool(
+            self.cfg.get("forced_wipe_reminder_enabled"), True
+        )
+        try:
+            repeat_m = max(
+                1,
+                int(self.cfg.get("forced_wipe_reminder_repeat_minutes", 30)),
+            )
+        except Exception:
+            repeat_m = 30
+
+        scheduled = info["wipe_utc_dt"]
+        last_wipe = _parse_utc_iso(
+            str(self.state.get("last_wipe_at") or "")
+        )
+        wiped_for_cycle = bool(last_wipe and last_wipe >= scheduled)
+        last_sent = _parse_utc_iso(
+            str(self.state.get("reminder_last_sent_at") or "")
+        )
+        due = bool(
+            enabled
+            and not self.enabled
+            and now_utc >= scheduled
+            and not self.state.get("completed")
+            and not wiped_for_cycle
+        )
+        send_due = bool(
+            due
+            and (
+                last_sent is None
+                or (now_utc - last_sent) >= timedelta(minutes=repeat_m)
+            )
+        )
+        return {
+            "enabled": enabled,
+            "due": due,
+            "send_due": send_due,
+            "repeat_minutes": repeat_m,
+            "cycle": str(info["cycle"]),
+            "scheduled_utc": _utc_iso(scheduled),
+            "wipe_tz": info["wipe_tz_dt"].strftime("%Y-%m-%d %H:%M"),
+            "tz_name": str(info.get("tz_name") or ""),
+            "action": self.action,
+            "last_sent_at": str(
+                self.state.get("reminder_last_sent_at") or ""
+            ),
+            "latest_local_build": str(
+                self.state.get("latest_local_build") or ""
+            ),
+            "latest_remote_build": str(
+                self.state.get("latest_remote_build") or ""
+            ),
+            "latest_update_verdict": str(
+                self.state.get("latest_update_verdict") or ""
+            ),
+            "last_wipe_at": str(self.state.get("last_wipe_at") or ""),
+            "last_wipe_age": _elapsed_ago(
+                str(self.state.get("last_wipe_at") or ""),
+                now_utc,
+            ),
+            "last_wipe_summary": (
+                f"{_status_timestamp(str(self.state.get('last_wipe_at') or ''))} "
+                f"({_elapsed_ago(str(self.state.get('last_wipe_at') or ''), now_utc)})"
+                if self.state.get("last_wipe_at")
+                else "unknown (no wipe timestamp recorded)"
+            ),
+        }
+
+    def render_reminder(self, status: dict) -> str:
+        template = str(
+            self.cfg.get(
+                "forced_wipe_reminder_message_template",
+                "⚠️ FORCED WIPE DUE: cycle {cycle} entered its scheduled "
+                "wipe window at {wipe_tz} ({tz_name}); no completed wipe "
+                "is recorded and forced_wipe_action={action}.",
+            )
+        )
+        try:
+            return template.format(**status)
+        except Exception:
+            return (
+                f"⚠️ FORCED WIPE DUE: cycle {status.get('cycle', '?')} "
+                f"entered its scheduled wipe window at "
+                f"{status.get('wipe_tz', '?')} "
+                f"({status.get('tz_name', '?')}); no completed wipe is "
+                f"recorded and forced_wipe_action={self.action}."
+            )
+
+    def mark_reminder_sent(self, now_utc: datetime) -> bool:
+        self.state["reminder_last_sent_at"] = _utc_iso(now_utc)
+        return self._save(now_utc)
+
+    def mark_manual_complete(
+        self,
+        now_utc: datetime,
+        *,
+        wiped_at: datetime = None,
+        wipe_kind: str = "unknown",
+    ) -> dict:
+        info = self._ensure_cycle(now_utc)
+        wiped_at = wiped_at or now_utc
+        if wiped_at.tzinfo is None:
+            wiped_at = wiped_at.replace(tzinfo=timezone.utc)
+        wiped_at = wiped_at.astimezone(timezone.utc)
+        if wiped_at > now_utc + timedelta(minutes=1):
+            raise ValueError("wipe timestamp cannot be in the future")
+        wipe_kind = str(wipe_kind or "unknown").strip().lower()
+        if wipe_kind not in ("unknown", "map-wipe", "full-wipe"):
+            raise ValueError(
+                "wipe_kind must be unknown, map-wipe, or full-wipe"
+            )
+
+        self.state["last_wipe_at"] = _utc_iso(wiped_at)
+        self.state["last_wipe_source"] = "manual"
+        self.state["last_wipe_kind"] = wipe_kind
+
+        tolerance_m = max(
+            0,
+            int(
+                self.cfg.get(
+                    "forced_wipe_early_release_tolerance_minutes",
+                    15,
+                )
+            ),
+        )
+        completes_cycle = bool(
+            wiped_at
+            >= info["wipe_utc_dt"] - timedelta(minutes=tolerance_m)
+        )
+        if completes_cycle:
+            self.state["pending"] = False
+            self.state["completed"] = True
+            self.state["completed_at"] = _utc_iso(now_utc)
+            self.state["completion_source"] = "manual"
+        self.state["failed_step"] = ""
+        self.state["last_error"] = ""
+        if not self._save(now_utc):
+            raise RuntimeError("could not persist forced-wipe completion")
+        return {
+            "cycle": str(info["cycle"]),
+            "scheduled_utc": _utc_iso(info["wipe_utc_dt"]),
+            "last_wipe_at": self.state["last_wipe_at"],
+            "last_wipe_age": _elapsed_ago(
+                self.state["last_wipe_at"],
+                now_utc,
+            ),
+            "last_wipe_kind": self.state["last_wipe_kind"],
+            "completed_cycle": completes_cycle,
+        }
+
+    def status(self, now_utc: datetime) -> dict:
+        info = self._ensure_cycle(now_utc)
+        out = dict(self.state)
+        out.update(
+            {
+                "enabled": self.enabled,
+                "action": self.action,
+                "trigger": self.trigger,
+                "cycle": str(info["cycle"]),
+                "scheduled_utc": _utc_iso(info["wipe_utc_dt"]),
+                "state_file": self.state_path,
+            }
+        )
+        reminder = self.reminder_status(now_utc)
+        out.update(
+            {
+                "reminder_enabled": reminder["enabled"],
+                "reminder_due": reminder["due"],
+                "reminder_repeat_minutes": reminder["repeat_minutes"],
+            }
+        )
+        return out
+
+
+def _refresh_server_restart_ledger(
+    cfg: dict,
+    coordinator: ForcedWipeCoordinator = None,
+    *,
+    now_utc: datetime = None,
+) -> str:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    process_info = get_server_process_info(cfg)
+    restarted_at = str(process_info.get("started_at_utc") or "")
+    if restarted_at and coordinator is not None:
+        coordinator.observe_server_restart(
+            restarted_at,
+            now_utc,
+            source="rust-process-start",
+        )
+    return restarted_at
+
+
+def _load_status_ledger(cfg: dict) -> dict:
+    path = str(cfg.get("forced_wipe_state_file") or "").strip()
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _build_alert_status_footnotes(
+    cfg: dict,
+    *,
+    coordinator: ForcedWipeCoordinator = None,
+    now_utc: datetime = None,
+) -> list:
+    alerts_cfg = cfg.get("alerts") if isinstance(cfg.get("alerts"), dict) else {}
+    options = (
+        alerts_cfg.get("status_footnote")
+        if isinstance(alerts_cfg.get("status_footnote"), dict)
+        else {}
+    )
+    if not parse_bool(options.get("enabled"), True):
+        return []
+
+    include_wipe = parse_bool(options.get("include_last_wipe"), True)
+    include_restart = parse_bool(options.get("include_last_restart"), True)
+    if not include_wipe and not include_restart:
+        return []
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    state = coordinator.state if coordinator is not None else _load_status_ledger(cfg)
+
+    current_restart = ""
+    if include_restart:
+        current_restart = _refresh_server_restart_ledger(
+            cfg,
+            coordinator,
+            now_utc=now_utc,
+        )
+        if coordinator is not None:
+            state = coordinator.state
+
+    lines = []
+    if include_wipe:
+        wiped_at = str(state.get("last_wipe_at") or "")
+        rendered_at = _status_timestamp(wiped_at)
+        if rendered_at:
+            lines.append(
+                f"Server last wiped: {rendered_at} "
+                f"({_elapsed_ago(wiped_at, now_utc)})"
+            )
+        else:
+            unknown = str(
+                options.get(
+                    "unknown_wipe_text",
+                    "unknown (no wipe timestamp recorded)",
+                )
+            ).strip()
+            lines.append(f"Server last wiped: {unknown}")
+
+    if include_restart:
+        restarted_at = current_restart or str(state.get("last_restart_at") or "")
+        rendered_at = _status_timestamp(restarted_at)
+        if rendered_at:
+            lines.append(
+                f"Server last restarted: {rendered_at} "
+                f"({_elapsed_ago(restarted_at, now_utc)})"
+            )
+        else:
+            unknown = str(
+                options.get(
+                    "unknown_restart_text",
+                    "unknown (no Rust process start timestamp recorded)",
+                )
+            ).strip()
+            lines.append(f"Server last restarted: {unknown}")
+
+    return lines
+
 
 def _cfg_base_dir(config_path: str) -> str:
     # Resolve relative paths against the CONFIG FILE location, not CWD.
@@ -1410,7 +2381,7 @@ def norm_path(p, *, base_dir: str):
 def normalize_cfg_paths(cfg: dict, config_path: str) -> dict:
     base_dir = _cfg_base_dir(config_path)
 
-    for k in ("server_dir", "lockfile", "logfile", "pause_file"):
+    for k in ("server_dir", "lockfile", "logfile", "pause_file", "forced_wipe_state_file"):
         if k in cfg:
             cfg[k] = norm_path(cfg.get(k), base_dir=base_dir)
 
@@ -1433,6 +2404,293 @@ def _deep_merge(base, override):
         else:
             out[k] = v
     return out
+
+
+_HOME_PATH_RE = re.compile(r"^/home/([^/\x00]+)(?=/|$)")
+_LINUX_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\$?$")
+_FORCED_WIPE_ACTIONS = ("off", "map-wipe", "full-wipe")
+
+
+def _config_json_path(parts) -> str:
+    out = "$"
+    for part in parts:
+        if isinstance(part, int):
+            out += f"[{part}]"
+        elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(part)):
+            out += f".{part}"
+        else:
+            out += f"[{json.dumps(str(part), ensure_ascii=False)}]"
+    return out
+
+
+def _validate_linux_home_user(value: str) -> str:
+    username = str(value or "").strip()
+    if (
+        not username
+        or len(username) > 32
+        or not _LINUX_USER_RE.fullmatch(username)
+        or username in (".", "..")
+    ):
+        raise ValueError(
+            "home user must be a Linux account name (1-32 characters; "
+            "letters, digits, underscore, dot, and hyphen are accepted)"
+        )
+    return username
+
+
+def _rewrite_home_paths(node, username: str, parts=()):
+    """
+    Rewrite JSON string values whose complete path starts with /home/<user>.
+
+    This deliberately does not rewrite embedded text, relative paths, config
+    keys, or username-like non-path values such as +server.identity.
+    """
+    matches = []
+    if isinstance(node, dict):
+        for key in list(node):
+            value = node[key]
+            if isinstance(value, str):
+                match = _HOME_PATH_RE.match(value)
+                if match:
+                    rewritten = f"/home/{username}{value[match.end():]}"
+                    if rewritten != value:
+                        node[key] = rewritten
+                    matches.append(
+                        {
+                            "path": _config_json_path(parts + (key,)),
+                            "old": value,
+                            "new": rewritten,
+                            "old_user": match.group(1),
+                            "changed": rewritten != value,
+                        }
+                    )
+            elif isinstance(value, (dict, list)):
+                matches.extend(
+                    _rewrite_home_paths(value, username, parts + (key,))
+                )
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, str):
+                match = _HOME_PATH_RE.match(value)
+                if match:
+                    rewritten = f"/home/{username}{value[match.end():]}"
+                    if rewritten != value:
+                        node[index] = rewritten
+                    matches.append(
+                        {
+                            "path": _config_json_path(parts + (index,)),
+                            "old": value,
+                            "new": rewritten,
+                            "old_user": match.group(1),
+                            "changed": rewritten != value,
+                        }
+                    )
+            elif isinstance(value, (dict, list)):
+                matches.extend(
+                    _rewrite_home_paths(value, username, parts + (index,))
+                )
+    return matches
+
+
+def _cli_bool(value: str) -> bool:
+    parsed = parse_bool(value, None)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(
+            "expected one of: on/off, true/false, yes/no, or 1/0"
+        )
+    return bool(parsed)
+
+
+def _resolve_forced_wipe_action(
+    current,
+    *,
+    set_action=None,
+    full_wipe_wipeday=None,
+    map_wipe_wipeday=None,
+):
+    base = str(set_action if set_action is not None else current or "off").strip().lower()
+    if base not in _FORCED_WIPE_ACTIONS:
+        raise ValueError(
+            "forced_wipe_action must be one of "
+            f"{', '.join(_FORCED_WIPE_ACTIONS)}; got {base!r}"
+        )
+
+    full_enabled = base == "full-wipe"
+    map_enabled = base == "map-wipe"
+    if full_wipe_wipeday is not None:
+        full_enabled = bool(full_wipe_wipeday)
+    if map_wipe_wipeday is not None:
+        map_enabled = bool(map_wipe_wipeday)
+
+    both_enabled = full_enabled and map_enabled
+    if full_enabled:
+        resolved = "full-wipe"
+    elif map_enabled:
+        resolved = "map-wipe"
+    else:
+        resolved = "off"
+    return resolved, both_enabled
+
+
+def _load_config_document(path: str) -> dict:
+    cfg_path = Path(
+        os.path.abspath(os.path.expanduser(os.path.expandvars(path or "")))
+    )
+    if not cfg_path.exists():
+        raise ValueError(f"config file does not exist: {cfg_path}")
+    if not cfg_path.is_file():
+        raise ValueError(f"config path is not a regular file: {cfg_path}")
+    try:
+        raw = cfg_path.read_text(encoding="utf-8-sig")
+    except Exception as e:
+        raise ValueError(f"cannot read config file {cfg_path}: {e}") from e
+    if not raw.strip():
+        raise ValueError(f"config file is empty or whitespace-only: {cfg_path}")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as e:
+        context = _format_json_error_context(raw, e.lineno, e.colno)
+        raise ValueError(
+            f"invalid JSON in {cfg_path} at line {e.lineno}, "
+            f"column {e.colno}: {e.msg}\n{context}"
+        ) from e
+    if not isinstance(document, dict):
+        raise ValueError(
+            "config top-level JSON must be an object, "
+            f"got {type(document).__name__}: {cfg_path}"
+        )
+    return document
+
+
+def _atomic_write_config_with_backup(path: str, document: dict) -> str:
+    cfg_path = Path(
+        os.path.abspath(os.path.expanduser(os.path.expandvars(path or "")))
+    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_path = cfg_path.with_name(f"{cfg_path.name}.bak.{timestamp}")
+    temp_path = cfg_path.with_name(f".{cfg_path.name}.tmp.{os.getpid()}")
+    original_mode = cfg_path.stat().st_mode & 0o7777
+
+    shutil.copy2(str(cfg_path), str(backup_path))
+    try:
+        with open(temp_path, "x", encoding="utf-8") as f:
+            json.dump(document, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, original_mode)
+        os.replace(temp_path, cfg_path)
+        try:
+            dir_fd = os.open(str(cfg_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return str(backup_path)
+
+
+def edit_config_file(
+    path: str,
+    *,
+    change_home_user=None,
+    set_forced_wipe_action=None,
+    full_wipe_wipeday=None,
+    map_wipe_wipeday=None,
+) -> dict:
+    document = _load_config_document(path)
+    home_matches = []
+    warnings = []
+    changes = []
+
+    if change_home_user is not None:
+        username = _validate_linux_home_user(change_home_user)
+        home_matches = _rewrite_home_paths(document, username)
+
+    wipe_edit_requested = any(
+        value is not None
+        for value in (
+            set_forced_wipe_action,
+            full_wipe_wipeday,
+            map_wipe_wipeday,
+        )
+    )
+    if wipe_edit_requested:
+        old_action = str(document.get("forced_wipe_action", "off")).strip().lower()
+        new_action, both_enabled = _resolve_forced_wipe_action(
+            old_action,
+            set_action=set_forced_wipe_action,
+            full_wipe_wipeday=full_wipe_wipeday,
+            map_wipe_wipeday=map_wipe_wipeday,
+        )
+        if both_enabled:
+            warnings.append(
+                "both map-wipe and full-wipe were enabled for the forced-wipe "
+                "day; full-wipe takes precedence. Effective "
+                'forced_wipe_action="full-wipe".'
+            )
+        if new_action != old_action or "forced_wipe_action" not in document:
+            document["forced_wipe_action"] = new_action
+            changes.append(
+                {
+                    "path": "$.forced_wipe_action",
+                    "old": old_action,
+                    "new": new_action,
+                }
+            )
+
+    changed = bool(
+        any(match.get("changed") for match in home_matches)
+        or changes
+    )
+    backup_path = ""
+    if changed:
+        backup_path = _atomic_write_config_with_backup(path, document)
+
+    return {
+        "config_path": str(
+            Path(
+                os.path.abspath(
+                    os.path.expanduser(os.path.expandvars(path or ""))
+                )
+            )
+        ),
+        "home_matches": home_matches,
+        "changes": changes,
+        "warnings": warnings,
+        "changed": changed,
+        "backup_path": backup_path,
+    }
+
+
+def print_config_edit_result(result: dict, *, changed_home_user=None) -> None:
+    print(f"CONFIG: {result['config_path']}")
+    if changed_home_user is not None:
+        matches = result.get("home_matches") or []
+        print(f"HOME PATH MATCHES: {len(matches)}")
+        for match in matches:
+            print(f"  {match['path']}: {match['old']} -> {match['new']}")
+        if matches:
+            print(
+                "WARN: rust-watchdog.service was not modified; review its "
+                "User=, Group=, WorkingDirectory=, and ExecStart= values."
+            )
+    for change in result.get("changes") or []:
+        print(f"CONFIG CHANGE: {change['path']}: {change['old']} -> {change['new']}")
+    for warning in result.get("warnings") or []:
+        print(f"WARN: {warning}")
+    if result.get("changed"):
+        print(f"BACKUP: {result['backup_path']}")
+        print(f"SAVED: {result['config_path']}")
+    else:
+        print("NO CHANGES: the requested values already match the config.")
 
 def _format_json_error_context(text: str, lineno: int, colno: int, radius: int = 2) -> str:
     lines = text.splitlines()
@@ -2017,6 +3275,74 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         if uto <= 0:
             fatal("config: update_check_timeout must be > 0", fp=fp)
 
+    forced_wipe_action = str(cfg.get("forced_wipe_action", "off")).strip().lower()
+    forced_wipe_reminder_enabled = parse_bool(
+        cfg.get("forced_wipe_reminder_enabled"), True
+    )
+    forced_wipe_trigger = str(
+        cfg.get("forced_wipe_trigger", "new-build-after-schedule")
+    ).strip().lower()
+    if forced_wipe_action not in ForcedWipeCoordinator.VALID_ACTIONS:
+        fatal(
+            "config: forced_wipe_action must be one of "
+            f"{ForcedWipeCoordinator.VALID_ACTIONS}, got {forced_wipe_action!r}",
+            fp=fp,
+        )
+    if forced_wipe_trigger not in ForcedWipeCoordinator.VALID_TRIGGERS:
+        fatal(
+            "config: forced_wipe_trigger must be one of "
+            f"{ForcedWipeCoordinator.VALID_TRIGGERS}, got {forced_wipe_trigger!r}",
+            fp=fp,
+        )
+
+    if forced_wipe_action != "off":
+        if not parse_bool(cfg.get("enable_update_watch"), False):
+            fatal(
+                "config: automatic forced wipes require enable_update_watch=true",
+                fp=fp,
+            )
+        if not parse_bool(cfg.get("enable_server_update"), True):
+            fatal(
+                "config: automatic forced wipes require enable_server_update=true",
+                fp=fp,
+            )
+        try:
+            tolerance_m = int(
+                cfg.get("forced_wipe_early_release_tolerance_minutes", 15)
+            )
+            action_window_m = int(
+                cfg.get("forced_wipe_action_window_minutes", 360)
+            )
+        except Exception as e:
+            fatal(f"config: forced-wipe minute values must be integers: {e}", fp=fp)
+        if tolerance_m < 0:
+            fatal(
+                "config: forced_wipe_early_release_tolerance_minutes must be >= 0",
+                fp=fp,
+            )
+        if action_window_m <= 0:
+            fatal(
+                "config: forced_wipe_action_window_minutes must be > 0",
+                fp=fp,
+            )
+
+    if forced_wipe_reminder_enabled:
+        try:
+            reminder_repeat_m = int(
+                cfg.get("forced_wipe_reminder_repeat_minutes", 30)
+            )
+        except Exception as e:
+            fatal(
+                "config: forced_wipe_reminder_repeat_minutes must be "
+                f"an integer: {e}",
+                fp=fp,
+            )
+        if reminder_repeat_m <= 0:
+            fatal(
+                "config: forced_wipe_reminder_repeat_minutes must be > 0",
+                fp=fp,
+            )
+
     # parse the Smooth Restarter bridge
     if parse_bool(cfg.get("enable_smoothrestarter_bridge"), False) and not parse_bool(cfg.get("enable_update_watch"), False):
         log("PRECHECK: NOTE: enable_smoothrestarter_bridge=true but enable_update_watch=false -- bridge will never trigger", fp)
@@ -2075,7 +3401,27 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         ensure_dir(pause_dir, "pause_file directory", fp=fp)
         require_dir_access(pause_dir, "pause_file directory", need_write=True, fp=fp)
 
-    # 6) Summary
+    # 6) Forced-wipe state directory (automatic action and/or reminders)
+    forced_wipe_state_file = str(cfg.get("forced_wipe_state_file") or "").strip()
+    if forced_wipe_action != "off" or forced_wipe_reminder_enabled:
+        if not forced_wipe_state_file:
+            fatal(
+                "config: forced_wipe_state_file cannot be empty when automatic "
+                "wiping or persistent reminders are enabled",
+                fp=fp,
+            )
+        forced_wipe_state_dir = (
+            os.path.dirname(os.path.abspath(forced_wipe_state_file)) or "."
+        )
+        ensure_dir(forced_wipe_state_dir, "forced-wipe state directory", fp=fp)
+        require_dir_access(
+            forced_wipe_state_dir,
+            "forced-wipe state directory",
+            need_write=True,
+            fp=fp,
+        )
+
+    # 7) Summary
     log("PRECHECK: checklist results:", fp)
     log(f"  OK: server_dir writable: {server_dir}", fp)
     log(f"  OK: rustserver executable: {rustserver_path}", fp)
@@ -2084,6 +3430,15 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         log(f"  OK: pause_file parent dir writable: {os.path.dirname(os.path.abspath(pause_file))}", fp)
     else:
         log("  NOTE: pause_file disabled (empty)", fp)
+    if forced_wipe_action != "off" or forced_wipe_reminder_enabled:
+        log(f"  OK: forced-wipe action: {forced_wipe_action}", fp)
+        log(f"  OK: forced-wipe state file: {forced_wipe_state_file}", fp)
+        if forced_wipe_reminder_enabled:
+            log(
+                "  OK: forced-wipe reminder: "
+                f"every {reminder_repeat_m}m until completion is recorded",
+                fp,
+            )
 
     if logfile:
         log(f"  OK: logfile open: {logfile}", fp)
@@ -2517,6 +3872,18 @@ def parse_update_available(out: str):
     if UPDATE_YES_RE.search(text):
         return True
     return None
+
+
+def parse_update_check(out: str, *, command: str = "") -> UpdateCheckResult:
+    text = strip_ansi(out)
+    local_m = LOCAL_BUILD_RE.search(text)
+    remote_m = REMOTE_BUILD_RE.search(text)
+    return UpdateCheckResult(
+        verdict=parse_update_available(text),
+        local_build=local_m.group(1) if local_m else "",
+        remote_build=remote_m.group(1) if remote_m else "",
+        command=command,
+    )
 
 def extract_rcon_from_cmdline_line(line: str):
     """
@@ -2973,7 +4340,8 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
 def check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp=None):
     """
     Run LinuxGSM check-update (or cu) and interpret output.
-    Returns: True/False/None
+    Returns UpdateCheckResult. verdict is True/False/None and the result also
+    retains LinuxGSM's local/remote Steam build IDs when present.
     """
     timeout = int(cfg.get("update_check_timeout", 60))
     for subcmd in ("check-update", "cu"):
@@ -2989,18 +4357,24 @@ def check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp=None):
         if out and ("Unknown command" in out or "Unknown option" in out):
             continue
 
-        verdict = parse_update_available(out or "")
-        if verdict is not None:
-            return verdict
+        result = parse_update_check(out or "", command=subcmd)
+        if result.verdict is not None:
+            if result.local_build or result.remote_build:
+                log(
+                    "UPDATE_WATCH: builds "
+                    f"local={result.local_build or '?'} remote={result.remote_build or '?'}",
+                    fp,
+                )
+            return result
 
         # Can't tell, but command ran
         if out:
             sample = "\n".join(strip_ansi(out).splitlines()[:8])
             log(f"UPDATE_WATCH: could not interpret check-update output. First lines:\n{sample}", fp)
-        return None
+        return result
 
     log("UPDATE_WATCH: neither 'check-update' nor 'cu' seems available in this LinuxGSM script", fp)
-    return None
+    return UpdateCheckResult(verdict=None)
 
 def check_process_identity(identity, fp=None) -> HealthCheckResult:
     """
@@ -3281,13 +4655,251 @@ def update_watch_no_sr_countdown(cfg, fp=None):
         sleep_interruptible(min(tick, remaining))
         remaining -= tick
 
-def update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=None):
+def _run_lgsm_step_checked(cfg, server_dir, rustserver_path, step: str, fp=None):
+    timeout = None
+    try:
+        timeout = cfg.get("timeouts", {}).get(step, None)
+    except Exception:
+        pass
+
+    try:
+        rc = run_cmd(
+            [rustserver_path, step],
+            server_dir,
+            fp,
+            timeout=timeout,
+            dry_run=parse_bool(cfg.get("dry_run"), False),
+        )
+    except TimeoutError as e:
+        return (False, str(e))
+    except Exception as e:
+        return (False, str(e))
+
+    if rc != 0:
+        return (False, f"LinuxGSM exited with rc={rc}")
+    return (True, "")
+
+
+def _forced_wipe_failure(
+    coordinator: ForcedWipeCoordinator,
+    cfg: dict,
+    step: str,
+    error: str,
+    fp=None,
+):
+    now_utc = datetime.now(timezone.utc)
+    coordinator.mark_failed(step, error, now_utc)
+    log(f"FORCED_WIPE: FAILED at {step}: {error}", fp)
+    alert(
+        "forced_wipe_failed",
+        f"Automatic forced wipe failed at {step}",
+        level="error",
+        fp=fp,
+        identity=cfg.get("identity"),
+        cycle=coordinator.state.get("cycle"),
+        action=coordinator.action,
+        candidate_build=coordinator.state.get("candidate_remote_build"),
+        failed_step=step,
+        error=error,
+    )
+    return False
+
+
+def execute_forced_wipe_sequence(
+    cfg: dict,
+    server_dir: str,
+    rustserver_path: str,
+    coordinator: ForcedWipeCoordinator,
+    *,
+    server_already_down: bool,
+    fp=None,
+) -> bool:
+    """
+    Own the destructive lifecycle:
+      [stop] -> backup -> update -> mu -> full-wipe/map-wipe -> start
+
+    If wipe_done is already persisted, only start is retried. This makes a
+    watchdog/system restart after deletion safe.
+    """
+    now_utc = datetime.now(timezone.utc)
+    if not coordinator.needs_recovery(now_utc):
+        return False
+
+    armed_action = str(coordinator.state.get("armed_action") or "")
+    if armed_action != coordinator.action:
+        return _forced_wipe_failure(
+            coordinator,
+            cfg,
+            "config-action-changed",
+            f"armed action is {armed_action or '?'} but configured action is "
+            f"{coordinator.action}; refusing destructive command",
+            fp=fp,
+        )
+
+    if not coordinator._save(now_utc):
+        return _forced_wipe_failure(
+            coordinator,
+            cfg,
+            "state-persist",
+            "cannot persist armed state; refusing lifecycle actions",
+            fp=fp,
+        )
+
+    if coordinator.mark_started(now_utc):
+        alert(
+            "forced_wipe_started",
+            "Automatic forced-wipe sequence started",
+            level="warning",
+            fp=fp,
+            identity=cfg.get("identity"),
+            cycle=coordinator.state.get("cycle"),
+            action=coordinator.action,
+            candidate_build=coordinator.state.get("candidate_remote_build"),
+        )
+
+    if (
+        coordinator.state.get("wipe_started_at")
+        and not coordinator.state.get("wipe_done")
+    ):
+        return _forced_wipe_failure(
+            coordinator,
+            cfg,
+            "wipe-state-ambiguous",
+            "a previous wipe command started without a persisted success marker; "
+            "manual inspection required",
+            fp=fp,
+        )
+
+    if coordinator.state.get("wipe_done"):
+        log(
+            "FORCED_WIPE: wipe_done already persisted; retrying start only",
+            fp,
+        )
+        ok, err = _run_lgsm_step_checked(
+            cfg, server_dir, rustserver_path, "start", fp=fp
+        )
+        if not ok:
+            return _forced_wipe_failure(
+                coordinator, cfg, "start", err, fp=fp
+            )
+        coordinator.mark_start_done(datetime.now(timezone.utc))
+        return True
+
+    if server_already_down:
+        log(
+            "FORCED_WIPE: health checks report DOWN; enforcing LinuxGSM stopped state",
+            fp,
+        )
+    ok, err = _run_lgsm_step_checked(
+        cfg, server_dir, rustserver_path, "stop", fp=fp
+    )
+    if not ok:
+        return _forced_wipe_failure(
+            coordinator, cfg, "stop", err, fp=fp
+        )
+
+    if parse_bool(cfg.get("forced_wipe_backup_before"), True):
+        ok, err = _run_lgsm_step_checked(
+            cfg, server_dir, rustserver_path, "backup", fp=fp
+        )
+        if not ok:
+            if parse_bool(cfg.get("forced_wipe_backup_required"), True):
+                return _forced_wipe_failure(
+                    coordinator, cfg, "backup", err, fp=fp
+                )
+            log(f"FORCED_WIPE: backup failed but is not required: {err}", fp)
+
+    ok, err = _run_lgsm_step_checked(
+        cfg, server_dir, rustserver_path, "update", fp=fp
+    )
+    if not ok:
+        return _forced_wipe_failure(
+            coordinator, cfg, "update", err, fp=fp
+        )
+
+    if (
+        parse_bool(cfg.get("forced_wipe_verify_update_current"), True)
+        and not parse_bool(cfg.get("dry_run"), False)
+    ):
+        verification = check_server_update_via_lgsm(
+            cfg, server_dir, rustserver_path, fp=fp
+        )
+        if verification.verdict is not False:
+            detail = (
+                "post-update check did not confirm current build "
+                f"(verdict={verification.verdict}, "
+                f"local={verification.local_build or '?'}, "
+                f"remote={verification.remote_build or '?'})"
+            )
+            return _forced_wipe_failure(
+                coordinator, cfg, "verify-update", detail, fp=fp
+            )
+
+    if parse_bool(cfg.get("enable_mods_update"), True):
+        ok, err = _run_lgsm_step_checked(
+            cfg, server_dir, rustserver_path, "mu", fp=fp
+        )
+        if not ok:
+            return _forced_wipe_failure(
+                coordinator, cfg, "mu", err, fp=fp
+            )
+
+    action = coordinator.action
+    if not coordinator.mark_wipe_started(datetime.now(timezone.utc)):
+        return _forced_wipe_failure(
+            coordinator,
+            cfg,
+            "state-persist",
+            "cannot persist pre-wipe marker; refusing destructive command",
+            fp=fp,
+        )
+
+    ok, err = _run_lgsm_step_checked(
+        cfg, server_dir, rustserver_path, action, fp=fp
+    )
+    if not ok:
+        return _forced_wipe_failure(
+            coordinator, cfg, action, err, fp=fp
+        )
+
+    # Persist the irreversible boundary before attempting startup.
+    if not coordinator.mark_wipe_done(datetime.now(timezone.utc)):
+        return _forced_wipe_failure(
+            coordinator,
+            cfg,
+            "state-persist",
+            "wipe succeeded but wipe_done could not be persisted; "
+            "server left stopped to prevent an unsafe retry",
+            fp=fp,
+        )
+
+    ok, err = _run_lgsm_step_checked(
+        cfg, server_dir, rustserver_path, "start", fp=fp
+    )
+    if not ok:
+        return _forced_wipe_failure(
+            coordinator, cfg, "start", err, fp=fp
+        )
+
+    coordinator.mark_start_done(datetime.now(timezone.utc))
+    return True
+
+
+def update_watch_fallback_restart_now(
+    cfg,
+    server_dir,
+    rustserver_path,
+    fp=None,
+    *,
+    forced_wipe: ForcedWipeCoordinator = None,
+):
     """
     No-SR path (or SR failed):
       - announce (best-effort)
       - crude countdown
       - final message
       - stop + update + mu + restart
+      - or, for an armed monthly build, the idempotent forced-wipe sequence
     """
     # Announce (best-effort)
     best_effort_rcon_say(cfg, str(cfg.get("update_watch_announce_message", "")).strip(), fp=fp)
@@ -3297,6 +4909,16 @@ def update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=None)
 
     # Final message (best-effort)
     best_effort_rcon_say(cfg, str(cfg.get("update_watch_final_message", "")).strip(), fp=fp)
+
+    if forced_wipe and forced_wipe.needs_recovery(datetime.now(timezone.utc)):
+        return execute_forced_wipe_sequence(
+            cfg,
+            server_dir,
+            rustserver_path,
+            forced_wipe,
+            server_already_down=False,
+            fp=fp,
+        )
 
     # Now do the actual sequence
     base = [s.strip().lower() for s in cfg.get("recovery_steps", [])]
@@ -3329,6 +4951,8 @@ def update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=None)
             log(f"STEP TIMEOUT ({s}): {e}", fp)
         except Exception as e:
             log(f"STEP ERROR ({s}): {e}", fp)
+
+    return True
 
 def test_smoothrestarter_bridge(cfg, server_dir, rustserver_path, fp=None, send=False):
     """
@@ -3483,11 +5107,159 @@ def health_report(cfg, server_dir, rustserver_path, fp=None):
 
     return (state, evidence)
 
+
+def print_forced_wipe_status(cfg: dict) -> None:
+    coordinator = ForcedWipeCoordinator(cfg, persist=False)
+    now_utc = datetime.now(timezone.utc)
+    status = coordinator.status(now_utc)
+    status["last_wipe_age"] = _elapsed_ago(
+        str(status.get("last_wipe_at") or ""),
+        now_utc,
+    )
+    status["last_restart_age"] = _elapsed_ago(
+        str(status.get("last_restart_at") or ""),
+        now_utc,
+    )
+    ordered = (
+        "enabled",
+        "action",
+        "armed_action",
+        "trigger",
+        "cycle",
+        "scheduled_utc",
+        "prewipe_remote_build",
+        "candidate_remote_build",
+        "pending",
+        "started_at",
+        "wipe_started_at",
+        "wipe_done",
+        "wipe_done_at",
+        "start_done",
+        "completed",
+        "completed_at",
+        "completion_source",
+        "last_wipe_at",
+        "last_wipe_age",
+        "last_wipe_source",
+        "last_wipe_kind",
+        "last_restart_at",
+        "last_restart_age",
+        "last_restart_source",
+        "reminder_enabled",
+        "reminder_due",
+        "reminder_repeat_minutes",
+        "reminder_last_sent_at",
+        "latest_local_build",
+        "latest_remote_build",
+        "latest_update_verdict",
+        "latest_build_seen_at",
+        "failed_step",
+        "last_error",
+        "state_file",
+    )
+    for key in ordered:
+        value = status.get(key)
+        if value in ("", None):
+            value = "-"
+        print(f"{key}: {value}")
+
+
+def maybe_emit_forced_wipe_reminder(
+    coordinator: ForcedWipeCoordinator,
+    cfg: dict,
+    fp=None,
+    *,
+    now_utc: datetime = None,
+) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    status = coordinator.reminder_status(now_utc)
+    if not status.get("send_due"):
+        return False
+
+    message = coordinator.render_reminder(status)
+    # Save the rate-limit marker before queuing the alert. A crash immediately
+    # after delivery must not turn a watchdog restart into duplicate spam.
+    coordinator.mark_reminder_sent(now_utc)
+    log(message, fp)
+    alert(
+        "forced_wipe_due",
+        message,
+        level="warning",
+        fp=fp,
+        identity=cfg.get("identity"),
+        cycle=status.get("cycle"),
+        scheduled_utc=status.get("scheduled_utc"),
+        action=status.get("action"),
+        last_wipe_at=status.get("last_wipe_at"),
+        last_wipe_age=status.get("last_wipe_age"),
+        local_build=status.get("latest_local_build"),
+        remote_build=status.get("latest_remote_build"),
+        update_verdict=status.get("latest_update_verdict"),
+    )
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(PROJECT_DIR, "rust_watchdog.json"))
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--version", action="store_true", help="print version and exit")
+    ap.add_argument(
+        "--change-home-user",
+        "--changeuser",
+        dest="change_home_user",
+        metavar="USER",
+        help=(
+            "persistently rewrite /home/<user> prefixes in JSON config path "
+            "values, save a backup, and exit"
+        ),
+    )
+    ap.add_argument(
+        "--set-forced-wipe-action",
+        choices=_FORCED_WIPE_ACTIONS,
+        help=(
+            "persist forced_wipe_action as off, map-wipe, or full-wipe and exit"
+        ),
+    )
+    ap.add_argument(
+        "--full-wipe-wipeday",
+        type=_cli_bool,
+        metavar="{on|off}",
+        help=(
+            "persistently enable/disable full wipes on the forced-wipe day "
+            "(also accepts true/false, yes/no, and 1/0)"
+        ),
+    )
+    ap.add_argument(
+        "--map-wipe-wipeday",
+        type=_cli_bool,
+        metavar="{on|off}",
+        help=(
+            "persistently enable/disable map wipes on the forced-wipe day "
+            "(full-wipe takes precedence if both are enabled)"
+        ),
+    )
+    ap.add_argument(
+        "--forced-wipe-status",
+        action="store_true",
+        help="show forced-wipe schedule/build fence/persisted state and exit",
+    )
+    ap.add_argument(
+        "--mark-forced-wipe-done",
+        nargs="?",
+        const="now",
+        metavar="UTC_TIMESTAMP",
+        help=(
+            "record a manual wipe and exit; omit UTC_TIMESTAMP to use now "
+            "(example: 2026-08-06T18:23:00Z)"
+        ),
+    )
+    ap.add_argument(
+        "--forced-wipe-kind",
+        choices=("unknown", "map-wipe", "full-wipe"),
+        default="unknown",
+        help="wipe kind stored with --mark-forced-wipe-done",
+    )
     ap.add_argument("--test-rcon-say", metavar="MSG",
                 help="send a global chat message via RCON (no plugins required) and exit")
     ap.add_argument("--test-rcon-cmd", metavar="CMD",
@@ -3507,13 +5279,69 @@ def main():
         print(__version__)
         return
 
+    config_edit_requested = any(
+        value is not None
+        for value in (
+            args.change_home_user,
+            args.set_forced_wipe_action,
+            args.full_wipe_wipeday,
+            args.map_wipe_wipeday,
+        )
+    )
+    if config_edit_requested:
+        try:
+            result = edit_config_file(
+                args.config,
+                change_home_user=args.change_home_user,
+                set_forced_wipe_action=args.set_forced_wipe_action,
+                full_wipe_wipeday=args.full_wipe_wipeday,
+                map_wipe_wipeday=args.map_wipe_wipeday,
+            )
+        except (OSError, ValueError) as e:
+            ap.error(f"could not edit config: {e}")
+        print_config_edit_result(
+            result,
+            changed_home_user=args.change_home_user,
+        )
+        return
+
     cfg = load_cfg(args.config)
     cfg = normalize_cfg_paths(cfg, args.config)
 
-    global CFG_FOR_HINTS
+    global CFG_FOR_HINTS, STATUS_COORDINATOR
     CFG_FOR_HINTS = cfg
     
     apply_recovery_toggles(cfg)
+
+    if args.forced_wipe_status:
+        print_forced_wipe_status(cfg)
+        return
+
+    if args.mark_forced_wipe_done is not None:
+        now_utc = datetime.now(timezone.utc)
+        raw = str(args.mark_forced_wipe_done or "now").strip()
+        wiped_at = now_utc if raw.lower() == "now" else _parse_utc_iso(raw)
+        if wiped_at is None:
+            ap.error(
+                "--mark-forced-wipe-done requires an ISO-8601 UTC timestamp "
+                "such as 2026-08-06T18:23:00Z"
+            )
+        coordinator = ForcedWipeCoordinator(cfg, persist=True)
+        try:
+            result = coordinator.mark_manual_complete(
+                now_utc,
+                wiped_at=wiped_at,
+                wipe_kind=args.forced_wipe_kind,
+            )
+        except Exception as e:
+            ap.error(f"could not record forced wipe: {e}")
+        print(f"cycle: {result['cycle']}")
+        print(f"scheduled_utc: {result['scheduled_utc']}")
+        print(f"last_wipe_at: {result['last_wipe_at']}")
+        print(f"last_wipe_age: {result['last_wipe_age']}")
+        print(f"last_wipe_kind: {result['last_wipe_kind']}")
+        print(f"completed_cycle: {result['completed_cycle']}")
+        return
 
     # Now server_dir is already absolute+stable (no CWD surprises)
     server_dir = cfg["server_dir"]
@@ -3619,10 +5447,22 @@ def main():
 
     # init alerts only after we actually own the lock
     init_alerts(cfg, fp)
+    forced_wipe = ForcedWipeCoordinator(
+        cfg,
+        fp=fp,
+        persist=not parse_bool(cfg.get("dry_run"), False),
+    )
+    STATUS_COORDINATOR = forced_wipe
+    _refresh_server_restart_ledger(cfg, forced_wipe)
 
     log(f"Rust Watchdog v{__version__} by FlyingFathead started (dry_run={cfg['dry_run']})", fp)
     log(f"server_dir={server_dir} identity={cfg['identity']}", fp)
     log(f"recovery_steps={cfg['recovery_steps']}", fp)
+    log(
+        f"forced_wipe_action={forced_wipe.action} "
+        f"state_file={forced_wipe.state_path or '(disabled)'}",
+        fp,
+    )
 
     alert(
         "watchdog_started",
@@ -3644,6 +5484,11 @@ def main():
             last_forced_wipe_log = time.monotonic()
         except Exception as e:
             log(f"FORCED_WIPE: WARNING: failed to compute/log forced wipe schedule: {e}", fp)
+
+    try:
+        maybe_emit_forced_wipe_reminder(forced_wipe, cfg, fp=fp)
+    except Exception as e:
+        log(f"FORCED_WIPE: WARNING: reminder check failed: {e}", fp)
 
     # One-time SmoothRestarter info on startup (even if bridge is disabled)
     if parse_bool(cfg.get("smoothrestarter_check_loaded"), False) or parse_bool(cfg.get("enable_smoothrestarter_bridge"), False):
@@ -3692,6 +5537,13 @@ def main():
                 log("Stop requested -- exiting watchdog loop", fp)
                 break
 
+            # Reminder delivery is independent of health/recovery and remains
+            # active even while a pause file suppresses operational actions.
+            try:
+                maybe_emit_forced_wipe_reminder(forced_wipe, cfg, fp=fp)
+            except Exception as e:
+                log(f"FORCED_WIPE: WARNING: reminder check failed: {e}", fp)
+
             pause_file = cfg.get("pause_file")
 
             if pause_file and os.path.exists(pause_file):
@@ -3725,6 +5577,8 @@ def main():
             log(f"HEALTH: {state}", fp)
             for line in evidence:
                 log(f"  {line}", fp)
+            if state == "RUNNING":
+                _refresh_server_restart_ledger(cfg, forced_wipe)
 
             # Send startup OK
             if state == "RUNNING" and not startup_ok_sent:
@@ -3735,6 +5589,29 @@ def main():
                     identity=cfg.get("identity"),
                 )
                 startup_ok_sent = True
+
+            if (
+                state == "RUNNING"
+                and forced_wipe.enabled
+                and not parse_bool(cfg.get("dry_run"), False)
+                and forced_wipe.finish_if_running(datetime.now(timezone.utc))
+            ):
+                log(
+                    "FORCED_WIPE: server healthy; cycle marked completed",
+                    fp,
+                )
+                alert(
+                    "forced_wipe_completed",
+                    "Automatic forced wipe completed and server is healthy",
+                    level="info",
+                    fp=fp,
+                    identity=cfg.get("identity"),
+                    cycle=forced_wipe.state.get("cycle"),
+                    action=forced_wipe.action,
+                    candidate_build=forced_wipe.state.get(
+                        "candidate_remote_build"
+                    ),
+                )
 
             # Forced wipe highlighter (rate-limited)
             if forced_wipe_enabled:
@@ -3776,11 +5653,47 @@ def main():
                         elif not cfg_ok:
                             log(f"SMOOTH_BRIDGE: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
 
-                    verdict = check_server_update_via_lgsm(cfg, server_dir, rustserver_path, fp)
+                    update_result = check_server_update_via_lgsm(
+                        cfg, server_dir, rustserver_path, fp
+                    )
+                    now_utc = datetime.now(timezone.utc)
+                    wipe_decision = forced_wipe.observe_update(
+                        update_result, now_utc
+                    )
+                    verdict = update_result.verdict
 
-                    hold, reason = in_forced_wipe_update_hold(cfg, datetime.now(timezone.utc), fp=fp)
+                    if wipe_decision.armed_now:
+                        log(
+                            "FORCED_WIPE: ARMED "
+                            f"cycle={wipe_decision.cycle} "
+                            f"candidate_build={wipe_decision.candidate_remote_build} "
+                            f"({wipe_decision.reason})",
+                            fp,
+                        )
+                        alert(
+                            "forced_wipe_armed",
+                            "Monthly forced-wipe build armed",
+                            level="warning",
+                            fp=fp,
+                            identity=cfg.get("identity"),
+                            cycle=wipe_decision.cycle,
+                            scheduled_utc=wipe_decision.scheduled_utc,
+                            candidate_build=wipe_decision.candidate_remote_build,
+                            reason=wipe_decision.reason,
+                        )
 
-                    if verdict is True:
+                    hold = wipe_decision.hold
+                    reason = wipe_decision.reason
+                    if not forced_wipe.enabled:
+                        hold, reason = in_forced_wipe_update_hold(
+                            cfg, now_utc, fp=fp
+                        )
+
+                    should_act = bool(
+                        verdict is True or wipe_decision.action_due
+                    )
+
+                    if should_act:
                         if hold:
                             log(f"UPDATE_WATCH: update available, but HOLDING until wipe ({reason})", fp)
                             alert(
@@ -3790,9 +5703,19 @@ def main():
                                 fp=fp,
                                 identity=cfg.get("identity"),
                                 hold_reason=reason,
+                                local_build=update_result.local_build,
+                                remote_build=update_result.remote_build,
                             )
                         else:
-                            log("UPDATE_WATCH: update available", fp)
+                            action_reason = (
+                                "armed monthly forced-wipe build"
+                                if wipe_decision.action_due
+                                else "update detected"
+                            )
+                            log(
+                                f"UPDATE_WATCH: action required ({action_reason})",
+                                fp,
+                            )
                             alert(
                                 "update_available",
                                 "Rust update detected",
@@ -3800,6 +5723,9 @@ def main():
                                 fp=fp,
                                 identity=cfg.get("identity"),
                                 source="linuxgsm check-update",
+                                local_build=update_result.local_build,
+                                remote_build=update_result.remote_build,
+                                forced_wipe_pending=wipe_decision.pending,
                             )
 
                             cooldown = int(cfg.get("restart_request_cooldown_seconds", 3600))
@@ -3859,7 +5785,7 @@ def main():
                                             identity=cfg.get("identity"),
                                             delay_seconds=sr_delay,
                                             path="smoothrestarter",
-                                            reason="update detected",
+                                            reason=action_reason,
                                         )
 
                                     else:
@@ -3871,9 +5797,15 @@ def main():
                                             fp=fp,
                                             identity=cfg.get("identity"),
                                             path="watchdog-fallback",
-                                            reason="update detected",
+                                            reason=action_reason,
                                         )
-                                        update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=fp)
+                                        update_watch_fallback_restart_now(
+                                            cfg,
+                                            server_dir,
+                                            rustserver_path,
+                                            fp=fp,
+                                            forced_wipe=forced_wipe,
+                                        )
 
                                         last_restart_request = now
                                         down_streak = 0
@@ -3892,9 +5824,15 @@ def main():
                                         fp=fp,
                                         identity=cfg.get("identity"),
                                         path="watchdog-fallback",
-                                        reason="update detected",
+                                        reason=action_reason,
                                     )
-                                    update_watch_fallback_restart_now(cfg, server_dir, rustserver_path, fp=fp)
+                                    update_watch_fallback_restart_now(
+                                        cfg,
+                                        server_dir,
+                                        rustserver_path,
+                                        fp=fp,
+                                        forced_wipe=forced_wipe,
+                                    )
 
                                     last_restart_request = now
                                     down_streak = 0
@@ -3923,30 +5861,48 @@ def main():
                     reason="health_report down_confirmed",
                 )
 
-                steps = list(cfg["recovery_steps"])
+                if forced_wipe.needs_recovery(datetime.now(timezone.utc)):
+                    steps = [
+                        "stop",
+                        "backup",
+                        "update",
+                        "mu",
+                        forced_wipe.action,
+                        "start",
+                    ]
+                    execute_forced_wipe_sequence(
+                        cfg,
+                        server_dir,
+                        rustserver_path,
+                        forced_wipe,
+                        server_already_down=True,
+                        fp=fp,
+                    )
+                else:
+                    steps = list(cfg["recovery_steps"])
 
-                if parse_bool(cfg.get("forced_wipe_recovery_restart_only_prewipe"), False):
-                    hold, reason = in_forced_wipe_update_hold(cfg, datetime.now(timezone.utc), fp=fp)
-                    if hold:
-                        # Drop update/mu during pre-wipe hold; keep server alive without chasing builds
-                        steps = [s for s in steps if s.strip().lower() not in ("update", "mu")]
-                        if not steps:
-                            steps = ["restart"]
-                        log(f"RECOVERY: pre-wipe HOLD active -> skipping update/mu ({reason})", fp)
+                    if parse_bool(cfg.get("forced_wipe_recovery_restart_only_prewipe"), False):
+                        hold, reason = in_forced_wipe_update_hold(cfg, datetime.now(timezone.utc), fp=fp)
+                        if hold:
+                            # Drop update/mu during pre-wipe hold; keep server alive without chasing builds
+                            steps = [s for s in steps if s.strip().lower() not in ("update", "mu")]
+                            if not steps:
+                                steps = ["restart"]
+                            log(f"RECOVERY: pre-wipe HOLD active -> skipping update/mu ({reason})", fp)
 
-                for step in steps:
-                    if stop_requested:
-                        log("Stop requested -- aborting recovery sequence", fp)
-                        break
+                    for step in steps:
+                        if stop_requested:
+                            log("Stop requested -- aborting recovery sequence", fp)
+                            break
 
-                    step = step.strip().lower()
-                    timeout = cfg["timeouts"].get(step, None)
-                    try:
-                        run_cmd([rustserver_path, step], server_dir, fp, timeout=timeout, dry_run=cfg["dry_run"])
-                    except TimeoutError as e:
-                        log(f"STEP TIMEOUT ({step}): {e}", fp)
-                    except Exception as e:
-                        log(f"STEP ERROR ({step}): {e}", fp)
+                        step = step.strip().lower()
+                        timeout = cfg["timeouts"].get(step, None)
+                        try:
+                            run_cmd([rustserver_path, step], server_dir, fp, timeout=timeout, dry_run=cfg["dry_run"])
+                        except TimeoutError as e:
+                            log(f"STEP TIMEOUT ({step}): {e}", fp)
+                        except Exception as e:
+                            log(f"STEP ERROR ({step}): {e}", fp)
 
                 if stop_requested:
                     log("Stop requested -- skipping cooldown and exiting", fp)
@@ -3973,6 +5929,7 @@ def main():
                 st2, ev2 = health_report(cfg, server_dir, rustserver_path, fp)
 
                 if st2 == "RUNNING":
+                    _refresh_server_restart_ledger(cfg, forced_wipe)
                     alert(
                         "server_recovered",
                         f"Server '{cfg.get('identity')}' is RUNNING -- cooldown passed",
@@ -3980,6 +5937,29 @@ def main():
                         fp=fp,
                         identity=cfg.get("identity"),
                     )
+                    if (
+                        forced_wipe.enabled
+                        and not parse_bool(cfg.get("dry_run"), False)
+                        and forced_wipe.finish_if_running(
+                            datetime.now(timezone.utc)
+                        )
+                    ):
+                        log(
+                            "FORCED_WIPE: server healthy; cycle marked completed",
+                            fp,
+                        )
+                        alert(
+                            "forced_wipe_completed",
+                            "Automatic forced wipe completed and server is healthy",
+                            level="info",
+                            fp=fp,
+                            identity=cfg.get("identity"),
+                            cycle=forced_wipe.state.get("cycle"),
+                            action=forced_wipe.action,
+                            candidate_build=forced_wipe.state.get(
+                                "candidate_remote_build"
+                            ),
+                        )
                 else:
                     primary = next((l for l in ev2 if l.startswith("PRIMARY_CAUSE:")), "")
                     alert(
@@ -4000,6 +5980,7 @@ def main():
                 if args.once:
                     break
     finally:
+        STATUS_COORDINATOR = None
         
         # // try alerts
         try:
@@ -4017,4 +5998,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

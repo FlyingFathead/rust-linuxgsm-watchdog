@@ -56,8 +56,12 @@ Optional (only needed for WebRCON features like `--test-rcon-say` and the Smooth
 ## Files
 
 - `rust_watchdog.py` -- the watchdog
+- `rust_watchdog_alerts.py` -- external alert backends and formatting
 - `rust_watchdog.json` -- config (merged over defaults)
 - `rust-watchdog.service` -- example systemd unit
+- `tests/test_forced_wipe.py` -- forced-wipe schedule/state/lifecycle regression tests
+- `tests/test_alert_footnotes.py` -- Telegram HTML/Markdown footnote regression tests
+- `tests/test_config_edit.py` -- persistent config-editing and path-migration regression tests
 
 ---
 
@@ -167,6 +171,96 @@ Run one loop iteration and exit:
 
 Do **not** run it inside `screen`/`tmux` if you want it to actually recover (LinuxGSM will tmuxception).
 
+### Persistent config editing
+
+The shipped example keeps `rustserver` as the default Linux account. To migrate
+an existing JSON config to another home account without hand-editing every
+absolute path:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --change-home-user rustnewone
+
+# Short alias:
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --changeuser rustnewone
+```
+
+The command recursively inspects the raw JSON config and rewrites string values
+whose complete absolute path starts with `/home/<user>`. It reports the number
+of matches and prints each JSON key, old value, and new value. For the shipped
+config, the normal matches are:
+
+```text
+$.server_dir
+$.lockfile
+$.logfile
+$.pause_file
+$.forced_wipe_state_file
+```
+
+It does not rewrite `identity`, relative paths, embedded message text, or
+arbitrary strings that merely contain `/home/`. It also deliberately leaves
+`rust-watchdog.service` alone and prints a warning to review that file's
+`User=`, `Group=`, `WorkingDirectory=`, and `ExecStart=` values separately.
+
+Config changes are written atomically. Before an actual change, the original is
+copied next to it with a UTC timestamp, for example:
+
+```text
+rust_watchdog.json.bak.20260727T145512.123456Z
+```
+
+The preferred forced-wipe config interface persists the existing single action
+value:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --set-forced-wipe-action off
+
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --set-forced-wipe-action map-wipe
+
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --set-forced-wipe-action full-wipe
+```
+
+Boolean-style convenience switches accept `on/off`, `true/false`, `yes/no`, or
+`1/0`:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --full-wipe-wipeday on
+
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --map-wipe-wipeday on
+```
+
+They still save only `forced_wipe_action`; separate contradictory booleans are
+not added to the config. If both modes are enabled, `full-wipe` wins:
+
+```text
+WARN: both map-wipe and full-wipe were enabled for the forced-wipe day; full-wipe takes precedence. Effective forced_wipe_action="full-wipe".
+```
+
+To switch explicitly from full wipe to map wipe using the convenience form:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --full-wipe-wipeday off \
+  --map-wipe-wipeday on
+```
+
+Home-path migration and forced-wipe changes can be combined in one invocation.
+They are saved as one transaction, after which the command exits without
+starting the watchdog:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --change-home-user rustnewone \
+  --set-forced-wipe-action full-wipe
+```
+
 ### WebRCON test helpers
 
 Send a chat broadcast via WebRCON:
@@ -243,6 +337,162 @@ Bump `timeouts.update` / `timeouts.mu` if SteamCMD is slow, or keep them strict 
 
 ---
 
+## Optional automatic monthly forced wipe
+
+Automatic deletion is **off by default**, including after an upgrade. Enable it
+explicitly with either `map-wipe` (retain blueprints) or `full-wipe` (remove
+blueprints):
+
+```json
+{
+  "forced_wipe_action": "full-wipe",
+  "forced_wipe_trigger": "new-build-after-schedule",
+
+  "forced_wipe_early_release_tolerance_minutes": 15,
+  "forced_wipe_action_window_minutes": 360,
+
+  "forced_wipe_backup_before": true,
+  "forced_wipe_backup_required": true,
+  "forced_wipe_verify_update_current": true,
+  "forced_wipe_state_file": "/home/rustserver/rust-linuxgsm-watchdog/data/state/forced_wipe.json",
+
+  "forced_wipe_reminder_enabled": true,
+  "forced_wipe_reminder_repeat_minutes": 30
+}
+```
+
+The schedule is the first Thursday at 19:00 `Europe/London`. This is deliberately
+not described as 19:00 GMT: during British Summer Time it is 18:00 UTC.
+
+The calendar alone never triggers deletion. The watchdog parses LinuxGSM's
+`Local build` and `Remote build` values and maintains a pre-release remote-build
+fence. A different remote build first observed within the configured tolerance
+before release, or after release, becomes the candidate. An earlier same-day
+update becomes the fence instead of the wipe candidate.
+
+The Rust player client and dedicated server are separate Steam apps with
+separate build IDs. Near-simultaneous changes are useful evidence that a
+coordinated Rust release landed, especially around the scheduled monthly
+window, but they are not a forced-wipe flag: an ordinary coordinated hotfix can
+also change both. Build correlation therefore must not independently authorize
+deletion.
+
+If the watchdog starts inside the release window without a previously persisted
+fence, it refuses to arm an automatic wipe. That can miss an unattended wipe,
+but it cannot reinterpret an old pending update as permission to delete data.
+
+Once armed, both restart paths use the same lifecycle:
+
+```text
+stop (a no-op if SmoothRestarter already stopped it)
+backup
+update
+verify no update remains pending
+mu
+full-wipe or map-wipe
+start
+verify normal watchdog health
+```
+
+The state file makes this sequence crash-safe:
+
+- `pending` is written before SmoothRestarter is asked to shut down.
+- A pre-wipe marker is written before the destructive LinuxGSM command.
+- `wipe_done` is written immediately after that command succeeds and before
+  startup.
+- If startup fails after `wipe_done`, recovery retries only `start`.
+- If execution dies while the wipe command is in an ambiguous state, the
+  watchdog refuses another automatic wipe and reports that manual inspection is
+  required.
+- `completed` is written only after the normal health checks report `RUNNING`.
+- Later hotfixes in the same monthly cycle use the ordinary update/restart path
+  and cannot cause another wipe.
+
+When `forced_wipe_action` is `off`, the persistent reminder is on by default.
+After the monthly schedule passes, the watchdog logs and sends a UTF-8 `⚠️`
+warning every `forced_wipe_reminder_repeat_minutes` until that cycle has a
+recorded wipe. The wording deliberately says **no completed wipe is recorded**:
+the watchdog cannot reliably infer an externally performed wipe from a running
+server or a Steam build number.
+
+The automatic path records the exact successful wipe-command time. After a
+manual `full-wipe` or `map-wipe`, record either the current time or the actual
+UTC time:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --mark-forced-wipe-done --forced-wipe-kind full-wipe
+
+./rust_watchdog.py --config ./rust_watchdog.json \
+  --mark-forced-wipe-done 2026-08-06T18:23:00Z \
+  --forced-wipe-kind full-wipe
+```
+
+The state retains `last_wipe_at`, `last_wipe_source`, `last_wipe_kind`,
+`last_restart_at`, and `last_restart_source` across monthly cycle rollover.
+Both ledgers are stored in the configured `forced_wipe_state_file`. The restart
+time is taken from the live `RustDedicated` process start time via Linux
+`/proc`, then persisted so a later server-down alert can still show it.
+
+Status renders the UTC timestamps and long-form ages:
+
+```text
+last_wipe_at: 2026-08-06T18:23:00Z
+last_wipe_age: 20 days, 3 hours, 12 minutes ago
+last_wipe_source: manual
+last_wipe_kind: full-wipe
+last_restart_at: 2026-08-06T18:24:15Z
+last_restart_age: 20 days, 3 hours, 10 minutes ago
+last_restart_source: rust-process-start
+```
+
+Every normal watchdog alert receives a separate status footnote by default:
+
+```text
+Server last wiped: 2026-08-06 18:23:00 UTC (20 days, 3 hours, 12 minutes ago)
+Server last restarted: 2026-08-06 18:24:15 UTC (20 days, 3 hours, 10 minutes ago)
+```
+
+The Telegram HTML renderer wraps each line in `<i>...</i>`, Telegram Markdown
+uses `_..._`, and the existing Discord renderer uses Markdown italics. The
+elapsed footnote is excluded from alert deduplication, so a changing minute
+count does not defeat the existing dedupe policy.
+
+If no prior timestamp can be established, the watchdog says so instead of
+guessing from a save-file mtime or Steam build time:
+
+```text
+Server last wiped: unknown (no wipe timestamp recorded)
+Server last restarted: unknown (no Rust process start timestamp recorded)
+```
+
+The footnote can be configured under `alerts`:
+
+```json
+{
+  "alerts": {
+    "status_footnote": {
+      "enabled": true,
+      "include_last_wipe": true,
+      "include_last_restart": true,
+      "unknown_wipe_text": "unknown (no wipe timestamp recorded)",
+      "unknown_restart_text": "unknown (no Rust process start timestamp recorded)"
+    }
+  }
+}
+```
+
+Inspect the current schedule and persisted fence without starting the watchdog:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json --forced-wipe-status
+```
+
+The automatic feature requires `enable_update_watch=true` and
+`enable_server_update=true`. `dry_run=true` never writes forced-wipe state.
+
+---
+
 ## Optional: SmoothRestarter bridge (graceful restarts)
 
 If you use uMod’s **[Smooth Restarter](https://umod.org/plugins/smooth-restarter)** for player-visible countdown/UI, the watchdog can act as a bridge **while the server is RUNNING**:
@@ -264,6 +514,9 @@ And it also sends the final fallback message once:
 - `update_watch_final_message` (default: "Server is restarting, come back in a few minutes!")
 
 SmoothRestarter then performs the graceful shutdown. Once the server is down, LinuxGSM restart/update happens on the next normal watchdog recovery cycle.
+
+If a monthly forced-wipe candidate is armed, that recovery cycle instead runs
+the persisted `backup -> update -> mu -> wipe -> start` sequence.
 
 ### Path B -- No SmoothRestarter (or bridge failed)
 
@@ -481,6 +734,36 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.3
+  **Fixed / Added:**
+  - Added `--change-home-user USER` with the `--changeuser` alias to migrate all `/home/<user>`-prefixed JSON path values while leaving `identity` and the systemd unit untouched.
+  - Added per-match reporting, Linux-account-name validation, atomic config replacement, and timestamped backups.
+  - Added `--set-forced-wipe-action {off,map-wipe,full-wipe}` for persistent command-line configuration.
+  - Added `--full-wipe-wipeday` and `--map-wipe-wipeday` boolean-style convenience switches, with explicit full-wipe precedence and warning output.
+  - Added transactional combined edits and config migration/precedence regression tests.
+- v0.4.2
+  **Fixed / Added:**
+  - Added a default-on italic status footnote to watchdog alerts with last wipe and last Rust server restart timestamps.
+  - Added long-form elapsed time such as `5 days, 23 hours, 51 minutes ago`.
+  - Added explicit unknown-timestamp fallbacks instead of inferring wipes from unreliable filesystem or Steam metadata.
+  - Added persistent `last_restart_at` tracking from the actual `RustDedicated` process start time.
+  - Added Telegram HTML/Markdown and existing Discord Markdown rendering, plus fallback, rollover, and dedupe regression tests.
+- v0.4.1
+  **Fixed / Added:**
+  - Added a default-on persistent `⚠️` reminder when automatic forced wiping is off and the monthly schedule has passed without a recorded wipe.
+  - Added configurable reminder repetition with restart-safe rate-limit state.
+  - Added a persistent last-wipe ledger with UTC timestamp, elapsed age, source, and wipe kind.
+  - Added `--mark-forced-wipe-done [UTC_TIMESTAMP]` for acknowledging externally performed wipes.
+  - Documented why simultaneous player-client and dedicated-server build changes are corroborating release evidence, not a forced-wipe flag.
+- v0.4.0
+  **Fixed / Added:**
+  - Added opt-in `map-wipe` / `full-wipe` handling for the monthly Rust release.
+  - Added persisted Steam build fencing so earlier same-day updates cannot be mistaken for the monthly release build.
+  - Added one-wipe-per-cycle state with `wipe_done` persisted before startup; startup failures now retry only `start`.
+  - Added an ambiguous in-progress guard so a watchdog crash during the destructive command cannot cause a blind second wipe.
+  - Unified SmoothRestarter and no-SmoothRestarter lifecycle ordering: backup, update, update verification, mod update, wipe, start, health verification.
+  - Fixed the post-release schedule bug that made the configured `WIPE WINDOW` unreachable.
+  - Added `--forced-wipe-status`, forced-wipe alerts, LinuxGSM build-ID parsing, DST/date tests, and lifecycle idempotency tests.
 - v0.3.8
   **Fixed / Added:**
   - Fixed startup alert ordering so `watchdog_started` is emitted only after the watchdog successfully acquires its lock.
@@ -532,7 +815,7 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 - v0.2.8 - Rudimentary checks on [Smooth Restarter](https://umod.org/plugins/smooth-restarter) integrity; more bug fixes
 - v0.2.7 - Small bugfixes
 - v0.2.6 - Implemented a standalone restart timer notification to the server when Smooth Restarter is not available and when we're watching for updates
-  - The watchdog is now calculating a countdown to Facepunch's forced wipe day (by default, the first Thursday of every month at 19:00 GMT); pending restarts over updates are on hold by default that day until we're past the expected update time.
+  - The watchdog is now calculating a countdown to Facepunch's forced wipe day (by default, the first Thursday of every month at 19:00 Europe/London); pending restarts over updates are on hold by default that day until we're past the expected update time.
   - WIP: set wipe levels during forced wipe update-restarts.
 - v0.2.5 - Switched completely to RCON to interact with bridged Oxide plugins like Smooth Restarter
 - v0.2.4 - [Smooth Restarter](https://umod.org/plugins/smooth-restarter) bridge test (`--test-smoothrestarter` and `--test-smoothrestarter-send`)
