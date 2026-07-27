@@ -155,10 +155,11 @@ class RconWipeLedgerTests(unittest.TestCase):
                 now_utc=dt("2026-07-27T14:06:28Z"),
             )
         self.assertEqual(
-            footnotes[0],
-            "Server last wiped: 2026-07-02 18:25:08 UTC "
-            "(RCON) "
-            "(24 days, 19 hours, 41 minutes ago)",
+            footnotes[:2],
+            [
+                "Server last wiped: 2026-07-02 18:25:08 UTC (RCON)",
+                "(24 days, 19 hours, 41 minutes ago)",
+            ],
         )
 
         reloaded = self.coordinator()
@@ -400,10 +401,12 @@ class RconWipeLedgerTests(unittest.TestCase):
                 now_utc=dt("2026-07-27T14:06:28Z"),
             )
         self.assertEqual(
-            footnotes[0],
-            "Server last wiped: 2026-07-02 18:24:55 UTC "
-            "(map file mtime) "
-            "(24 days, 19 hours, 41 minutes ago)",
+            footnotes[:2],
+            [
+                "Server last wiped: 2026-07-02 18:24:55 UTC "
+                "(map file mtime)",
+                "(24 days, 19 hours, 41 minutes ago)",
+            ],
         )
 
     def test_alert_wipe_source_labels_cover_persisted_record_types(self):
@@ -434,7 +437,10 @@ class RconWipeLedgerTests(unittest.TestCase):
                         footnotes[0],
                         "Server last wiped: "
                         "2026-07-02 18:25:08 UTC"
-                        f"{suffix} "
+                        f"{suffix}",
+                    )
+                    self.assertEqual(
+                        footnotes[1],
                         "(24 days, 19 hours, 41 minutes ago)",
                     )
 

@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 
 def _runtime_version():
@@ -2803,10 +2803,8 @@ def _build_alert_status_footnotes(
                 str(state.get("last_wipe_source") or "")
             )
             source_suffix = f" ({source_label})" if source_label else ""
-            lines.append(
-                f"Server last wiped: {rendered_at}{source_suffix} "
-                f"({_elapsed_ago(wiped_at, now_utc)})"
-            )
+            lines.append(f"Server last wiped: {rendered_at}{source_suffix}")
+            lines.append(f"({_elapsed_ago(wiped_at, now_utc)})")
         else:
             unknown = str(
                 options.get(
@@ -2817,13 +2815,13 @@ def _build_alert_status_footnotes(
             lines.append(f"Server last wiped: {unknown}")
 
     if include_restart:
+        if lines:
+            lines.append("")
         restarted_at = current_restart or str(state.get("last_restart_at") or "")
         rendered_at = _status_timestamp(restarted_at)
         if rendered_at:
-            lines.append(
-                f"Server last restarted: {rendered_at} "
-                f"({_elapsed_ago(restarted_at, now_utc)})"
-            )
+            lines.append(f"Server last restarted: {rendered_at}")
+            lines.append(f"({_elapsed_ago(restarted_at, now_utc)})")
         else:
             unknown = str(
                 options.get(
@@ -3312,6 +3310,295 @@ def apply_recovery_toggles(cfg):
 
     cfg["_recovery_steps_original"] = orig
     cfg["recovery_steps"] = new
+
+
+_CONFIG_VIEW_SECTION_ORDER = (
+    "Core",
+    "Health and RCON",
+    "Updates and recovery",
+    "Forced wipe",
+    "SmoothRestarter",
+    "Alerts",
+    "Service helpers",
+    "Other",
+)
+
+
+def _config_view_section(key: str) -> str:
+    key = str(key)
+    if key == "alerts" or key.startswith("alerts_"):
+        return "Alerts"
+    if (
+        key == "enable_forced_wipe_highlight"
+        or key.startswith("forced_wipe_")
+    ):
+        return "Forced wipe"
+    if (
+        key == "enable_smoothrestarter_bridge"
+        or key.startswith("smoothrestarter_")
+        or key == "restart_request_cooldown_seconds"
+    ):
+        return "SmoothRestarter"
+    if (
+        key.startswith("watchdog_systemd_")
+        or key.startswith("test_telegram_status_")
+    ):
+        return "Service helpers"
+    if (
+        key.startswith("dupe_identity_")
+        or key.startswith("check_")
+        or key.startswith("rcon_")
+        or key.startswith("wipe_timestamp_")
+        or key in {
+            "server_port",
+            "tcp_timeout",
+            "details_timeout",
+        }
+    ):
+        return "Health and RCON"
+    if (
+        key.startswith("update_")
+        or key.startswith("enable_update_")
+        or key in {
+            "enable_server_update",
+            "enable_mods_update",
+            "recovery_steps",
+            "timeouts",
+        }
+    ):
+        return "Updates and recovery"
+    if key in {
+        "server_dir",
+        "identity",
+        "interval_seconds",
+        "cooldown_seconds",
+        "down_confirmations",
+        "lockfile",
+        "logfile",
+        "pause_file",
+        "dry_run",
+    }:
+        return "Core"
+    return "Other"
+
+
+def _effective_config_for_view(cfg: dict) -> dict:
+    from rust_watchdog_alerts import effective_alert_config
+
+    effective = _deep_merge({}, cfg)
+    effective.pop("_recovery_steps_original", None)
+    effective["alerts"] = effective_alert_config(effective)
+    return effective
+
+
+def _config_scalar_text(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        if not value:
+            return '""'
+        if any(ch in value for ch in "\r\n\t"):
+            return json.dumps(value, ensure_ascii=False)
+        return value
+    return str(value)
+
+
+def _config_tree_lines(value, *, indent: int, colorize) -> list:
+    prefix = " " * indent
+    if isinstance(value, dict):
+        if not value:
+            return [prefix + "{}"]
+
+        scalar_keys = [
+            str(key)
+            for key, item in value.items()
+            if not isinstance(item, (dict, list))
+        ]
+        width = max((len(key) for key in scalar_keys), default=0)
+        width = min(max(width, 1), 42)
+        lines = []
+        for key, item in value.items():
+            key_text = str(key)
+            if isinstance(item, dict):
+                if item:
+                    lines.append(
+                        prefix + colorize(f"{key_text}:", "key")
+                    )
+                    lines.extend(
+                        _config_tree_lines(
+                            item,
+                            indent=indent + 2,
+                            colorize=colorize,
+                        )
+                    )
+                else:
+                    lines.append(
+                        prefix
+                        + colorize(key_text.ljust(width), "key")
+                        + "  {}"
+                    )
+            elif isinstance(item, list):
+                if not item:
+                    lines.append(
+                        prefix
+                        + colorize(key_text.ljust(width), "key")
+                        + "  []"
+                    )
+                elif all(
+                    not isinstance(entry, (dict, list))
+                    for entry in item
+                ):
+                    rendered = json.dumps(item, ensure_ascii=False)
+                    lines.append(
+                        prefix
+                        + colorize(key_text.ljust(width), "key")
+                        + f"  {rendered}"
+                    )
+                else:
+                    lines.append(
+                        prefix + colorize(f"{key_text}:", "key")
+                    )
+                    for index, entry in enumerate(item):
+                        lines.append(
+                            " " * (indent + 2)
+                            + colorize(f"[{index}]", "index")
+                        )
+                        lines.extend(
+                            _config_tree_lines(
+                                entry,
+                                indent=indent + 4,
+                                colorize=colorize,
+                            )
+                        )
+            else:
+                lines.append(
+                    prefix
+                    + colorize(key_text.ljust(width), "key")
+                    + f"  {_config_scalar_text(item)}"
+                )
+        return lines
+
+    return [prefix + _config_scalar_text(value)]
+
+
+def _stream_is_tty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def _stream_supports_unicode(stream) -> bool:
+    encoding = str(getattr(stream, "encoding", "") or "").strip()
+    if not encoding:
+        return False
+    try:
+        "⚙📄🧩🔧".encode(encoding)
+        return True
+    except (LookupError, UnicodeEncodeError):
+        return False
+
+
+def print_effective_config(
+    cfg: dict,
+    config_path: str,
+    *,
+    stream=None,
+    use_color=None,
+    use_unicode=None,
+) -> None:
+    stream = stream or sys.stdout
+    is_tty = _stream_is_tty(stream)
+    term = str(os.getenv("TERM", "") or "").strip().lower()
+    if use_color is None:
+        use_color = (
+            is_tty
+            and term not in ("", "dumb")
+            and "NO_COLOR" not in os.environ
+        )
+    if use_unicode is None:
+        use_unicode = (
+            is_tty
+            and term != "dumb"
+            and _stream_supports_unicode(stream)
+        )
+
+    styles = {
+        "header": "\033[1;36m",
+        "section": "\033[1;33m",
+        "key": "\033[36m",
+        "index": "\033[2;36m",
+    }
+
+    def colorize(text: str, style: str) -> str:
+        if not use_color:
+            return text
+        return f"{styles.get(style, '')}{text}\033[0m"
+
+    icons = {
+        "header": "⚙ " if use_unicode else "",
+        "file": "📄 " if use_unicode else "",
+        "defaults": "🧩 " if use_unicode else "",
+        "normalized": "🔧 " if use_unicode else "",
+    }
+    resolved_path = os.path.abspath(
+        os.path.expanduser(os.path.expandvars(config_path or ""))
+    )
+    source_state = (
+        "loaded and merged"
+        if resolved_path and os.path.isfile(resolved_path)
+        else "not found; using built-in defaults"
+    )
+    effective = _effective_config_for_view(cfg)
+
+    print(
+        colorize(
+            f"{icons['header']}Rust Watchdog v{__version__} "
+            "-- effective configuration",
+            "header",
+        ),
+        file=stream,
+    )
+    print(
+        f"{icons['file']}Config file: {resolved_path or '(none)'} "
+        f"({source_state})",
+        file=stream,
+    )
+    print(
+        f"{icons['defaults']}Built-in defaults: merged",
+        file=stream,
+    )
+    print(
+        f"{icons['normalized']}Runtime normalization: paths and recovery "
+        "toggles applied",
+        file=stream,
+    )
+    print("Environment variable values: not read", file=stream)
+
+    sections = {name: {} for name in _CONFIG_VIEW_SECTION_ORDER}
+    for key, value in effective.items():
+        sections[_config_view_section(key)][key] = value
+
+    for name in _CONFIG_VIEW_SECTION_ORDER:
+        values = sections[name]
+        if not values:
+            continue
+        rendered_values = (
+            values["alerts"]
+            if name == "Alerts" and set(values) == {"alerts"}
+            else values
+        )
+        print(file=stream)
+        print(colorize(f"[{name}]", "section"), file=stream)
+        for line in _config_tree_lines(
+            rendered_values,
+            indent=2,
+            colorize=colorize,
+        ):
+            print(line, file=stream)
+
 
 def acquire_lock(lock_path, fp=None):
     """
@@ -5845,6 +6132,16 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--version", action="store_true", help="print version and exit")
     ap.add_argument(
+        "--view-config",
+        "--viewconfig",
+        dest="view_config",
+        action="store_true",
+        help=(
+            "show the complete effective configuration after defaults, path "
+            "normalization, and recovery toggles; then exit"
+        ),
+    )
+    ap.add_argument(
         "--change-home-user",
         "--changeuser",
         dest="change_home_user",
@@ -5929,6 +6226,11 @@ def main():
         )
     )
     if config_edit_requested:
+        if args.view_config:
+            ap.error(
+                "--view-config cannot be combined with persistent "
+                "config-edit options"
+            )
         try:
             result = edit_config_file(
                 args.config,
@@ -5947,11 +6249,14 @@ def main():
 
     cfg = load_cfg(args.config)
     cfg = normalize_cfg_paths(cfg, args.config)
+    apply_recovery_toggles(cfg)
+
+    if args.view_config:
+        print_effective_config(cfg, args.config)
+        return
 
     global CFG_FOR_HINTS, STATUS_COORDINATOR
     CFG_FOR_HINTS = cfg
-    
-    apply_recovery_toggles(cfg)
 
     if args.forced_wipe_status:
         print_forced_wipe_status(cfg)

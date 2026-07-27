@@ -10,10 +10,14 @@ Scan an Oxide/uMod plugins directory for *.cs files and extract:
 - file size
 
 Usage:
+  python3 oxide_plugins_inventory.py
   python3 oxide_plugins_inventory.py /path/to/oxide/plugins
   python3 oxide_plugins_inventory.py /path/to/oxide/plugins --tsv
   python3 oxide_plugins_inventory.py /path/to/oxide/plugins --json
   python3 oxide_plugins_inventory.py /path/to/oxide/plugins --recursive
+
+With no directory argument, the default is:
+  $HOME/serverfiles/oxide/plugins
 """
 
 from __future__ import annotations
@@ -26,6 +30,9 @@ import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+DEFAULT_PLUGINS_DIR = Path.home() / "serverfiles" / "oxide" / "plugins"
 
 
 # Match C# normal string literal: " ... " with backslash escapes
@@ -205,17 +212,26 @@ def _print_tsv(rows: List[Dict[str, Any]]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("dir", nargs="?", default=".", help="plugins directory (default: .)")
+    ap.add_argument(
+        "dir",
+        nargs="?",
+        default=str(DEFAULT_PLUGINS_DIR),
+        help=f"plugins directory (default: {DEFAULT_PLUGINS_DIR})",
+    )
     ap.add_argument("--recursive", action="store_true", help="scan recursively")
     ap.add_argument("--json", dest="as_json", action="store_true", help="output JSON")
     ap.add_argument("--tsv", action="store_true", help="output TSV")
     args = ap.parse_args()
 
-    rows = scan_plugins(Path(args.dir).expanduser(), recursive=args.recursive)
+    plugins_dir = Path(args.dir).expanduser()
+    try:
+        rows = scan_plugins(plugins_dir, recursive=args.recursive)
+    except FileNotFoundError:
+        print(f"Plugin directory not found: {plugins_dir}", file=sys.stderr)
+        return 2
 
     if not rows:
-        p = str(Path(args.dir).expanduser())
-        print(f"No plugins found in directory: {p}")
+        print(f"No plugins found in directory: {plugins_dir}")
         return 0
 
     if args.as_json:

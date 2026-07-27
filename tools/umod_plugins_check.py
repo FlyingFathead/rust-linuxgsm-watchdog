@@ -6,6 +6,7 @@ Check local Oxide/uMod Rust plugins (*.cs) against uMod plugin JSON endpoints,
 with optional fallback to ChaosCode manifest for plugins that do not match uMod.
 
 Features:
+- defaults to $HOME/serverfiles/oxide/plugins
 - cache to disk (TTL)
 - proper 429 handling (Retry-After / X-Retry-After)
 - min interval throttling
@@ -33,6 +34,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+DEFAULT_PLUGINS_DIR = Path.home() / "serverfiles" / "oxide" / "plugins"
 
 # ------------------------------------------------------------
 # Import your inventory scanner (local source of truth)
@@ -392,7 +395,12 @@ def print_table(rows: List[Dict[str, Any]], *, use_color: bool) -> None:
 # ------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("plugins_dir", nargs="?", default=".", help="oxide/plugins directory (default: .)")
+    ap.add_argument(
+        "plugins_dir",
+        nargs="?",
+        default=str(DEFAULT_PLUGINS_DIR),
+        help=f"oxide/plugins directory (default: {DEFAULT_PLUGINS_DIR})",
+    )
     ap.add_argument("--recursive", action="store_true", help="scan recursively for *.cs")
     ap.add_argument("--cache", default=str(CACHE_FILE_DEFAULT), help=f"cache file (default: {CACHE_FILE_DEFAULT})")
     ap.add_argument("--cache-ttl", type=int, default=CACHE_TTL_SECONDS_DEFAULT, help="uMod cache TTL seconds")
@@ -424,7 +432,14 @@ def main() -> int:
     cache_path = Path(args.cache).expanduser()
     cache = load_cache(cache_path)
 
-    locals_ = scan_plugins(plugins_dir, recursive=bool(args.recursive))
+    try:
+        locals_ = scan_plugins(
+            plugins_dir,
+            recursive=bool(args.recursive),
+        )
+    except FileNotFoundError:
+        print(f"Plugin directory not found: {plugins_dir}", file=sys.stderr)
+        return 2
     if not locals_:
         print(f"No plugins found in directory: {plugins_dir}")
         return 0

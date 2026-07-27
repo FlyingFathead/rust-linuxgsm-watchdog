@@ -410,9 +410,10 @@ class ForcedWipeReminderTests(unittest.TestCase):
             lines,
             [
                 "Server last wiped: 2026-07-31 18:09:00 UTC "
-                "(manual record) "
+                "(manual record)",
                 "(5 days, 23 hours, 51 minutes ago)",
-                "Server last restarted: 2026-07-31 18:09:00 UTC "
+                "",
+                "Server last restarted: 2026-07-31 18:09:00 UTC",
                 "(5 days, 23 hours, 51 minutes ago)",
             ],
         )
@@ -433,6 +434,7 @@ class ForcedWipeReminderTests(unittest.TestCase):
             lines,
             [
                 "Server last wiped: unknown (no wipe timestamp recorded)",
+                "",
                 "Server last restarted: unknown "
                 "(no Rust process start timestamp recorded)",
             ],

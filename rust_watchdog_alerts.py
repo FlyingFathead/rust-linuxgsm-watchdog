@@ -78,9 +78,56 @@ DEFAULT_EVENT_BODIES = {
     "forced_wipe_due": "scheduled monthly wipe window has arrived without a recorded wipe",
 }
 
+DEFAULT_ALERT_CONFIG = {
+    "enabled": False,
+    "backends": [],
+    "state_path": "data/state/alerts_state.json",
+    "cooldown_seconds_default": 900,
+    "dedupe_seconds": 300,
+    "include_host": True,
+    "include_identity": True,
+    "app": "rust-linuxgsm-watchdog",
+    "version": "",
+    "status_footnote": {
+        "enabled": True,
+        "include_last_wipe": True,
+        "include_last_restart": True,
+        "unknown_wipe_text": "unknown (no wipe timestamp recorded)",
+        "unknown_restart_text":
+            "unknown (no Rust process start timestamp recorded)",
+    },
+    "emoji_by_event": DEFAULT_EMOJI_BY_EVENT,
+    "emoji_by_level": DEFAULT_EMOJI_BY_LEVEL,
+    "event_titles": DEFAULT_EVENT_TITLES,
+    "event_bodies": DEFAULT_EVENT_BODIES,
+    "telegram": {
+        "token_env": "RUST_WD_TELEGRAM_TOKEN",
+        "chat_ids_env": "RUST_WD_TELEGRAM_CHAT_IDS",
+        "parse_mode": "HTML",
+        "disable_web_preview": True,
+        "timeout_s": 8,
+        "preflight_getme": False,
+    },
+    "discord": {
+        "webhook_env": "RUST_WD_DISCORD_WEBHOOK",
+        "timeout_s": 8,
+    },
+    "cooldowns": {},
+}
+
 # ---------------------------------------
 # HELPERS
 # ---------------------------------------
+
+def _deep_merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_config(out[key], value)
+        else:
+            out[key] = value
+    return out
+
 
 def _normalize_level_map(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -90,6 +137,28 @@ def _normalize_level_map(d: Dict[str, Any]) -> Dict[str, Any]:
             kk = "WARNING"
         out[kk] = v
     return out
+
+
+def effective_alert_config(
+    root_cfg: Dict[str, Any],
+    *,
+    state_path: str = "data/state/alerts_state.json",
+) -> Dict[str, Any]:
+    """Return the complete alert configuration without starting any backend."""
+    defaults = _deep_merge_config({}, DEFAULT_ALERT_CONFIG)
+    defaults["state_path"] = state_path
+    configured = (
+        root_cfg.get("alerts", {})
+        if isinstance(root_cfg, dict)
+        and isinstance(root_cfg.get("alerts", {}), dict)
+        else {}
+    )
+    merged = _deep_merge_config(defaults, configured)
+    merged["emoji_by_level"] = _normalize_level_map(
+        merged.get("emoji_by_level", {}) or {}
+    )
+    return merged
+
 
 def _parse_int_list(s: str) -> List[int]:
     s = (s or "").strip()
@@ -294,7 +363,12 @@ class AlertManager:
         raw = alert.fields.get("_footnote_lines")
         if not isinstance(raw, (list, tuple)):
             return []
-        return [str(line).strip() for line in raw if str(line).strip()]
+        lines = [str(line).strip() for line in raw]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
 
     def __init__(
         self,
@@ -304,7 +378,10 @@ class AlertManager:
         log_fn=None,  # callable(level:str, msg:str)
     ):
         self.root_cfg = cfg if isinstance(cfg, dict) else {}
-        self.cfg = self.root_cfg.get("alerts", {}) if isinstance(self.root_cfg.get("alerts", {}), dict) else {}
+        self.cfg = effective_alert_config(
+            self.root_cfg,
+            state_path=state_path,
+        )
         self.log_fn = log_fn
 
         self.enabled = bool(self.cfg.get("enabled", False))
@@ -523,7 +600,10 @@ class AlertManager:
         footnotes = self._footnote_lines_for(alert)
         if footnotes:
             parts.append("")
-            parts.extend(f"<i>{html.escape(line)}</i>" for line in footnotes)
+            parts.extend(
+                f"<i>{html.escape(line)}</i>" if line else ""
+                for line in footnotes
+            )
 
         return "\n".join(parts)
 
@@ -568,7 +648,7 @@ class AlertManager:
                 # The existing Discord backend renders these as Markdown
                 # italics. A truly plain backend still gets a visibly separate
                 # footnote block.
-                parts.extend(f"*{line}*" for line in footnotes)
+                parts.extend(f"*{line}*" if line else "" for line in footnotes)
 
         return "\n".join(parts)
 
@@ -613,7 +693,7 @@ class AlertManager:
         footnotes = self._footnote_lines_for(alert)
         if footnotes:
             parts.append("")
-            parts.extend(f"_{esc(line)}_" for line in footnotes)
+            parts.extend(f"_{esc(line)}_" if line else "" for line in footnotes)
 
         return "\n".join(parts)
 

@@ -67,13 +67,15 @@ features such as `--test-rcon-say` and the SmoothRestarter bridge):
 - `tests/test_forced_wipe.py` -- forced-wipe schedule/state/lifecycle regression tests
 - `tests/test_alert_footnotes.py` -- Telegram HTML/Markdown footnote regression tests
 - `tests/test_config_edit.py` -- persistent config-editing and path-migration regression tests
+- `tests/test_view_config.py` -- effective-config rendering and safe-exit regression tests
+- `tests/test_plugin_tools.py` -- Oxide plugin-tool path-default regression tests
 
 The release version is declared once as `__version__` near the top of
 `rust_watchdog.py`. Every alert reads that runtime value and renders it in the
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.5) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.6) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -198,6 +200,26 @@ Run one loop iteration and exit:
 
 Do **not** run it inside `screen`/`tmux` if you want it to actually recover (LinuxGSM will tmuxception).
 
+### View the effective configuration
+
+Show the complete configuration the watchdog would use after merging built-in
+defaults, resolving configured paths, merging alert defaults, and applying the
+recovery-step toggles:
+
+```bash
+./rust_watchdog.py --config ./rust_watchdog.json --view-config
+```
+
+`--viewconfig` is accepted as a convenience alias. The command exits before
+opening logs, acquiring the watchdog lock, loading alert state, starting alert
+workers, sending notifications, checking systemd, probing RCON, or touching
+runtime state.
+
+Interactive terminals receive section colors and UTF-8 symbols when supported.
+Piped or redirected output is plain text, and setting `NO_COLOR` disables ANSI
+colors. Environment-variable values, including alert credentials, are not read
+or printed.
+
 ### Persistent config editing
 
 The shipped example keeps `rustserver` as the default Linux account. To migrate
@@ -286,6 +308,30 @@ starting the watchdog:
 ./rust_watchdog.py --config ./rust_watchdog.json \
   --change-home-user rustnewone \
   --set-forced-wipe-action full-wipe
+```
+
+### Oxide/uMod plugin tools
+
+Both plugin utilities now use the standard LinuxGSM Oxide plugin directory when
+no directory argument is supplied:
+
+```text
+$HOME/serverfiles/oxide/plugins
+```
+
+Run them from the repository without repeating that path:
+
+```bash
+python3 tools/oxide_plugins_inventory.py
+python3 tools/umod_plugins_check.py
+```
+
+Each script declares its own `DEFAULT_PLUGINS_DIR` near the imports. A positional
+directory still overrides the default for nonstandard installations:
+
+```bash
+python3 tools/oxide_plugins_inventory.py /srv/rust/oxide/plugins
+python3 tools/umod_plugins_check.py /srv/rust/oxide/plugins
 ```
 
 ### WebRCON test helpers
@@ -523,8 +569,11 @@ last_restart_source: rust-process-start
 Every normal watchdog alert receives a separate status footnote by default:
 
 ```text
-Server last wiped: 2026-08-06 18:23:00 UTC (RCON) (20 days, 3 hours, 12 minutes ago)
-Server last restarted: 2026-08-06 18:24:15 UTC (20 days, 3 hours, 10 minutes ago)
+Server last wiped: 2026-08-06 18:23:00 UTC (RCON)
+(20 days, 3 hours, 12 minutes ago)
+
+Server last restarted: 2026-08-06 18:24:15 UTC
+(20 days, 3 hours, 10 minutes ago)
 ```
 
 The wipe line identifies the source actually used: `(RCON)` for
@@ -544,6 +593,7 @@ mtime or Steam build time:
 
 ```text
 Server last wiped: unknown (no wipe timestamp recorded)
+
 Server last restarted: unknown (no Rust process start timestamp recorded)
 ```
 
@@ -815,6 +865,15 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.6
+  **Fixed / Added:**
+  - Added `--view-config` with the `--viewconfig` alias for a complete, human-readable effective configuration.
+  - The view merges watchdog and alert defaults, resolves paths, applies recovery toggles, and exits before runtime side effects.
+  - Added automatic ANSI colors and UTF-8 symbols for capable interactive terminals, with plain redirected output and `NO_COLOR` support.
+  - Split wipe/restart alert ages onto their own lines and added a blank line between the two status blocks.
+  - Changed both Oxide/uMod plugin tools to default to `$HOME/serverfiles/oxide/plugins`.
+  - Kept an explicit `DEFAULT_PLUGINS_DIR` in each tool and retained positional path overrides.
+  - Added config-view, alert-rendering, and plugin-tool regression coverage.
 - v0.4.5
   **Fixed / Added:**
   - Added default-on reconciliation of the last map-wipe timestamp from authenticated WebRCON `serverinfo.SaveCreatedTime`.

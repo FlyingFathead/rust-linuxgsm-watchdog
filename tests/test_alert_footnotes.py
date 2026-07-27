@@ -26,9 +26,9 @@ class AlertFootnoteRenderTests(unittest.TestCase):
             text="server looks healthy",
             fields={
                 "_footnote_lines": [
-                    "Server last wiped: 2026-07-31 18:09:00 UTC "
-                    "(RCON) "
+                    "Server last wiped: 2026-07-31 18:09:00 UTC (RCON)",
                     "(5 days, 23 hours, 51 minutes ago)",
+                    "",
                     "Server last restarted: unknown "
                     "(no Rust process start timestamp recorded)",
                 ]
@@ -40,20 +40,21 @@ class AlertFootnoteRenderTests(unittest.TestCase):
         rendered = self.manager._render_html(self.alert)
         self.assertIn(
             "\n\n<i>Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON) "
-            "(5 days, 23 hours, 51 minutes ago)</i>\n"
+            "(RCON)</i>\n"
+            "<i>(5 days, 23 hours, 51 minutes ago)</i>\n\n"
             "<i>Server last restarted: unknown "
             "(no Rust process start timestamp recorded)</i>",
             rendered,
         )
+        self.assertNotIn("<i></i>", rendered)
         self.assertNotIn("_footnote_lines=", rendered)
 
     def test_existing_discord_renderer_uses_markdown_italics(self):
         rendered = self.manager._render_plain(self.alert)
         self.assertIn(
             "\n\n*Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON) "
-            "(5 days, 23 hours, 51 minutes ago)*\n"
+            "(RCON)*\n"
+            "*(5 days, 23 hours, 51 minutes ago)*\n\n"
             "*Server last restarted: unknown "
             "(no Rust process start timestamp recorded)*",
             rendered,
@@ -66,8 +67,10 @@ class AlertFootnoteRenderTests(unittest.TestCase):
         )
         self.assertIn(
             "\n\n_Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON) "
-            "(5 days, 23 hours, 51 minutes ago)_",
+            "(RCON)_\n"
+            "_(5 days, 23 hours, 51 minutes ago)_\n\n"
+            "_Server last restarted: unknown "
+            "(no Rust process start timestamp recorded)_",
             rendered,
         )
 
