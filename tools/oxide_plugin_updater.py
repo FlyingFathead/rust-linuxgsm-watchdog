@@ -922,8 +922,14 @@ class ActivitySpinner:
 
     FRAMES = ("\\", "|", "/", "-")
 
-    def __init__(self, message: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        message_on_own_line: bool = False,
+    ):
         self.message = message
+        self.message_on_own_line = bool(message_on_own_line)
         self.enabled = bool(
             _ACTIVITY_SPINNER_ENABLED and sys.stderr.isatty()
         )
@@ -932,8 +938,9 @@ class ActivitySpinner:
 
     def _draw(self, index: int) -> None:
         frame = self.FRAMES[index % len(self.FRAMES)]
+        suffix = "" if self.message_on_own_line else f" {self.message}"
         print(
-            f"\r{frame} {self.message}",
+            f"\r{frame}{suffix}",
             end="",
             file=sys.stderr,
             flush=True,
@@ -947,6 +954,8 @@ class ActivitySpinner:
 
     def __enter__(self):
         if self.enabled:
+            if self.message_on_own_line:
+                print(self.message, file=sys.stderr, flush=True)
             self._draw(0)
             self._thread = threading.Thread(
                 target=self._run,
@@ -2338,11 +2347,14 @@ def reload_updated_plugins(
         if loaded_author:
             target_description += f" by {loaded_author}"
         spinner_message = (
-            f"[{index:>{len(str(len(requested)))}}/{len(requested)}] "
+            f"  [{index:>{len(str(len(requested)))}}/{len(requested)}] "
             f"Verifying {target_description} ({command})"
         )
         try:
-            with ActivitySpinner(spinner_message):
+            with ActivitySpinner(
+                spinner_message,
+                message_on_own_line=True,
+            ):
                 ok, response = watchdog.rcon_send(
                     cfg,
                     command,
