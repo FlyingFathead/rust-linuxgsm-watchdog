@@ -80,7 +80,7 @@ CHAOS_CACHE_TTL_SECONDS_DEFAULT = 45 * 60  # manifest updates ~31m; keep a littl
 MAX_PLUGIN_BYTES = 10 * 1024 * 1024
 SHRINK_WARN_PERCENT = 25.0
 SHRINK_REFUSE_PERCENT = 50.0
-RCON_RELOAD_COMMAND = "oxide.reload <updated-plugin>"
+RCON_ACTIVATION_COMMAND = "oxide.load|oxide.reload <updated-plugin>"
 _ACTIVITY_SPINNER_ENABLED = True
 _NETWORK_AUDIT = None
 
@@ -759,6 +759,7 @@ def record_reload_state(
     detail: str,
     updated_plugins: int,
     limit: int,
+    activations: Optional[List[Dict[str, str]]] = None,
 ) -> None:
     records = state.setdefault("reload_history", [])
     if not isinstance(records, list):
@@ -770,13 +771,54 @@ def record_reload_state(
             "at": dt.datetime.now().astimezone().isoformat(
                 timespec="seconds"
             ),
-            "command": RCON_RELOAD_COMMAND,
+            "command": RCON_ACTIVATION_COMMAND,
             "result": result,
             "detail": detail,
             "updated_plugins": updated_plugins,
+            "activations": list(activations or []),
         },
         limit,
     )
+
+
+def record_revalidated_source(
+    state: Dict[str, Any],
+    *,
+    key: str,
+    candidate: UpdateCandidate,
+    validation: DownloadValidation,
+    download_url: str,
+    history_limit: int,
+) -> None:
+    """Record a forced pristine-source check which required no replacement."""
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    plugins = state.setdefault("plugins", {})
+    entry = plugins.setdefault(key, {})
+    history = entry.setdefault("history", [])
+    if not isinstance(history, list):
+        history = []
+        entry["history"] = history
+    _append_limited(
+        history,
+        {
+            "event": "source_revalidated",
+            "at": now,
+            "source": "umod",
+            "version": candidate.remote_version,
+            "size_bytes": validation.new_size,
+            "sha256": validation.new_sha256,
+            "download_url": download_url,
+        },
+        history_limit,
+    )
+    entry["current"] = {
+        "version": candidate.local_version,
+        "sha256": validation.old_sha256,
+        "size_bytes": validation.old_size,
+        "mtime": now,
+    }
+    entry["last_check_status"] = "OK"
+    entry["active_outdated"] = None
 
 # ------------------------------------------------------------
 # HTTP with 429 handling + rate-limit headers
@@ -816,6 +858,15 @@ class DownloadValidation:
     new_size: int
     old_sha256: str
     new_sha256: str
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    success: bool
+    source_changed: bool = False
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 class AuditLogger:
@@ -1615,6 +1666,7 @@ def validate_plugin_download(
     allow_large_shrink: bool,
     shrink_warn_percent: float = SHRINK_WARN_PERCENT,
     shrink_refuse_percent: float = SHRINK_REFUSE_PERCENT,
+    force_reinstall: bool = False,
 ) -> DownloadValidation:
     """Validate transport, identity, metadata, version, and basic C# structure."""
     errors: List[str] = []
@@ -1670,10 +1722,25 @@ def validate_plugin_download(
                 f"version mismatch: uMod reports {candidate.remote_version}, "
                 f"download contains {candidate_version or '-'}"
             )
-        if version_is_newer(candidate_version, candidate.local_version) is not True:
+        definitely_newer = (
+            version_is_newer(candidate_version, candidate.local_version)
+            is True
+        )
+        if force_reinstall:
+            if (
+                candidate_version != candidate.local_version
+                and not definitely_newer
+            ):
+                errors.append(
+                    f"downloaded version {candidate_version or '-'} is neither "
+                    f"the installed version {candidate.local_version} nor "
+                    "definitely newer"
+                )
+        elif not definitely_newer:
             errors.append(
-                f"downloaded version {candidate_version or '-'} is not definitely newer "
-                f"than installed version {candidate.local_version}"
+                f"downloaded version {candidate_version or '-'} is not "
+                f"definitely newer than installed version "
+                f"{candidate.local_version}"
             )
 
         if not re.search(r"\bnamespace\s+Oxide\.Plugins\b", text):
@@ -1697,7 +1764,7 @@ def validate_plugin_download(
                 "review it and use --allow-large-shrink only if intentional"
             )
 
-    if installed == downloaded:
+    if installed == downloaded and not force_reinstall:
         errors.append("download is byte-for-byte identical to the installed file")
 
     return DownloadValidation(
@@ -1733,7 +1800,8 @@ def install_update(
     package_state: Optional[Dict[str, Any]] = None,
     state_history_limit: int = 50,
     max_interval_s: Optional[float] = None,
-) -> bool:
+    force_reinstall: bool = False,
+) -> InstallResult:
     print(
         color_text(
             f"{candidate.filename}: {candidate.local_version} -> {candidate.remote_version}",
@@ -1790,7 +1858,7 @@ def install_update(
                 result="refused",
                 reason=str(e),
             )
-        return False
+        return InstallResult(False)
 
     try:
         response = http_get_bytes(
@@ -1817,7 +1885,7 @@ def install_update(
                 result="download_failed",
                 reason=str(e),
             )
-        return False
+        return InstallResult(False)
 
     validation = validate_plugin_download(
         candidate,
@@ -1828,6 +1896,7 @@ def install_update(
         allow_large_shrink=allow_large_shrink,
         shrink_warn_percent=shrink_warn_percent,
         shrink_refuse_percent=shrink_refuse_percent,
+        force_reinstall=force_reinstall,
     )
     size_delta = validation.new_size - validation.old_size
     size_percent = (
@@ -1863,7 +1932,7 @@ def install_update(
                 new_sha256=validation.new_sha256,
                 download_url=response.final_url,
             )
-        return False
+        return InstallResult(False)
     print(
         color_text(
             "  Source validation: OK (Oxide compile not tested)",
@@ -1871,6 +1940,41 @@ def install_update(
             use=use_color,
         )
     )
+
+    if installed == response.data:
+        print(
+            color_text(
+                "  Installed source is already byte-for-byte identical; "
+                "leaving the file unchanged.",
+                "green",
+                use=use_color,
+            )
+        )
+        if package_state is not None:
+            record_revalidated_source(
+                package_state,
+                key=relative.as_posix(),
+                candidate=candidate,
+                validation=validation,
+                download_url=response.final_url,
+                history_limit=state_history_limit,
+            )
+        if audit:
+            audit.write(
+                "plugin_update",
+                plugin=candidate.filename,
+                source="umod",
+                installed_path=str(candidate.path),
+                local_version=candidate.local_version,
+                remote_version=candidate.remote_version,
+                result="identical_source_revalidated",
+                old_size=validation.old_size,
+                new_size=validation.new_size,
+                old_sha256=validation.old_sha256,
+                new_sha256=validation.new_sha256,
+                download_url=response.final_url,
+            )
+        return InstallResult(True, source_changed=False)
 
     safe_plugin = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(relative).stem)
     safe_version = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate.local_version)
@@ -1923,7 +2027,7 @@ def install_update(
                 old_sha256=validation.old_sha256,
                 new_sha256=validation.new_sha256,
             )
-        return False
+        return InstallResult(False)
 
     print(f"  Backup: {backup_path}")
     print(color_text("  Updated: YES", "green", use=use_color, bold=True))
@@ -1953,7 +2057,7 @@ def install_update(
             warnings=validation.warnings,
             download_url=response.final_url,
         )
-    return True
+    return InstallResult(True, source_changed=True)
 
 
 def _rcon_response_text(watchdog: Any, response: Any) -> str:
@@ -1979,13 +2083,56 @@ def _reload_compile_failure(text: str) -> str:
     return ""
 
 
+def _inventory_lines_for_plugin(
+    inventory_text: str,
+    filename: str,
+) -> List[str]:
+    """Find only exact Oxide inventory lines for one plugin filename."""
+    plugin_filename = Path(filename).name
+    plugin_name = Path(plugin_filename).stem
+    filename_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_.-]){re.escape(plugin_filename)}"
+        rf"(?![A-Za-z0-9_.-])",
+        re.IGNORECASE,
+    )
+    failed_pattern = re.compile(
+        rf"^\s*(?:\d+\s+)?{re.escape(plugin_name)}(?:\.cs)?"
+        rf"\s+-\s+failed to compile\b",
+        re.IGNORECASE,
+    )
+    return [
+        line
+        for line in str(inventory_text or "").splitlines()
+        if filename_pattern.search(line) or failed_pattern.search(line)
+    ]
+
+
+def _inventory_line_has_version(line: str, expected_version: str) -> bool:
+    """Match an exact inventory version token, not a numeric substring."""
+    official = re.match(
+        r'^\s*\d+\s+(?:"[^"]*"|\S+)\s+\(([^()]+)\)',
+        line,
+    )
+    if official:
+        return official.group(1).strip().casefold() == expected_version.casefold()
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(expected_version)}"
+            rf"(?![A-Za-z0-9_.-])",
+            line,
+            re.IGNORECASE,
+        )
+    )
+
+
 def reload_updated_plugins(
     rcon_config: Dict[str, Any],
     plugins: Optional[List[Tuple[str, str]]] = None,
     *,
     progress: Optional[Any] = None,
+    activation_records: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[bool, str]:
-    """Reload updated plugins individually and verify the resulting inventory."""
+    """Activate updated plugins individually and verify the resulting inventory."""
     password = str(rcon_config.get("password") or "")
     password_environment_variable = str(
         rcon_config.get("password_environment_variable") or ""
@@ -2014,83 +2161,162 @@ def reload_updated_plugins(
     }
     requested = list(plugins or [])
     if not requested:
-        return False, "no updated plugins were supplied for reload"
+        return False, "no plugins were supplied for activation"
+
+    try:
+        inventory_ok, inventory_response = watchdog.rcon_send(
+            cfg,
+            "oxide.plugins",
+        )
+        inventory_before = _rcon_response_text(watchdog, inventory_response)
+    except Exception as e:
+        inventory_ok = False
+        inventory_before = f"oxide.plugins raised an exception: {e}"
+    if not inventory_ok:
+        return False, (
+            "cannot determine current plugin state before activation: "
+            + (inventory_before or "no response")
+        )
 
     failures: List[str] = []
+    activation_failed = set()
+
+    def update_activation_record(
+        filename: str,
+        status: str,
+        detail: str,
+    ) -> None:
+        if activation_records is None:
+            return
+        for record in reversed(activation_records):
+            if record.get("plugin") == filename:
+                record["status"] = status
+                record["response"] = detail
+                return
+
     for index, (filename, _expected_version) in enumerate(requested, start=1):
         plugin_name = Path(filename).stem
-        command = f"oxide.reload {plugin_name}"
+        matching_lines = _inventory_lines_for_plugin(
+            inventory_before,
+            filename,
+        )
+        currently_loaded = bool(matching_lines) and not any(
+            re.search(r"\bfailed to compile\b", line, re.IGNORECASE)
+            for line in matching_lines
+        )
+        action = "reload" if currently_loaded else "load"
+        command = f"oxide.{action} {plugin_name}"
         try:
             ok, response = watchdog.rcon_send(cfg, command)
         except Exception as e:
-            ok, response = False, f"RCON reload raised an exception: {e}"
+            ok, response = False, f"RCON {action} raised an exception: {e}"
         response_text = _rcon_response_text(watchdog, response)
         compile_failure = _reload_compile_failure(response_text)
         if not ok:
             status = "RCON FAILED"
             detail = response_text or "no response"
             failures.append(f"{filename}: {detail}")
+            activation_failed.add(filename)
         elif compile_failure:
             status = "FAILED TO COMPILE"
             detail = compile_failure
             failures.append(f"{filename}: {compile_failure}")
+            activation_failed.add(filename)
         else:
             status = "OK"
             detail = response_text
+        if activation_records is not None:
+            activation_records.append(
+                {
+                    "plugin": filename,
+                    "command": command,
+                    "status": status,
+                    "response": detail,
+                }
+            )
         if progress:
             progress(index, len(requested), filename, status, detail)
 
     inventory_ok = False
     inventory_text = ""
-    if not failures:
-        try:
-            inventory_ok, inventory_response = watchdog.rcon_send(
-                cfg,
-                "oxide.plugins",
-            )
-            inventory_text = _rcon_response_text(
-                watchdog,
-                inventory_response,
-            )
-        except Exception as e:
-            inventory_text = f"oxide.plugins raised an exception: {e}"
+    try:
+        inventory_ok, inventory_response = watchdog.rcon_send(
+            cfg,
+            "oxide.plugins",
+        )
+        inventory_text = _rcon_response_text(
+            watchdog,
+            inventory_response,
+        )
+    except Exception as e:
+        inventory_text = f"oxide.plugins raised an exception: {e}"
 
-        if not inventory_ok:
-            failures.append(
-                "final oxide.plugins verification failed: "
-                + (inventory_text or "no response")
+    if not inventory_ok:
+        detail = (
+            "final oxide.plugins verification failed: "
+            + (inventory_text or "no response")
+        )
+        failures.append(detail)
+        for filename, _expected_version in requested:
+            if filename not in activation_failed:
+                update_activation_record(filename, "VERIFY FAILED", detail)
+    else:
+        for filename, expected_version in requested:
+            if filename in activation_failed:
+                continue
+            matching_lines = _inventory_lines_for_plugin(
+                inventory_text,
+                filename,
             )
-        else:
-            inventory_lines = inventory_text.splitlines()
-            for filename, expected_version in requested:
-                plugin_name = Path(filename).stem
-                matching_lines = [
-                    line
-                    for line in inventory_lines
-                    if plugin_name.casefold() in line.casefold()
-                ]
-                if not matching_lines:
-                    failures.append(
-                        f"{filename}: not listed by oxide.plugins after reload"
+            if not matching_lines:
+                detail = (
+                    f"{filename}: not listed by oxide.plugins after activation"
+                )
+                failures.append(detail)
+                update_activation_record(filename, "VERIFY FAILED", detail)
+            elif any(
+                re.search(
+                    r"\bfailed to compile\b",
+                    line,
+                    re.IGNORECASE,
+                )
+                for line in matching_lines
+            ):
+                detail = next(
+                    line.strip()
+                    for line in matching_lines
+                    if re.search(
+                        r"\bfailed to compile\b",
+                        line,
+                        re.IGNORECASE,
                     )
-                elif (
-                    expected_version
-                    and expected_version != "-"
-                    and not any(
-                        expected_version.casefold() in line.casefold()
-                        for line in matching_lines
-                    )
-                ):
-                    failures.append(
-                        f"{filename}: expected version {expected_version} "
-                        "not found in oxide.plugins"
-                    )
+                )
+                failures.append(f"{filename}: {detail}")
+                update_activation_record(
+                    filename,
+                    "FAILED TO COMPILE",
+                    detail,
+                )
+            elif (
+                expected_version
+                and expected_version != "-"
+                and not any(
+                    _inventory_line_has_version(line, expected_version)
+                    for line in matching_lines
+                )
+            ):
+                detail = (
+                    f"{filename}: expected version {expected_version} "
+                    "not found in oxide.plugins"
+                )
+                failures.append(detail)
+                update_activation_record(filename, "VERIFY FAILED", detail)
 
     if failures:
         return False, "\n".join(failures)
     return True, (
         f"{len(requested)} plugin"
-        f"{'' if len(requested) == 1 else 's'} reloaded and verified"
+        f"{'' if len(requested) == 1 else 's'} activated and verified"
     )
 
 
@@ -2181,7 +2407,7 @@ def main(
             if legacy_check_only
             else
             "Oxide Plugin Updater: check, validate, archive, install, and "
-            "optionally reload Rust Oxide/uMod plugins."
+            "optionally activate Rust Oxide/uMod plugins."
         )
     )
     ap.add_argument(
@@ -2333,6 +2559,41 @@ def main(
         ),
     )
     ap.add_argument(
+        "--update-plugin",
+        metavar="NAME",
+        help=argparse.SUPPRESS if legacy_check_only else (
+            "check and update exactly one installed plugin; accepts the "
+            "filename with or without its .cs extension"
+        ),
+    )
+    ap.add_argument(
+        "--verify-plugin",
+        metavar="NAME",
+        help=argparse.SUPPRESS if legacy_check_only else (
+            "compile/load-verify exactly one installed plugin without "
+            "checking or downloading updates"
+        ),
+    )
+    ap.add_argument(
+        "--verify-all-plugins",
+        "--verify-all",
+        dest="verify_all_plugins",
+        action="store_true",
+        help=argparse.SUPPRESS if legacy_check_only else (
+            "compile/load-verify every scanned plugin sequentially without "
+            "using a wildcard command"
+        ),
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help=argparse.SUPPRESS if legacy_check_only else (
+            "with --update-plugin, bypass metadata cache, re-download the "
+            "current upstream source, and force targeted activation even "
+            "when the version or bytes are unchanged"
+        ),
+    )
+    ap.add_argument(
         "--backup-dir",
         default=str(configured_backup_dir),
         help=argparse.SUPPRESS if legacy_check_only else (
@@ -2356,8 +2617,8 @@ def main(
             ),
             action=argparse.BooleanOptionalAction,
             help=argparse.SUPPRESS if legacy_check_only else (
-                "reload each updated plugin via RCON, detect compile failures, "
-                "and verify oxide.plugins (configured default: enabled)"
+                "load or reload each processed plugin via RCON, detect compile "
+                "failures, and verify oxide.plugins (configured default: enabled)"
             ),
         )
     except AttributeError:
@@ -2397,6 +2658,27 @@ def main(
         help="do not read or write persistent plugin package state",
     )
     args = ap.parse_args(argv)
+
+    selected_modes = sum(
+        (
+            bool(args.update),
+            bool(args.update_plugin),
+            bool(args.verify_plugin),
+            bool(args.verify_all_plugins),
+        )
+    )
+    if selected_modes > 1:
+        ap.error(
+            "--update, --update-plugin, --verify-plugin, and "
+            "--verify-all-plugins are mutually exclusive"
+        )
+    verify_mode = bool(args.verify_plugin or args.verify_all_plugins)
+    if args.update_plugin:
+        args.update = True
+    if args.force and not args.update_plugin:
+        ap.error("--force requires --update-plugin")
+    if args.force:
+        args.override_cache = True
 
     configured_min_interval = float(
         network_config.get("minimum_interval_seconds", 1.5)
@@ -2449,10 +2731,16 @@ def main(
             ap.error(
                 "--set-plugins-directory cannot be combined with --no-config"
             )
-        if args.update or args.as_json or args.view_config:
+        if (
+            args.update
+            or args.update_plugin
+            or verify_mode
+            or args.as_json
+            or args.view_config
+        ):
             ap.error(
                 "--set-plugins-directory cannot be combined with "
-                "--update, --json, or --view-config"
+                "update/verify modes, --json, or --view-config"
             )
         try:
             result = set_plugins_directory_config(
@@ -2466,8 +2754,10 @@ def main(
         return 0
 
     if args.view_config:
-        if args.update:
-            ap.error("--view-config cannot be combined with --update")
+        if args.update or verify_mode:
+            ap.error(
+                "--view-config cannot be combined with update/verify modes"
+            )
         print_effective_updater_config(
             config,
             config_path,
@@ -2475,11 +2765,11 @@ def main(
         )
         return 0
 
-    if args.as_json and args.update:
-        ap.error("--json and --update cannot be used together")
+    if args.as_json and (args.update or verify_mode):
+        ap.error("--json cannot be combined with update/verify modes")
     if args.allow_large_shrink and not args.update:
         ap.error("--allow-large-shrink requires --update")
-    if legacy_check_only and args.update:
+    if legacy_check_only and (args.update or verify_mode):
         command = update_command_hint(
             Path(args.plugins_dir).expanduser(),
             recursive=bool(args.recursive),
@@ -2522,7 +2812,13 @@ def main(
     _NETWORK_AUDIT = audit
     audit.write(
         "run_started",
-        mode="update" if args.update else "check",
+        mode=(
+            "verify"
+            if verify_mode
+            else "update"
+            if args.update
+            else "check"
+        ),
         program=(
             "umod_plugins_check"
             if legacy_check_only
@@ -2538,12 +2834,12 @@ def main(
     cache = load_cache(cache_path)
     if args.override_cache:
         print(
-            "Cache override enabled: fetching fresh uMod and ChaosCode "
-            "results; refreshed results will still be cached.",
+            "Cache override enabled: fetching fresh upstream results as "
+            "needed; refreshed results will still be cached.",
             file=sys.stderr,
         )
     package_state: Optional[Dict[str, Any]] = None
-    if state_enabled:
+    if state_enabled and not verify_mode:
         try:
             package_state = load_plugin_state(state_path)
         except ValueError as e:
@@ -2569,8 +2865,178 @@ def main(
         audit.write("check_summary", total=0, outdated=0, auto_updateable=0)
         return 0
 
+    requested_single_plugin = args.update_plugin or args.verify_plugin
+    if requested_single_plugin:
+        requested_name = Path(str(requested_single_plugin)).name
+        if requested_name.casefold().endswith(".cs"):
+            requested_name = requested_name[:-3]
+        matches = [
+            plugin
+            for plugin in locals_
+            if Path(str(plugin.get("filename") or "")).stem.casefold()
+            == requested_name.casefold()
+        ]
+        if not matches:
+            print(
+                f"Plugin not found: {requested_single_plugin}",
+                file=sys.stderr,
+            )
+            return 2
+        if len(matches) != 1:
+            paths = ", ".join(
+                str(plugin.get("file") or plugin.get("filename") or "-")
+                for plugin in matches
+            )
+            print(
+                f"Plugin name is ambiguous: "
+                f"{requested_single_plugin} ({paths})",
+                file=sys.stderr,
+            )
+            return 2
+        locals_ = matches
+
     show_progress = args.progress or (sys.stderr.isatty() and not args.no_progress)
     use_color = want_color(args.color)
+
+    if verify_mode:
+        plugins_to_verify = [
+            (
+                str(plugin.get("filename") or ""),
+                str(plugin.get("version") or "-"),
+            )
+            for plugin in locals_
+        ]
+        activation_records: List[Dict[str, str]] = []
+        print(
+            color_text(
+                f"Verifying {len(plugins_to_verify)} "
+                f"{'plugin' if len(plugins_to_verify) == 1 else 'plugins'} "
+                "sequentially via targeted Oxide commands:",
+                "cyan",
+                use=use_color,
+                bold=True,
+            )
+        )
+
+        def show_verify_progress(
+            index: int,
+            total: int,
+            filename: str,
+            status: str,
+            detail: str,
+        ) -> None:
+            status_color = "green" if status == "OK" else "red"
+            command = (
+                activation_records[-1].get("command", "")
+                if activation_records
+                else ""
+            )
+            print(
+                f"  [{index:>{len(str(total))}}/{total}] "
+                f"{filename} -- "
+                + color_text(
+                    status,
+                    status_color,
+                    use=use_color,
+                    bold=status != "OK",
+                )
+                + (f" ({command})" if command else "")
+            )
+            if status != "OK" and detail:
+                print(f"      {detail}")
+
+        verify_succeeded, verify_detail = reload_updated_plugins(
+            rcon_config,
+            plugins_to_verify,
+            progress=show_verify_progress,
+            activation_records=activation_records,
+        )
+        total_plugins = len(plugins_to_verify)
+        compiled_ok = sum(
+            record.get("status") == "OK"
+            for record in activation_records
+        )
+        compile_failures = [
+            record
+            for record in activation_records
+            if record.get("status") == "FAILED TO COMPILE"
+        ]
+        other_failures = [
+            record
+            for record in activation_records
+            if record.get("status") not in {"OK", "FAILED TO COMPILE"}
+        ]
+        unrecorded = max(0, total_plugins - len(activation_records))
+
+        print()
+        print(terminal_rule())
+        print(
+            color_text(
+                "Plugin verification summary:",
+                "cyan",
+                use=use_color,
+                bold=True,
+            )
+        )
+        print(
+            color_text(
+                f"{compiled_ok} out of {total_plugins} "
+                f"{'plugin' if total_plugins == 1 else 'plugins'} "
+                "compiled/loaded successfully.",
+                "green" if compiled_ok == total_plugins else "yellow",
+                use=use_color,
+                bold=True,
+            )
+        )
+        print(
+            color_text(
+                f"{len(compile_failures)} "
+                f"{'plugin' if len(compile_failures) == 1 else 'plugins'} "
+                "failed to compile.",
+                "red" if compile_failures else "green",
+                use=use_color,
+                bold=bool(compile_failures),
+            )
+        )
+        could_not_verify = len(other_failures) + unrecorded
+        if could_not_verify:
+            print(
+                color_text(
+                    f"{could_not_verify} "
+                    f"{'plugin could' if could_not_verify == 1 else 'plugins could'} "
+                    "not be verified.",
+                    "red",
+                    use=use_color,
+                    bold=True,
+                )
+            )
+
+        failed_records = compile_failures + other_failures
+        if failed_records:
+            print("Failures:")
+            for record in failed_records:
+                plugin = record.get("plugin") or "-"
+                status = record.get("status") or "FAILED"
+                command = record.get("command") or "-"
+                response = record.get("response") or "no response"
+                print(f"  {plugin} -- {status}")
+                print(f"    Command: {command}")
+                print(f"    Error: {response}")
+        if unrecorded and verify_detail:
+            print("Verification error:")
+            print(f"  {verify_detail}")
+        print(terminal_rule())
+        audit.write(
+            "plugins_verify",
+            result="ok" if verify_succeeded else "failed",
+            response=verify_detail,
+            verified_plugins=len(plugins_to_verify),
+            compiled_loaded_ok=compiled_ok,
+            failed_to_compile=len(compile_failures),
+            could_not_verify=could_not_verify,
+            activations=activation_records,
+        )
+        return 0 if verify_succeeded else 2
 
     check_chaos = bool(getattr(args, "check_chaos", True))
     # older-python fallback parsing if both flags exist
@@ -2580,7 +3046,14 @@ def main(
     chaos_index: Dict[str, Dict[str, Any]] = {}
     chaos_load_err: Optional[str] = None
     chaos_manifest_cached = False
-    if check_chaos:
+    chaos_manifest_checked = False
+
+    def ensure_chaos_manifest() -> None:
+        nonlocal chaos_index, chaos_load_err
+        nonlocal chaos_manifest_cached, chaos_manifest_checked
+        if not check_chaos or chaos_manifest_checked:
+            return
+        chaos_manifest_checked = True
         chaos_ent = cache.get("chaos:manifest")
         if isinstance(chaos_ent, dict) and not args.override_cache:
             chaos_ts = int(chaos_ent.get("ts", 0) or 0)
@@ -2605,6 +3078,11 @@ def main(
         except Exception as e:
             chaos_load_err = str(e)
             chaos_index = {}
+
+    # A targeted uMod hit does not need the global ChaosCode manifest. Defer
+    # that request until the selected plugin actually needs the fallback.
+    if check_chaos and not args.update_plugin:
+        ensure_chaos_manifest()
 
     hdr = f"Found {len(locals_)} plugins in {plugins_dir} -- checking uMod"
     if check_chaos:
@@ -2739,6 +3217,12 @@ def main(
                 any_unknown = True
 
         # If uMod failed/unknown and chaos enabled -> Chaos fallback
+        if (
+            (not status or status.startswith("UNKNOWN"))
+            and check_chaos
+            and not status.startswith("ERROR")
+        ):
+            ensure_chaos_manifest()
         if (not status or status.startswith("UNKNOWN")) and check_chaos and chaos_index and (not status.startswith("ERROR")):
             rr = chaos_index.get(stem_l)
             if isinstance(rr, dict):
@@ -2802,10 +3286,18 @@ def main(
                 known_unconfirmed.append(filename)
 
         if (
-            status == "OUTDATED"
+            (status == "OUTDATED" or (
+                bool(args.force)
+                and source == "umod"
+                and isinstance(data, dict)
+                and remote_ver not in ("", "-")
+            ))
             and source == "umod"
             and isinstance(data, dict)
-            and version_is_newer(remote_ver, local_ver) is True
+            and (
+                bool(args.force)
+                or version_is_newer(remote_ver, local_ver) is True
+            )
         ):
             try:
                 update_candidates.append(
@@ -2873,6 +3365,8 @@ def main(
 
     update_failures = 0
     update_successes = 0
+    source_updates = 0
+    source_revalidations = 0
     updated_filenames = set()
     updated_plugins_for_reload: List[Tuple[str, str]] = []
     failed_filenames = set()
@@ -2884,7 +3378,7 @@ def main(
         print(terminal_rule())
         print(
             color_text(
-                f"Updating {len(update_candidates)} eligible uMod "
+                f"Processing {len(update_candidates)} eligible uMod "
                 f"{'plugin' if len(update_candidates) == 1 else 'plugins'}:",
                 "yellow",
                 use=use_color,
@@ -2939,9 +3433,14 @@ def main(
                 max_interval_s=float(args.max_interval),
                 package_state=package_state,
                 state_history_limit=history_limit,
+                force_reinstall=bool(args.force),
             )
             if installed_ok:
                 update_successes += 1
+                if getattr(installed_ok, "source_changed", True):
+                    source_updates += 1
+                else:
+                    source_revalidations += 1
                 updated_filenames.add(candidate.filename)
                 updated_plugins_for_reload.append(
                     (candidate.filename, candidate.remote_version)
@@ -2966,10 +3465,11 @@ def main(
 
         if update_successes and args.reload_plugins_after_updates:
             reload_attempted = True
+            activation_records: List[Dict[str, str]] = []
             print()
             print(
                 color_text(
-                    "Reloading updated plugins individually via RCON "
+                    "Activating processed plugins individually via RCON "
                     "and checking compile results:",
                     "cyan",
                     use=use_color,
@@ -3002,11 +3502,12 @@ def main(
                 rcon_config,
                 updated_plugins_for_reload,
                 progress=show_reload_progress,
+                activation_records=activation_records,
             )
             if reload_succeeded:
                 print(
                     color_text(
-                        "  Plugin reload: OK",
+                        "  Plugin activation: OK",
                         "green",
                         use=use_color,
                         bold=True,
@@ -3015,7 +3516,7 @@ def main(
             else:
                 print(
                     color_text(
-                        f"  Plugin reload: FAILED ({reload_detail})",
+                        f"  Plugin activation: FAILED ({reload_detail})",
                         "red",
                         use=use_color,
                         bold=True,
@@ -3023,7 +3524,9 @@ def main(
                 )
             audit.write(
                 "plugins_reload",
-                command=RCON_RELOAD_COMMAND,
+                operation="activation",
+                command=RCON_ACTIVATION_COMMAND,
+                activations=activation_records,
                 result="ok" if reload_succeeded else "failed",
                 response=reload_detail,
                 updated_plugins=update_successes,
@@ -3035,12 +3538,15 @@ def main(
                     detail=reload_detail,
                     updated_plugins=update_successes,
                     limit=reload_history_limit,
+                    activations=activation_records,
                 )
         elif update_successes:
             reload_detail = "disabled by configuration or CLI"
             audit.write(
                 "plugins_reload",
-                command=RCON_RELOAD_COMMAND,
+                operation="activation",
+                command=RCON_ACTIVATION_COMMAND,
+                activations=[],
                 result="deferred",
                 reason=reload_detail,
                 updated_plugins=update_successes,
@@ -3052,6 +3558,7 @@ def main(
                     detail=reload_detail,
                     updated_plugins=update_successes,
                     limit=reload_history_limit,
+                    activations=[],
                 )
 
         if package_state is not None and update_successes:
@@ -3085,13 +3592,24 @@ def main(
         )
         print(
             color_text(
-                f"{update_successes} "
-                f"{'plugin' if update_successes == 1 else 'plugins'} updated.",
+                f"{source_updates} plugin "
+                f"{'source' if source_updates == 1 else 'sources'} updated.",
                 "green",
                 use=use_color,
                 bold=True,
             )
         )
+        if source_revalidations:
+            print(
+                color_text(
+                    f"{source_revalidations} plugin "
+                    f"{'source was' if source_revalidations == 1 else 'sources were'} "
+                    "already identical and revalidated.",
+                    "green",
+                    use=use_color,
+                    bold=True,
+                )
+            )
         print(
             color_text(
                 f"{len(remaining_rows)} "
@@ -3140,27 +3658,32 @@ def main(
                 )
             )
         print(terminal_rule())
-        print(f"  Updated:       {update_successes}")
+        print(f"  Source updates:{source_updates:>3}")
+        if source_revalidations:
+            print(f"  Revalidated:   {source_revalidations:>3}")
         print(f"  Failed/refused:{update_failures:>3}")
         print(f"  Manual-only:   {manual_outdated}")
         print(f"  Unknown/error: {unknown_count}")
         if known_unconfirmed:
             print(f"  Known outdated, unconfirmed: {len(known_unconfirmed)}")
-        if update_successes:
+        if source_updates:
             print(f"  Backups:       {backup_root}")
         if reload_attempted:
             print(
-                "  Plugin reload: "
+                "  Plugin activation: "
                 + ("OK" if reload_succeeded else "FAILED")
             )
         elif update_successes:
-            print("  Plugin reload: deferred")
+            print("  Plugin activation: deferred")
         else:
-            print("  Plugin reload: not needed")
+            print("  Plugin activation: not needed")
         print(terminal_rule())
         audit.write(
             "update_summary",
-            updated=update_successes,
+            updated=source_updates,
+            processed_successfully=update_successes,
+            source_updates=source_updates,
+            source_revalidations=source_revalidations,
             failed_or_refused=update_failures,
             manual_only=manual_outdated,
             unknown_error=unknown_count,
@@ -3169,7 +3692,7 @@ def main(
             remaining_outdated_plugins=[
                 row.get("filename") for row in remaining_rows
             ],
-            reload_command=RCON_RELOAD_COMMAND,
+            reload_command=RCON_ACTIVATION_COMMAND,
             reload_result=(
                 "ok"
                 if reload_succeeded

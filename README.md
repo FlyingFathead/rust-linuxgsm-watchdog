@@ -448,9 +448,68 @@ Before replacing a plugin, the updater:
   unless `--allow-large-shrink` is explicitly supplied;
 - archives the installed source before atomically replacing it.
 
+To check and update only one installed plugin, pass its filename with or
+without the `.cs` extension (matching is case-insensitive):
+
+```bash
+python3 tools/oxide_plugin_updater.py --update-plugin HeliRide
+python3 tools/oxide_plugin_updater.py --update-plugin HeliRide.cs
+```
+
+The local directory is scanned to resolve one exact match, then only that
+plugin receives a uMod metadata lookup and update attempt. The global ChaosCode
+manifest is fetched only if the selected plugin has no uMod match and needs the
+configured fallback. With `--recursive`, duplicate filenames in different
+directories are refused as ambiguous rather than guessed.
+
+For a clean same-version reproduction and compiler pass, add `--force`:
+
+```bash
+python3 tools/oxide_plugin_updater.py \
+  --update-plugin HeliRide \
+  --force
+```
+
+`--force` is accepted only with `--update-plugin`. It bypasses cached metadata,
+downloads and validates the current official uMod source, and permits the
+declared version to equal the installed version. All normal transport,
+identity, C# structure, source-origin, size, and hash/race checks remain in
+force. If the downloaded bytes are identical, the live file is left untouched
+and the pristine-source revalidation is recorded, but the plugin remains
+eligible for targeted activation to reproduce the current compiler result.
+Activation can still be explicitly deferred with
+`--no-reload-plugins-after-updates`.
+
 This is strict static/source validation, not a promise that the plugin compiles
 against the currently installed Rust/Oxide assemblies. Oxide's live compilation
 after replacement remains the authoritative compatibility check.
+
+To trigger that live check without contacting an update source or changing any
+plugin file, verify one plugin by name:
+
+```bash
+python3 tools/oxide_plugin_updater.py --verify-plugin HeliRide
+```
+
+To verify every scanned plugin sequentially, use either spelling:
+
+```bash
+python3 tools/oxide_plugin_updater.py --verify-all-plugins
+python3 tools/oxide_plugin_updater.py --verify-all
+```
+
+Verification queries `oxide.plugins`, issues one exact state-aware
+`oxide.load NAME` or `oxide.reload NAME` command per source file, and queries
+the final inventory. It never sends a wildcard command. The terminal-width
+summary reports how many plugins compiled/loaded successfully, how many
+actually failed to compile, and how many could not be verified for another
+reason. Each failure includes the exact command, status, and compiler or RCON
+response. `--verify-all` intentionally reprocesses every scanned plugin, so it
+should be run during an appropriate maintenance or diagnostic window.
+
+This verifies compilation/loading and the final Oxide inventory. It does not
+prove that every initialization hook ran without a later runtime exception;
+backend-log inspection remains a separate health check.
 
 Updater-owned runtime data is kept outside the live Oxide tree and explicitly
 ignored by Git:
@@ -474,6 +533,8 @@ The metadata cache avoids repeating uMod requests inside the configured TTL.
 SHA-256, latest observed remote version/source/URL, and a compact history of
 new, previously known, changed, resolved, and installed updates. Repeated
 identical checks update the existing record instead of appending duplicates.
+Forced same-version checks which confirm byte-identical pristine source are
+recorded as source revalidations rather than installations.
 Historical state is informational; it never replaces current/cached official
 metadata or downloaded-source validation.
 
@@ -487,21 +548,23 @@ cached/history information. Interactive terminals show an unbracketed
 Cooldowns and transient failures also leave timestamped `[WAIT]` and
 `[CONTINUE]` lines; redirected output contains no animation/control sequence.
 
-After one or more successful installations, the default configuration reloads
-each updated plugin separately through Rust WebRCON:
+After one or more successful installations or forced source revalidations, the
+default configuration activates each processed plugin separately through Rust
+WebRCON. It first reads `oxide.plugins`, then reloads plugins which are
+currently running and loads plugins which are absent or listed as failed:
 
 ```text
 oxide.reload AdminRadar
-oxide.reload Kits
+oxide.load HeliRide
 ...
 ```
 
 The updater prints live progress for every plugin, treats a `Failed to compile`
 response as an activation failure, and includes the compiler detail in its
-output. If all individual reloads succeed, it runs `oxide.plugins` and checks
-that every updated plugin is listed at the expected new version. This is
-deliberately not a blind `oxide.reload *`: command acceptance alone does not
-prove that the updated C# sources compiled.
+output. After the individual commands, it always runs `oxide.plugins` and
+checks every plugin which did not already fail against the expected version.
+This is deliberately not a blind `oxide.reload *`: command acceptance alone
+does not prove that the updated C# sources compiled.
 
 Set `"reload_plugins_after_updates": false` in
 `oxide_plugin_updater.json`, or pass
@@ -523,8 +586,9 @@ The `log/` directory is ignored by Git. Use `--no-log` to disable the audit log
 for one run, or `--log-file PATH` to place it elsewhere. An update run ends with
 counts for updated, failed/refused, manual-only, and unknown/error results.
 Successful per-plugin records include the installed path, source, old/new
-versions, byte sizes, SHA-256 checksums, official download URL, backup path,
-warnings, and result. Reload attempts and results are logged separately.
+versions, byte sizes, SHA-256 checksums, official download URL, optional backup
+path, warnings, and result. Activation records separately include the exact
+`oxide.load` or `oxide.reload` command, status, and compiler response.
 
 The inventory and updater declare the LinuxGSM default near their imports. A
 positional directory still overrides the configured path for nonstandard

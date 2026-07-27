@@ -780,6 +780,84 @@ class PluginUpdateValidationTests(unittest.TestCase):
         self.assertEqual(result.candidate_version, "1.1.0")
         self.assertNotEqual(result.old_sha256, result.new_sha256)
 
+    def test_force_accepts_identical_same_version_source(self):
+        source = plugin_source(version="1.0.0").encode()
+        candidate = self.candidate()
+        candidate.remote_version = "1.0.0"
+
+        normal = checker.validate_plugin_download(
+            candidate,
+            source,
+            source,
+            headers={"Content-Type": "text/x-csharp"},
+            final_url="https://umod.org/plugins/ExamplePlugin.cs",
+            allow_large_shrink=False,
+        )
+        forced = checker.validate_plugin_download(
+            candidate,
+            source,
+            source,
+            headers={"Content-Type": "text/x-csharp"},
+            final_url="https://umod.org/plugins/ExamplePlugin.cs",
+            allow_large_shrink=False,
+            force_reinstall=True,
+        )
+
+        self.assertTrue(normal.errors)
+        self.assertIn(
+            "is not definitely newer than installed version",
+            normal.errors[0],
+        )
+        self.assertEqual(forced.errors, [])
+        self.assertEqual(forced.old_sha256, forced.new_sha256)
+
+    def test_force_identical_source_records_revalidation_without_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugins_dir = root / "oxide" / "plugins"
+            plugins_dir.mkdir(parents=True)
+            target = plugins_dir / "ExamplePlugin.cs"
+            source = plugin_source(version="1.0.0").encode()
+            target.write_bytes(source)
+            candidate = self.candidate(target)
+            candidate.remote_version = "1.0.0"
+            package_state = checker._empty_plugin_state()
+            response = checker.HttpBytesResult(
+                data=source,
+                headers={"Content-Type": "text/x-csharp"},
+                final_url="https://umod.org/plugins/ExamplePlugin.cs",
+            )
+
+            with mock.patch.object(
+                checker,
+                "http_get_bytes",
+                return_value=response,
+            ), contextlib.redirect_stdout(io.StringIO()):
+                result = checker.install_update(
+                    candidate,
+                    plugins_dir=plugins_dir,
+                    backup_root=root / "backups",
+                    timeout_s=1,
+                    min_interval_s=0,
+                    max_retries=0,
+                    debug_headers=False,
+                    allow_large_shrink=False,
+                    use_color=False,
+                    package_state=package_state,
+                    force_reinstall=True,
+                )
+
+            self.assertTrue(result)
+            self.assertFalse(result.source_changed)
+            self.assertEqual(target.read_bytes(), source)
+            self.assertFalse((root / "backups").exists())
+            history = package_state["plugins"]["ExamplePlugin.cs"]["history"]
+            self.assertEqual(history[-1]["event"], "source_revalidated")
+            self.assertEqual(
+                history[-1]["sha256"],
+                checker.hashlib.sha256(source).hexdigest(),
+            )
+
     def test_html_response_is_refused(self):
         result = checker.validate_plugin_download(
             self.candidate(),
@@ -1003,6 +1081,29 @@ class PluginUpdateValidationTests(unittest.TestCase):
 
 
 class PluginUpdateOutputTests(unittest.TestCase):
+    def test_force_requires_a_single_plugin_target(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                checker.main(["--no-config", "--force"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--force requires --update-plugin", stderr.getvalue())
+
+    def test_verify_modes_are_mutually_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                checker.main(
+                    [
+                        "--no-config",
+                        "--verify-plugin",
+                        "HeliRide",
+                        "--verify-all-plugins",
+                    ]
+                )
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("are mutually exclusive", stderr.getvalue())
+
     def test_table_header_is_bracketed_by_terminal_width_rules(self):
         rows = [
             {
@@ -1186,15 +1287,15 @@ class PluginUpdateOutputTests(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         rendered = stdout.getvalue()
-        self.assertIn("Updated:       1", rendered)
+        self.assertIn("Source updates:  1", rendered)
         self.assertIn("Failed/refused:  1", rendered)
         self.assertIn("Manual-only:   1", rendered)
-        self.assertIn("Plugin reload: OK", rendered)
+        self.assertIn("Plugin activation: OK", rendered)
         self.assertIn(
             "3 plugins found in directory: /srv/oxide/plugins",
             rendered,
         )
-        self.assertIn("1 plugin updated.", rendered)
+        self.assertIn("1 plugin source updated.", rendered)
         self.assertIn("2 plugins remain outdated.", rendered)
         self.assertIn("Plugins that still need to be updated (2):", rendered)
         self.assertIn("Example2.cs: 1.0.0 -> 1.1.0 [umod; failed/refused]", rendered)
@@ -1261,7 +1362,409 @@ class PluginUpdateOutputTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         reload_plugins.assert_not_called()
-        self.assertIn("Plugin reload: deferred", stdout.getvalue())
+        self.assertIn("Plugin activation: deferred", stdout.getvalue())
+
+    def test_update_plugin_force_targets_one_same_version_plugin(self):
+        locals_ = [
+            {
+                "file": "/srv/oxide/plugins/HeliRide.cs",
+                "filename": "HeliRide.cs",
+                "name": "Heli Ride",
+                "author": "Example Author",
+                "version": "1.0.0",
+                "size_bytes": 500,
+                "sha256": "a" * 64,
+            },
+            {
+                "file": "/srv/oxide/plugins/UberTool.cs",
+                "filename": "UberTool.cs",
+                "name": "Uber Tool",
+                "author": "Example Author",
+                "version": "1.0.0",
+                "size_bytes": 500,
+                "sha256": "b" * 64,
+            },
+        ]
+        remote = checker.HttpResult(
+            data={
+                "latest_release_version": "1.0.0",
+                "url": "https://umod.org/plugins/heli-ride",
+                "download_url": "https://umod.org/plugins/HeliRide.cs",
+            },
+            headers={},
+        )
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            checker,
+            "scan_plugins",
+            return_value=locals_,
+        ), mock.patch.object(
+            checker,
+            "http_get_json",
+            return_value=remote,
+        ) as get_json, mock.patch.object(
+            checker,
+            "load_chaos_manifest",
+        ) as load_chaos, mock.patch.object(
+            checker,
+            "install_update",
+            return_value=checker.InstallResult(
+                True,
+                source_changed=False,
+            ),
+        ) as install, mock.patch.object(
+            checker,
+            "reload_updated_plugins",
+            return_value=(True, "activation complete"),
+        ) as activate, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "oxide_plugin_updater.py",
+                "/srv/oxide/plugins",
+                "--cache",
+                str(Path(td) / "cache.json"),
+                "--color",
+                "never",
+                "--update-plugin",
+                "heliride.cs",
+                "--force",
+                "--no-log",
+                "--no-state",
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            rc = checker.main()
+
+        self.assertEqual(rc, 0)
+        get_json.assert_called_once()
+        load_chaos.assert_not_called()
+        install.assert_called_once()
+        candidate = install.call_args.args[0]
+        self.assertEqual(candidate.filename, "HeliRide.cs")
+        self.assertTrue(install.call_args.kwargs["force_reinstall"])
+        activate.assert_called_once()
+        self.assertEqual(
+            activate.call_args.args[1],
+            [("HeliRide.cs", "1.0.0")],
+        )
+        self.assertIsNotNone(activate.call_args.kwargs["progress"])
+        self.assertEqual(
+            activate.call_args.kwargs["activation_records"],
+            [],
+        )
+        rendered = stdout.getvalue()
+        self.assertIn("1 plugin found in directory", rendered)
+        self.assertIn("0 plugin sources updated.", rendered)
+        self.assertIn(
+            "1 plugin source was already identical and revalidated.",
+            rendered,
+        )
+        self.assertNotIn("Backups:", rendered)
+
+    def test_verify_plugin_targets_one_without_contacting_upstream(self):
+        locals_ = [
+            {
+                "file": "/srv/oxide/plugins/HeliRide.cs",
+                "filename": "HeliRide.cs",
+                "name": "Heli Ride",
+                "version": "1.0.0",
+            },
+            {
+                "file": "/srv/oxide/plugins/UberTool.cs",
+                "filename": "UberTool.cs",
+                "name": "Uber Tool",
+                "version": "2.0.0",
+            },
+        ]
+
+        def activate_one(
+            _rcon_config,
+            _plugins,
+            *,
+            progress,
+            activation_records,
+        ):
+            record = {
+                "plugin": "HeliRide.cs",
+                "command": "oxide.load HeliRide",
+                "status": "OK",
+                "response": "HeliRide was compiled successfully",
+            }
+            activation_records.append(record)
+            progress(
+                1,
+                1,
+                record["plugin"],
+                record["status"],
+                record["response"],
+            )
+            return True, "1 plugin activated and verified"
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            checker,
+            "scan_plugins",
+            return_value=locals_,
+        ), mock.patch.object(
+            checker,
+            "http_get_json",
+        ) as get_json, mock.patch.object(
+            checker,
+            "load_chaos_manifest",
+        ) as load_chaos, mock.patch.object(
+            checker,
+            "install_update",
+        ) as install, mock.patch.object(
+            checker,
+            "reload_updated_plugins",
+            side_effect=activate_one,
+        ) as activate, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            rc = checker.main(
+                [
+                    "/srv/oxide/plugins",
+                    "--no-config",
+                    "--cache",
+                    str(Path(td) / "cache.json"),
+                    "--color",
+                    "never",
+                    "--verify-plugin",
+                    "heliride.cs",
+                    "--no-log",
+                    "--no-state",
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+        get_json.assert_not_called()
+        load_chaos.assert_not_called()
+        install.assert_not_called()
+        activate.assert_called_once()
+        self.assertEqual(
+            activate.call_args.args[1],
+            [("HeliRide.cs", "1.0.0")],
+        )
+        self.assertEqual(
+            activate.call_args.kwargs["activation_records"],
+            [
+                {
+                    "plugin": "HeliRide.cs",
+                    "command": "oxide.load HeliRide",
+                    "status": "OK",
+                    "response": "HeliRide was compiled successfully",
+                }
+            ],
+        )
+        rendered = stdout.getvalue()
+        self.assertIn("Verifying 1 plugin", rendered)
+        self.assertIn(
+            "1 out of 1 plugin compiled/loaded successfully.",
+            rendered,
+        )
+        self.assertIn("0 plugins failed to compile.", rendered)
+
+    def test_verify_all_plugins_is_sequential_and_surfaces_failure(self):
+        locals_ = [
+            {
+                "file": "/srv/oxide/plugins/HeliRide.cs",
+                "filename": "HeliRide.cs",
+                "name": "Heli Ride",
+                "version": "1.0.0",
+            },
+            {
+                "file": "/srv/oxide/plugins/UberTool.cs",
+                "filename": "UberTool.cs",
+                "name": "Uber Tool",
+                "version": "2.0.0",
+            },
+        ]
+
+        def activate_all(
+            _rcon_config,
+            _plugins,
+            *,
+            progress,
+            activation_records,
+        ):
+            records = [
+                {
+                    "plugin": "HeliRide.cs",
+                    "command": "oxide.reload HeliRide",
+                    "status": "OK",
+                    "response": "HeliRide was compiled successfully",
+                },
+                {
+                    "plugin": "UberTool.cs",
+                    "command": "oxide.load UberTool",
+                    "status": "FAILED TO COMPILE",
+                    "response": (
+                        "UberTool - Failed to compile: bad overload | "
+                        "Line: 855, Pos: 29"
+                    ),
+                },
+            ]
+            activation_records.extend(records)
+            for index, record in enumerate(records, start=1):
+                progress(
+                    index,
+                    len(records),
+                    record["plugin"],
+                    record["status"],
+                    record["response"],
+                )
+            return (
+                False,
+                "UberTool.cs: UberTool - Failed to compile: bad overload",
+            )
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            checker,
+            "scan_plugins",
+            return_value=locals_,
+        ), mock.patch.object(
+            checker,
+            "http_get_json",
+        ) as get_json, mock.patch.object(
+            checker,
+            "reload_updated_plugins",
+            side_effect=activate_all,
+        ) as activate, mock.patch.object(
+            checker.shutil,
+            "get_terminal_size",
+            return_value=os.terminal_size((53, 24)),
+        ), contextlib.redirect_stdout(
+            io.StringIO()
+        ) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            rc = checker.main(
+                [
+                    "/srv/oxide/plugins",
+                    "--no-config",
+                    "--cache",
+                    str(Path(td) / "cache.json"),
+                    "--color",
+                    "never",
+                    "--verify-all",
+                    "--no-log",
+                    "--no-state",
+                ]
+            )
+
+        self.assertEqual(rc, 2)
+        get_json.assert_not_called()
+        activate.assert_called_once()
+        self.assertEqual(
+            activate.call_args.args[1],
+            [
+                ("HeliRide.cs", "1.0.0"),
+                ("UberTool.cs", "2.0.0"),
+            ],
+        )
+        rendered = stdout.getvalue()
+        self.assertIn("Verifying 2 plugins", rendered)
+        self.assertIn("-" * 53, rendered)
+        self.assertIn(
+            "1 out of 2 plugins compiled/loaded successfully.",
+            rendered,
+        )
+        self.assertIn("1 plugin failed to compile.", rendered)
+        self.assertIn("UberTool.cs -- FAILED TO COMPILE", rendered)
+        self.assertIn("Command: oxide.load UberTool", rendered)
+        self.assertIn(
+            "Error: UberTool - Failed to compile: bad overload",
+            rendered,
+        )
+
+    def test_update_plugin_refuses_an_ambiguous_recursive_name(self):
+        locals_ = [
+            {
+                "file": f"/srv/oxide/plugins/{folder}/Kits.cs",
+                "filename": "Kits.cs",
+                "name": "Kits",
+                "version": "1.0.0",
+            }
+            for folder in ("one", "two")
+        ]
+        with mock.patch.object(
+            checker,
+            "scan_plugins",
+            return_value=locals_,
+        ), mock.patch.object(
+            sys,
+            "argv",
+            [
+                "oxide_plugin_updater.py",
+                "/srv/oxide/plugins",
+                "--recursive",
+                "--update-plugin",
+                "Kits",
+                "--no-log",
+                "--no-state",
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ) as stderr:
+            rc = checker.main()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("Plugin name is ambiguous", stderr.getvalue())
+
+    def test_targeted_check_loads_chaos_fallback_only_after_umod_miss(self):
+        local = {
+            "file": "/srv/oxide/plugins/HeliRide.cs",
+            "filename": "HeliRide.cs",
+            "name": "Heli Ride",
+            "author": "Example Author",
+            "version": "1.0.0",
+            "size_bytes": 500,
+            "sha256": "a" * 64,
+        }
+        chaos = {
+            "heliride": {
+                "ResourceVersion": "1.1.0",
+                "ResourceURL": "https://chaoscode.io/resources/heli-ride.1/",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            checker,
+            "scan_plugins",
+            return_value=[local],
+        ), mock.patch.object(
+            checker,
+            "http_get_json",
+            side_effect=FileNotFoundError,
+        ) as get_json, mock.patch.object(
+            checker,
+            "load_chaos_manifest",
+            return_value=chaos,
+        ) as load_chaos, mock.patch.object(
+            checker,
+            "install_update",
+        ) as install, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            rc = checker.main(
+                [
+                    "/srv/oxide/plugins",
+                    "--no-config",
+                    "--cache",
+                    str(Path(td) / "cache.json"),
+                    "--color",
+                    "never",
+                    "--update-plugin",
+                    "HeliRide",
+                    "--no-log",
+                    "--no-state",
+                ]
+            )
+
+        self.assertEqual(rc, 1)
+        get_json.assert_called_once()
+        load_chaos.assert_called_once()
+        install.assert_not_called()
+        self.assertIn("HeliRide.cs  chaos", stdout.getvalue())
 
     def test_reload_failure_is_reported_after_successful_install(self):
         local = {
@@ -1320,14 +1823,23 @@ class PluginUpdateOutputTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         reload_plugins.assert_called_once()
         rendered = stdout.getvalue()
-        self.assertIn("Plugin reload: FAILED", rendered)
+        self.assertIn("Plugin activation: FAILED", rendered)
         self.assertIn("RCON unavailable", rendered)
 
     def test_reload_uses_environment_password_and_exact_oxide_command(self):
         rcon_send = mock.Mock(
             side_effect=[
+                (
+                    True,
+                    '01 "Example Plugin" (1.1.0) by Example '
+                    '- ExamplePlugin.cs',
+                ),
                 (True, "ExamplePlugin was compiled successfully"),
-                (True, "01 ExamplePlugin - 1.2.3"),
+                (
+                    True,
+                    '01 "Example Plugin" (1.2.3) by Example '
+                    '- ExamplePlugin.cs',
+                ),
             ]
         )
         watchdog = mock.Mock(
@@ -1342,6 +1854,7 @@ class PluginUpdateOutputTests(unittest.TestCase):
             "import_module",
             return_value=watchdog,
         ):
+            activation_records = []
             ok, response = checker.reload_updated_plugins(
                 {
                     "identity": "rustserver",
@@ -1352,26 +1865,51 @@ class PluginUpdateOutputTests(unittest.TestCase):
                         "TEST_RUST_RCON_PASSWORD",
                 },
                 [("ExamplePlugin.cs", "1.2.3")],
+                activation_records=activation_records,
             )
 
         self.assertTrue(ok)
-        self.assertEqual(response, "1 plugin reloaded and verified")
-        self.assertEqual(rcon_send.call_count, 2)
-        cfg, command = rcon_send.call_args_list[0].args
+        self.assertEqual(response, "1 plugin activated and verified")
+        self.assertEqual(rcon_send.call_count, 3)
+        self.assertEqual(
+            rcon_send.call_args_list[0].args[1],
+            "oxide.plugins",
+        )
+        cfg, command = rcon_send.call_args_list[1].args
         self.assertEqual(command, "oxide.reload ExamplePlugin")
         self.assertEqual(cfg["rcon_password"], "secret")
         self.assertEqual(cfg["identity"], "rustserver")
         self.assertEqual(
-            rcon_send.call_args_list[1].args[1],
+            rcon_send.call_args_list[2].args[1],
             "oxide.plugins",
         )
+        self.assertEqual(
+            activation_records,
+            [
+                {
+                    "plugin": "ExamplePlugin.cs",
+                    "command": "oxide.reload ExamplePlugin",
+                    "status": "OK",
+                    "response": "ExamplePlugin was compiled successfully",
+                }
+            ],
+        )
 
-    def test_individual_reload_reports_compile_failure_and_skips_inventory(self):
+    def test_individual_reload_reports_compile_failure_and_refreshes_inventory(self):
         rcon_send = mock.Mock(
-            return_value=(
-                True,
-                "Kits - Failed to compile: bad overload | Line: 1840, Pos: 33",
-            )
+            side_effect=[
+                (True, "Kits - Failed to compile: previous error"),
+                (
+                    True,
+                    "Kits - Failed to compile: bad overload | "
+                    "Line: 1840, Pos: 33",
+                ),
+                (
+                    True,
+                    "Kits - Failed to compile: bad overload | "
+                    "Line: 1840, Pos: 33",
+                ),
+            ]
         )
         watchdog = mock.Mock(
             rcon_send=rcon_send,
@@ -1395,7 +1933,12 @@ class PluginUpdateOutputTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("Kits.cs: Kits - Failed to compile", response)
-        rcon_send.assert_called_once()
+        self.assertEqual(rcon_send.call_count, 3)
+        self.assertEqual(rcon_send.call_args_list[1].args[1], "oxide.load Kits")
+        self.assertEqual(
+            rcon_send.call_args_list[2].args[1],
+            "oxide.plugins",
+        )
         progress.assert_called_once()
         self.assertEqual(
             progress.call_args.args[3],
@@ -1405,8 +1948,105 @@ class PluginUpdateOutputTests(unittest.TestCase):
     def test_individual_reload_rejects_missing_expected_inventory_version(self):
         rcon_send = mock.Mock(
             side_effect=[
+                (
+                    True,
+                    '01 "Example Plugin" (1.2.2) by Example '
+                    '- ExamplePlugin.cs',
+                ),
                 (True, "reload complete"),
-                (True, "01 ExamplePlugin - 1.2.2"),
+                (
+                    True,
+                    '01 "Example Plugin" (1.2.2) by Example '
+                    '- ExamplePlugin.cs',
+                ),
+            ]
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        activation_records = []
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ):
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                [("ExamplePlugin.cs", "1.2.3")],
+                activation_records=activation_records,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn(
+            "expected version 1.2.3 not found in oxide.plugins",
+            response,
+        )
+        self.assertEqual(
+            activation_records[0]["status"],
+            "VERIFY FAILED",
+        )
+        self.assertIn(
+            "expected version 1.2.3 not found",
+            activation_records[0]["response"],
+        )
+
+    def test_activation_inventory_matching_does_not_confuse_similar_names(self):
+        rcon_send = mock.Mock(
+            side_effect=[
+                (
+                    True,
+                    '01 "Foo Plus" (1.0.0) by Example - Foo-Plus.cs',
+                ),
+                (True, "Foo was compiled successfully"),
+                (
+                    True,
+                    '01 "Foo" (1.0.0) by Example - Foo.cs',
+                ),
+            ]
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ):
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                [("Foo.cs", "1.0.0")],
+            )
+
+        self.assertTrue(ok, response)
+        self.assertEqual(
+            rcon_send.call_args_list[1].args[1],
+            "oxide.load Foo",
+        )
+
+    def test_final_inventory_version_requires_an_exact_token(self):
+        rcon_send = mock.Mock(
+            side_effect=[
+                (
+                    True,
+                    '01 "Example Plugin" (1.2.2) by Example '
+                    '- ExamplePlugin.cs',
+                ),
+                (True, "reload complete"),
+                (
+                    True,
+                    '01 "Example Plugin" (1.2.30) by Example '
+                    '- ExamplePlugin.cs',
+                ),
             ]
         )
         watchdog = mock.Mock(
