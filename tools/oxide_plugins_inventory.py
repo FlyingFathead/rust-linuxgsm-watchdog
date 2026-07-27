@@ -8,6 +8,7 @@ Scan an Oxide/uMod plugins directory for *.cs files and extract:
 - Description(...)
 - file mtime (local time)
 - file size
+- SHA-256
 
 Usage:
   python3 oxide_plugins_inventory.py
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -114,7 +116,8 @@ def _extract_description(text: str) -> Optional[str]:
     return None
 
 
-def _extract_info(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def extract_plugin_info(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract the Oxide plugin name, author, and version from C# source."""
     m = INFO_RE.search(text)
     if not m:
         return None, None, None
@@ -142,11 +145,14 @@ def scan_plugins(dir_path: Path, recursive: bool = False) -> List[Dict[str, Any]
             continue
 
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
+            raw = p.read_bytes()
+            text = raw.decode("utf-8-sig", errors="replace")
+            sha256 = hashlib.sha256(raw).hexdigest()
         except OSError:
             text = ""
+            sha256 = None
 
-        name, author, version = _extract_info(text)
+        name, author, version = extract_plugin_info(text)
         desc = _extract_description(text)
 
         out.append(
@@ -159,6 +165,7 @@ def scan_plugins(dir_path: Path, recursive: bool = False) -> List[Dict[str, Any]
                 "description": desc,
                 "mtime": _local_dt(st.st_mtime),
                 "size_bytes": st.st_size,
+                "sha256": sha256,
             }
         )
 
@@ -199,7 +206,17 @@ def _print_table(rows: List[Dict[str, Any]]) -> None:
 
 
 def _print_tsv(rows: List[Dict[str, Any]]) -> None:
-    cols = ["file", "filename", "name", "author", "version", "mtime", "size_bytes", "description"]
+    cols = [
+        "file",
+        "filename",
+        "name",
+        "author",
+        "version",
+        "mtime",
+        "size_bytes",
+        "sha256",
+        "description",
+    ]
     print("\t".join(cols))
     for r in rows:
         def t(v: Any) -> str:

@@ -1,0 +1,59 @@
+{
+  "plugins_directory": "~/serverfiles/oxide/plugins",
+  "recursive": false,
+
+  "sources": {
+    "check_chaoscode": true,
+    "fallback_search": false
+  },
+
+  "network": {
+    "timeout_seconds": 12,
+    "minimum_interval_seconds": 0.6,
+    "maximum_retries": 6,
+    "maximum_backoff_seconds": 300,
+    "fallback_backoff_seconds": 30,
+    "show_activity_spinner": true
+  },
+
+  "cache": {
+    "file": "data/cache/oxide_plugin_updater_cache.json",
+    "umod_ttl_seconds": 43200,
+    "chaoscode_ttl_seconds": 2700
+  },
+
+  "validation": {
+    "maximum_plugin_bytes": 10485760,
+    "shrink_warning_percent": 25.0,
+    "shrink_refusal_percent": 50.0
+  },
+
+  "updates": {
+    "backup_directory": "data/plugin-backups",
+    "reload_plugins_after_updates": true
+  },
+
+  "state": {
+    "enabled": true,
+    "file": "data/state/plugin_history.json",
+    "history_limit_per_plugin": 50,
+    "reload_history_limit": 50
+  },
+
+  "rcon": {
+    "identity": "rustserver",
+    "host": "127.0.0.1",
+    "port": 28016,
+    "password": "",
+    "password_environment_variable": "RUST_RCON_PASSWORD"
+  },
+
+  "logging": {
+    "enabled": true,
+    "file": "../log/oxide_plugin_updater.log"
+  },
+
+  "output": {
+    "color": "auto"
+  }
+}

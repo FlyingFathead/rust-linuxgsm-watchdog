@@ -53,7 +53,8 @@ Optional (disabled by default): `./rustserver details` parsing exists for debugg
 - A working LinuxGSM Rust install where `server_dir` contains an executable `./rustserver`
 
 Optional (needed for authenticated wipe-timestamp discovery and other WebRCON
-features such as `--test-rcon-say` and the SmoothRestarter bridge):
+features such as `--test-rcon-say`, the SmoothRestarter bridge, and Oxide
+Plugin Updater's default post-update `oxide.reload *` activation):
 - `websocket-client` (install via `requirements.txt`, or `pip install websocket-client`) 
 
 ---
@@ -75,7 +76,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.6) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.7) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -312,8 +313,8 @@ starting the watchdog:
 
 ### Oxide/uMod plugin tools
 
-Both plugin utilities now use the standard LinuxGSM Oxide plugin directory when
-no directory argument is supplied:
+All plugin-tool entry points use the standard LinuxGSM Oxide plugin directory
+when no directory argument or JSON override is supplied:
 
 ```text
 $HOME/serverfiles/oxide/plugins
@@ -324,14 +325,172 @@ Run them from the repository without repeating that path:
 ```bash
 python3 tools/oxide_plugins_inventory.py
 python3 tools/umod_plugins_check.py
+python3 tools/oxide_plugin_updater.py
 ```
 
-Each script declares its own `DEFAULT_PLUGINS_DIR` near the imports. A positional
-directory still overrides the default for nonstandard installations:
+`umod_plugins_check.py` remains a deliberately check-only front end. After its
+existing colored progress output and result table, it prints a terminal-width
+update summary showing which outdated uMod plugins can be updated
+automatically:
+
+```text
+--------------------------------------------------------------------------------
+Plugins that can be auto-updated (2):
+  AdminRadar.cs: 5.4.2 -> 5.4.3
+  ZoneManager.cs: 3.1.10 -> 3.1.12
+--------------------------------------------------------------------------------
+Found 2 plugins that can be auto-updated.
+Run Oxide Plugin Updater to update them:
+  python3 tools/oxide_plugin_updater.py --update
+```
+
+The canonical program and its configuration are:
+
+```text
+tools/oxide_plugin_updater.py
+tools/oxide_plugin_updater.json
+```
+
+The updater is also check-only unless `--update` is explicitly supplied:
+
+```bash
+python3 tools/oxide_plugin_updater.py
+python3 tools/oxide_plugin_updater.py --update
+```
+
+If the configured Oxide plugin directory does not exist, the updater exits
+with status 2 and prints both the permanent and one-run recovery commands.
+Persist the correct directory without hand-editing JSON:
+
+```bash
+python3 tools/oxide_plugin_updater.py \
+  --set-plugins-directory /home/rustserver/serverfiles/oxide/plugins
+```
+
+`--set-plugins-dir` is accepted as a shorter alias. The setter requires an
+existing directory, changes only `plugins_directory`, validates the resulting
+configuration, writes it atomically, and exits without scanning plugins or
+accessing the network. A timestamped backup of an existing JSON file is stored
+under the config file's adjacent `data/config-backups/` tree, which places the
+canonical updater backups under the already ignored `tools/data/` directory.
+With a custom configuration, target that same file explicitly:
+
+```bash
+python3 tools/oxide_plugin_updater.py \
+  --config /path/to/custom-updater.json \
+  --set-plugins-directory /srv/rust/serverfiles/oxide/plugins
+```
+
+Inspect the complete merged and resolved configuration without running a
+check:
+
+```bash
+python3 tools/oxide_plugin_updater.py --view-config
+```
+
+`--viewconfig` is accepted as an alias. A configured RCON password is redacted
+from this display. Normal positional paths and other CLI options remain
+one-run overrides; they are deliberately not persisted implicitly.
+
+The JSON controls the plugin, cache, state, backup, and log paths; source
+fallbacks; network throttling and cooldowns; validation thresholds; WebRCON
+endpoint discovery; and post-update reload behavior. Paths are expanded from
+`~` or resolved relative to the JSON file. Use `--config PATH` for another
+configuration and normal CLI options for one-run overrides.
+
+Before replacing a plugin, the updater:
+
+- accepts downloads only from the official HTTPS uMod host;
+- rejects empty, binary, HTML, XML, JSON, oversized, or invalid UTF-8 responses;
+- requires recognizable `[Info(...)]` metadata, the expected plugin identity,
+  the expected Oxide namespace/class, and an exact match between uMod's
+  advertised version and the downloaded source version;
+- requires the downloaded version to be definitely newer than the installed
+  version;
+- requires the installed file's SHA-256 to still match the inventory scan, then
+  verifies it again immediately before replacement;
+- shows old/new sizes and SHA-256 hashes;
+- warns at 25% shrinkage and refuses a source file that is at least 50% smaller
+  unless `--allow-large-shrink` is explicitly supplied;
+- archives the installed source before atomically replacing it.
+
+This is strict static/source validation, not a promise that the plugin compiles
+against the currently installed Rust/Oxide assemblies. Oxide's live compilation
+after replacement remains the authoritative compatibility check.
+
+Updater-owned runtime data is kept outside the live Oxide tree and explicitly
+ignored by Git:
+
+```text
+tools/data/
+├── cache/oxide_plugin_updater_cache.json
+├── state/plugin_history.json
+└── plugin-backups/<plugin>/<old-version>/<plugin>-<sha256-prefix>.cs
+```
+
+The hash suffix preserves distinct locally modified copies that share the same
+declared version. The backup root can be changed with `--backup-dir PATH`.
+The updater refuses any backup path that resolves inside the live
+`oxide/plugins/` tree.
+ChaosCode and other paid/authenticated plugins remain
+check-and-link/manual rather than being downloaded automatically.
+
+The metadata cache avoids repeating uMod requests inside the configured TTL.
+`plugin_history.json` separately records the current local version, byte size,
+SHA-256, latest observed remote version/source/URL, and a compact history of
+new, previously known, changed, resolved, and installed updates. Repeated
+identical checks update the existing record instead of appending duplicates.
+Historical state is informational; it never replaces current/cached official
+metadata or downloaded-source validation.
+
+Rate-limit handling respects `Retry-After` and `X-Retry-After`, uses
+exponential fallback cooldowns for HTTP 429 responses without a usable header,
+and refuses delays beyond the configured ceiling instead of hammering the
+service. If rate limiting persists after the retry budget, a circuit breaker
+skips the remaining uncached remote requests for that run while retaining
+cached/history information. Interactive terminals show an unbracketed
+`\ | / -` activity spinner.
+Cooldowns and transient failures also leave timestamped `[WAIT]` and
+`[CONTINUE]` lines; redirected output contains no animation/control sequence.
+
+After one or more successful installations, the default configuration sends
+one batch activation command through Rust WebRCON:
+
+```text
+oxide.reload *
+```
+
+Set `"reload_plugins_after_updates": false` in
+`oxide_plugin_updater.json`, or pass
+`--no-reload-plugins-after-updates`, to defer activation until a manual reload
+or server restart. A reload failure does not undo already validated and
+archived file replacements; it is reported separately as an activation
+failure and makes the command exit with status 2. WebRCON credentials are
+autodetected from the configured Rust identity when possible. The optional
+`RUST_RCON_PASSWORD` environment variable is used before the empty password in
+the shipped configuration.
+
+Checks and updates append structured audit records to:
+
+```text
+log/oxide_plugin_updater.log
+```
+
+The `log/` directory is ignored by Git. Use `--no-log` to disable the audit log
+for one run, or `--log-file PATH` to place it elsewhere. An update run ends with
+counts for updated, failed/refused, manual-only, and unknown/error results.
+Successful per-plugin records include the installed path, source, old/new
+versions, byte sizes, SHA-256 checksums, official download URL, backup path,
+warnings, and result. Reload attempts and results are logged separately.
+
+The inventory and updater declare the LinuxGSM default near their imports. A
+positional directory still overrides the configured path for nonstandard
+installations:
 
 ```bash
 python3 tools/oxide_plugins_inventory.py /srv/rust/oxide/plugins
 python3 tools/umod_plugins_check.py /srv/rust/oxide/plugins
+python3 tools/oxide_plugin_updater.py /srv/rust/oxide/plugins --update
 ```
 
 ### WebRCON test helpers
@@ -865,6 +1024,17 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.7
+  **Fixed / Added:**
+  - Added the canonical, separately configured **Oxide Plugin Updater** with check-only and explicit `--update` modes.
+  - Added validated uMod downloads, installed-file SHA-256 race checks, versioned backups outside the live Oxide tree, and atomic plugin replacement.
+  - Added optional one-shot post-update `oxide.reload *` activation through WebRCON, enabled by default and reported separately from installation.
+  - Added updater-owned metadata caching, persistent plugin history, structured audit logging, polite request throttling, rate-limit cooldowns, a circuit breaker, and an interactive activity spinner.
+  - Added package-manager-style check/update summaries, residual manual/failed plugin lists, source URLs, and clear exit statuses.
+  - Kept `umod_plugins_check.py` as a backward-compatible check-only command that directs users to the canonical updater.
+  - Added `oxide_plugin_updater.json`, resolved configuration viewing, atomic `--set-plugins-directory` persistence, ignored config backups, and useful missing-directory recovery instructions.
+  - Extended the Oxide inventory with UTF-8 BOM-tolerant metadata parsing and SHA-256 reporting.
+  - Added comprehensive updater, validation, backup, state, configuration, RCON reload, rate-limit, and CLI regression coverage.
 - v0.4.6
   **Fixed / Added:**
   - Added `--view-config` with the `--viewconfig` alias for a complete, human-readable effective configuration.
