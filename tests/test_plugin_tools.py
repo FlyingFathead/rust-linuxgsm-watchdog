@@ -704,6 +704,29 @@ class PluginNetworkBackoffTests(unittest.TestCase):
     def test_spinner_is_the_unbracketed_classic_sequence(self):
         self.assertEqual(checker.ActivitySpinner.FRAMES, ("\\", "|", "/", "-"))
 
+    def test_spinner_renders_target_immediately_on_entry(self):
+        stderr = io.StringIO()
+        stderr.isatty = lambda: True
+        with mock.patch.object(
+            checker.sys,
+            "stderr",
+            stderr,
+        ), mock.patch.object(
+            checker.threading,
+            "Thread",
+        ) as thread:
+            with checker.ActivitySpinner(
+                "[ 1/52] Verifying Admin No Loot"
+            ):
+                pass
+
+        self.assertTrue(
+            stderr.getvalue().startswith(
+                "\r\\ [ 1/52] Verifying Admin No Loot"
+            )
+        )
+        thread.return_value.start.assert_called_once_with()
+
     def test_persistent_rate_limit_opens_circuit_for_remaining_plugins(self):
         locals_ = [
             {
@@ -1081,14 +1104,17 @@ class PluginUpdateValidationTests(unittest.TestCase):
 
 
 class PluginUpdateOutputTests(unittest.TestCase):
-    def test_plugin_compile_completion_is_exact_and_terminal(self):
+    def test_plugin_activation_completion_is_exact_and_terminal(self):
         pending = (
             "Plugin compilation is already queued: HeliRide\n"
-            "UberTool was compiled successfully in 500ms"
+            "UberTool was compiled successfully in 500ms\n"
+            "Unloaded plugin Heli Ride v1.1.17 by ColonBlow\n"
+            "[Heli Ride] Config Loaded\n"
+            "HeliRide was compiled successfully in 625ms"
         )
         succeeded = (
             pending
-            + "\nHeliRide was compiled successfully in 625ms"
+            + "\nLoaded plugin Heli Ride v1.1.17 by ColonBlow"
         )
         failed = (
             pending
@@ -1096,13 +1122,33 @@ class PluginUpdateOutputTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            checker._plugin_compile_completed(pending, "HeliRide")
+            checker._plugin_activation_completed(
+                pending,
+                "HeliRide",
+                "Heli Ride",
+            )
         )
         self.assertTrue(
-            checker._plugin_compile_completed(succeeded, "HeliRide")
+            checker._plugin_activation_completed(
+                succeeded,
+                "HeliRide",
+                "Heli Ride",
+            )
         )
         self.assertTrue(
-            checker._plugin_compile_completed(failed, "HeliRide")
+            checker._plugin_activation_completed(
+                failed,
+                "HeliRide",
+                "Heli Ride",
+            )
+        )
+        self.assertEqual(
+            checker._plugin_loaded_success(
+                succeeded,
+                "HeliRide",
+                "Heli Ride",
+            ),
+            "Loaded plugin Heli Ride v1.1.17 by ColonBlow",
         )
         self.assertEqual(
             checker._reload_compile_failure(failed, "HeliRide"),
@@ -1621,7 +1667,9 @@ class PluginUpdateOutputTests(unittest.TestCase):
                     "plugin": "HeliRide.cs",
                     "command": "oxide.reload HeliRide",
                     "status": "OK",
-                    "response": "HeliRide was compiled successfully",
+                    "response": (
+                        "Loaded plugin Heli Ride v1.0.0 by ColonBlow"
+                    ),
                 },
                 {
                     "plugin": "UberTool.cs",
@@ -1694,6 +1742,11 @@ class PluginUpdateOutputTests(unittest.TestCase):
         self.assertIn("-" * 53, rendered)
         self.assertIn(
             "1 out of 2 plugins compiled/loaded successfully.",
+            rendered,
+        )
+        self.assertIn(
+            "[1/2] Loaded plugin Heli Ride v1.0.0 by ColonBlow "
+            "(oxide.reload HeliRide)",
             rendered,
         )
         self.assertIn("1 plugin failed to compile.", rendered)
@@ -1978,7 +2031,13 @@ class PluginUpdateOutputTests(unittest.TestCase):
         completion_matcher = command_call.kwargs["response_matcher"]
         self.assertFalse(completion_matcher("oxide.load accepted"))
         self.assertFalse(
-            completion_matcher("HeliRide was compiled successfully")
+            completion_matcher("Kits was compiled successfully")
+        )
+        self.assertFalse(
+            completion_matcher("Unloaded plugin Kits v4.4.9 by k1lly0u")
+        )
+        self.assertTrue(
+            completion_matcher("Loaded plugin Kits v4.4.9 by k1lly0u")
         )
         self.assertTrue(
             completion_matcher(
@@ -2017,7 +2076,7 @@ class PluginUpdateOutputTests(unittest.TestCase):
                 )
             else:
                 response = (
-                    f"{plugin_name} was compiled successfully in 100ms"
+                    f"Loaded plugin {plugin_name} v1.0.0 by Example"
                 )
             self.assertTrue(kwargs["response_matcher"](response))
             self.assertEqual(kwargs["timeout_s"], 120)
@@ -2068,6 +2127,65 @@ class PluginUpdateOutputTests(unittest.TestCase):
                 response,
             )
         self.assertEqual(rcon_send.call_count, 54)
+
+    def test_reload_shows_current_target_and_preserves_loaded_result(self):
+        inventory = (
+            '01 "Admin No Loot" (0.1.3) by Dana (0.00s / 0 B) '
+            "- AdminNoLoot.cs"
+        )
+        loaded = "Loaded plugin Admin No Loot v0.1.3 by Dana"
+        rcon_send = mock.Mock(
+            side_effect=[
+                (True, inventory),
+                (True, loaded),
+                (True, inventory),
+            ]
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        activation_records = []
+
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ), mock.patch.object(
+            checker,
+            "ActivitySpinner",
+        ) as spinner:
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                [("AdminNoLoot.cs", "0.1.3")],
+                activation_records=activation_records,
+            )
+
+        self.assertTrue(ok, response)
+        spinner.assert_called_once_with(
+            "[1/1] Verifying Admin No Loot v0.1.3 by Dana "
+            "(oxide.reload AdminNoLoot)"
+        )
+        self.assertEqual(
+            activation_records,
+            [
+                {
+                    "plugin": "AdminNoLoot.cs",
+                    "command": "oxide.reload AdminNoLoot",
+                    "status": "OK",
+                    "response": loaded,
+                }
+            ],
+        )
+        matcher = rcon_send.call_args_list[1].kwargs["response_matcher"]
+        self.assertFalse(
+            matcher("Unloaded plugin Admin No Loot v0.1.3 by Dana")
+        )
+        self.assertTrue(matcher(loaded))
 
     def test_individual_reload_rejects_missing_expected_inventory_version(self):
         rcon_send = mock.Mock(

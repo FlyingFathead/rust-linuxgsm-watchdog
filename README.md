@@ -76,7 +76,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.9) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.10) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -500,9 +500,15 @@ python3 tools/oxide_plugin_updater.py --verify-all
 
 Verification queries `oxide.plugins`, issues one exact state-aware
 `oxide.load NAME` or `oxide.reload NAME` command per source file, waits for
-that plugin's asynchronous `compiled successfully` or compiler-error event,
-and only then proceeds to the next source file. A command acknowledgement is
-not counted as success. After all terminal compiler results, the updater
+that plugin's complete asynchronous
+`Loaded plugin NAME vVERSION by AUTHOR` line or plugin-specific compiler-error
+event, and only then proceeds to the next source file. Neither a command
+acknowledgement, an unload line, nor an intermediate `compiled successfully`
+message is counted as successful loading. While each command is running, an
+interactive spinner immediately identifies the current plugin, version,
+inventory author when available, and exact Oxide command. The transient
+spinner line is replaced by the complete Oxide load result. After all terminal
+activation results, the updater
 queries the final inventory. It never sends a wildcard command. The
 terminal-width summary reports how many plugins compiled/loaded successfully,
 how many actually failed to compile, and how many could not be verified for
@@ -564,10 +570,12 @@ oxide.load HeliRide
 ...
 ```
 
-The updater prints live progress for every plugin and waits for each plugin's
-terminal compiler event before proceeding. It treats both `Failed to compile`
-and `Error while compiling` responses as activation failures and includes the
-compiler detail in its output. After the individual commands, it always runs
+The updater immediately displays the current target and exact command, animates
+a spinner while WebRCON waits, and replaces it with Oxide's complete
+`Loaded plugin NAME vVERSION by AUTHOR` result. It treats both
+`Failed to compile` and `Error while compiling` responses as activation
+failures and includes the compiler detail in its output. After the individual
+commands, it always runs
 `oxide.plugins` and checks every plugin which did not already fail against the
 expected version. This is deliberately not a blind `oxide.reload *`: command
 acceptance alone does not prove that the updated C# sources compiled.
@@ -1151,12 +1159,19 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.10
+  **Fixed / Added:**
+  - Fixed `--verify-plugin` and `--verify-all` incorrectly waiting 120 seconds and reporting `RCON FAILED` after Oxide had already reloaded a plugin successfully.
+  - Changed successful activation completion to the exact `Loaded plugin NAME vVERSION by AUTHOR` event; unload, config, acknowledgement, and intermediate compile messages do not complete verification.
+  - Added an immediate per-plugin spinner showing the current display name, version, available inventory author, progress count, and exact `oxide.load` or `oxide.reload` command while verification is running.
+  - Preserved the complete Oxide load line as the frontend success result and bound each displayed result to its own command.
+  - Added regression coverage for the observed Admin No Loot unload/config/load sequence, immediate spinner rendering, and exact frontend result text.
 - v0.4.9
   **Fixed / Added:**
   - Added `--update-plugin NAME` for case-insensitive, exact single-plugin update targeting, with ambiguity refusal for recursive scans.
   - Added targeted `--force` source revalidation for same-version pristine uMod downloads without unnecessary rewrites or backups when the bytes are identical.
   - Added source-preserving `--verify-plugin NAME`, `--verify-all-plugins`, and `--verify-all` compilation/loading checks with exact per-plugin commands and terminal-width summaries.
-  - Fixed false-positive plugin verification by keeping WebRCON open until each exact plugin emits a terminal compile-success or compile-failure event before processing the next plugin.
+  - Kept WebRCON open after command acknowledgement to collect each targeted plugin's asynchronous compiler output before processing the next plugin.
   - Added configurable per-command compiler waits through `rcon.command_timeout_seconds` and retained final exact-name/version `oxide.plugins` inventory verification.
   - Added regression coverage for delayed compiler output, unrelated plugin output, terminal timeouts, exact error attribution, and the observed 49-loaded/3-failed inventory case.
 - v0.4.8

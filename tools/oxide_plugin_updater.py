@@ -930,20 +930,24 @@ class ActivitySpinner:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+    def _draw(self, index: int) -> None:
+        frame = self.FRAMES[index % len(self.FRAMES)]
+        print(
+            f"\r{frame} {self.message}",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
     def _run(self) -> None:
-        index = 0
+        index = 1
         while not self._stop.wait(0.12):
-            frame = self.FRAMES[index % len(self.FRAMES)]
-            print(
-                f"\r{frame} {self.message}",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
+            self._draw(index)
             index += 1
 
     def __enter__(self):
         if self.enabled:
+            self._draw(0)
             self._thread = threading.Thread(
                 target=self._run,
                 name="oxide-plugin-updater-spinner",
@@ -2109,20 +2113,87 @@ def _reload_compile_failure(
 
 
 def _plugin_compile_completed(text: str, plugin_name: str) -> bool:
-    """Return true only for this plugin's terminal compiler result."""
+    """Backward-compatible wrapper for plugin activation completion."""
+    return _plugin_activation_completed(text, plugin_name)
+
+
+def _oxide_plugin_identity(value: str) -> str:
+    """Normalize Oxide filename/display-name variants for exact comparison."""
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _plugin_loaded_success(
+    text: str,
+    plugin_name: str,
+    display_name: str = "",
+) -> str:
+    """Return this plugin's complete `Loaded plugin ...` line, if present."""
+    expected_identities = {
+        _oxide_plugin_identity(plugin_name),
+        _oxide_plugin_identity(display_name),
+    }
+    expected_identities.discard("")
+    loaded_pattern = re.compile(
+        r"^\s*Loaded plugin\s+(.+?)\s+v(\S+)\s+by\s+(.+?)\s*$",
+        re.IGNORECASE,
+    )
+    for line in str(text or "").splitlines():
+        match = loaded_pattern.match(line)
+        if not match:
+            continue
+        if _oxide_plugin_identity(match.group(1)) in expected_identities:
+            return line.strip()
+    return ""
+
+
+def _inventory_plugin_metadata(
+    matching_lines: List[str],
+    filename: str,
+) -> Tuple[str, str, str]:
+    """Extract Oxide display name, version, and author from an inventory row."""
+    plugin_filename = Path(filename).name
+    suffix = re.compile(
+        rf"\s+-\s+{re.escape(plugin_filename)}\s*$",
+        re.IGNORECASE,
+    )
+    prefix = re.compile(
+        r'^\s*\d+\s+"([^"]+)"\s+\(([^()]+)\)\s+by\s+(.+?)\s*$',
+        re.IGNORECASE,
+    )
+    timing = re.compile(r"\s+\([^()]*?/[^()]*?\)\s*$")
+    for line in matching_lines:
+        without_filename = suffix.sub("", line)
+        match = prefix.match(without_filename)
+        if not match:
+            continue
+        author = timing.sub("", match.group(3)).strip()
+        return (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            author,
+        )
+    return Path(plugin_filename).stem, "", ""
+
+
+def _plugin_activation_completed(
+    text: str,
+    plugin_name: str,
+    display_name: str = "",
+) -> bool:
+    """Return true only for this plugin's terminal load or compiler failure."""
     if _reload_compile_failure(text, plugin_name):
         return True
-    for line in str(text or "").splitlines():
-        if (
-            _line_mentions_plugin(line, plugin_name)
-            and re.search(
-                r"\bcompiled successfully\b",
-                line,
-                re.IGNORECASE,
-            )
-        ):
-            return True
-    return False
+    return bool(
+        _plugin_loaded_success(
+            text,
+            plugin_name,
+            display_name,
+        )
+    )
 
 
 def _inventory_lines_for_plugin(
@@ -2244,34 +2315,60 @@ def reload_updated_plugins(
                 record["response"] = detail
                 return
 
-    for index, (filename, _expected_version) in enumerate(requested, start=1):
+    for index, (filename, expected_version) in enumerate(requested, start=1):
         plugin_name = Path(filename).stem
         matching_lines = _inventory_lines_for_plugin(
             inventory_before,
             filename,
         )
+        display_name, loaded_version, loaded_author = (
+            _inventory_plugin_metadata(matching_lines, filename)
+        )
+        if not loaded_version and expected_version != "-":
+            loaded_version = expected_version
         currently_loaded = bool(matching_lines) and not any(
             re.search(r"\bfailed to compile\b", line, re.IGNORECASE)
             for line in matching_lines
         )
         action = "reload" if currently_loaded else "load"
         command = f"oxide.{action} {plugin_name}"
+        target_description = display_name
+        if loaded_version:
+            target_description += f" v{loaded_version}"
+        if loaded_author:
+            target_description += f" by {loaded_author}"
+        spinner_message = (
+            f"[{index:>{len(str(len(requested)))}}/{len(requested)}] "
+            f"Verifying {target_description} ({command})"
+        )
         try:
-            ok, response = watchdog.rcon_send(
-                cfg,
-                command,
-                response_matcher=(
-                    lambda text, target=plugin_name:
-                        _plugin_compile_completed(text, target)
-                ),
-                timeout_s=command_timeout_seconds,
-            )
+            with ActivitySpinner(spinner_message):
+                ok, response = watchdog.rcon_send(
+                    cfg,
+                    command,
+                    response_matcher=(
+                        lambda text,
+                        target=plugin_name,
+                        target_display=display_name:
+                            _plugin_activation_completed(
+                                text,
+                                target,
+                                target_display,
+                            )
+                    ),
+                    timeout_s=command_timeout_seconds,
+                )
         except Exception as e:
             ok, response = False, f"RCON {action} raised an exception: {e}"
         response_text = _rcon_response_text(watchdog, response)
         compile_failure = _reload_compile_failure(
             response_text,
             plugin_name,
+        )
+        loaded_success = _plugin_loaded_success(
+            response_text,
+            plugin_name,
+            display_name,
         )
         if not ok:
             status = "RCON FAILED"
@@ -2285,7 +2382,7 @@ def reload_updated_plugins(
             activation_failed.add(filename)
         else:
             status = "OK"
-            detail = response_text
+            detail = loaded_success or response_text
         if activation_records is not None:
             activation_records.append(
                 {
@@ -2987,14 +3084,29 @@ def main(
             detail: str,
         ) -> None:
             status_color = "green" if status == "OK" else "red"
-            command = (
-                activation_records[-1].get("command", "")
-                if activation_records
-                else ""
+            command = next(
+                (
+                    record.get("command", "")
+                    for record in reversed(activation_records)
+                    if record.get("plugin") == filename
+                ),
+                "",
             )
+            prefix = f"  [{index:>{len(str(total))}}/{total}] "
+            if status == "OK" and detail:
+                print(
+                    prefix
+                    + color_text(
+                        detail,
+                        "green",
+                        use=use_color,
+                    )
+                    + (f" ({command})" if command else "")
+                )
+                return
             print(
-                f"  [{index:>{len(str(total))}}/{total}] "
-                f"{filename} -- "
+                prefix
+                + f"{filename} -- "
                 + color_text(
                     status,
                     status_color,
@@ -3546,15 +3658,36 @@ def main(
                 detail: str,
             ) -> None:
                 status_color = "green" if status == "OK" else "red"
+                command = next(
+                    (
+                        record.get("command", "")
+                        for record in reversed(activation_records)
+                        if record.get("plugin") == filename
+                    ),
+                    "",
+                )
+                prefix = f"  [{index:>{len(str(total))}}/{total}] "
+                if status == "OK" and detail:
+                    print(
+                        prefix
+                        + color_text(
+                            detail,
+                            "green",
+                            use=use_color,
+                        )
+                        + (f" ({command})" if command else "")
+                    )
+                    return
                 print(
-                    f"  [{index:>{len(str(total))}}/{total}] "
-                    f"{filename} -- "
+                    prefix
+                    + f"{filename} -- "
                     + color_text(
                         status,
                         status_color,
                         use=use_color,
                         bold=status != "OK",
                     )
+                    + (f" ({command})" if command else "")
                 )
                 if status != "OK" and detail:
                     print(f"      {detail}")
