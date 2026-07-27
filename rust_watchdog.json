@@ -55,6 +55,7 @@
   "forced_wipe_trigger": "new-build-after-schedule",
   "forced_wipe_early_release_tolerance_minutes": 15,
   "forced_wipe_action_window_minutes": 360,
+  "forced_wipe_fallback_at_window_end": false,
   "forced_wipe_backup_before": true,
   "forced_wipe_backup_required": true,
   "forced_wipe_verify_update_current": true,

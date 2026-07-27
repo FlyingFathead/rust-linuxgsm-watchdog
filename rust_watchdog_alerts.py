@@ -149,6 +149,15 @@ def _hostname() -> str:
         return "unknown-host"
 
 
+def _version_label(value: Any) -> str:
+    version = str(value or "").strip()
+    if not version:
+        return "N/A"
+    if version.upper() == "N/A":
+        return "N/A"
+    return version if version.lower().startswith("v") else f"v{version}"
+
+
 def _telegram_markdown_escape(value: Any, *, v2: bool) -> str:
     s = str(value)
     chars = r"_*[]()~`>#+-=|{}.!\\" if v2 else r"_*[`\\"
@@ -254,8 +263,14 @@ class AlertManager:
 
     def _app_label_for(self, alert: Alert) -> str:
         app = str(alert.fields.get("app") or self.app_default).strip()
-        ver = str(alert.fields.get("version") or self.version_default).strip()
-        return f"{app} {ver}".strip()
+        # An explicitly supplied empty runtime version must become N/A rather
+        # than falling through to a possibly stale config value.
+        version = (
+            alert.fields.get("version")
+            if "version" in alert.fields
+            else self.version_default
+        )
+        return f"{app} ({_version_label(version)})".strip()
 
     def _title_for(self, alert: Alert) -> str:
         # If caller didn’t provide a meaningful title, use event_titles mapping

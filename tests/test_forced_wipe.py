@@ -160,6 +160,105 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertFalse(hotfix.armed_now)
         self.assertFalse(hotfix.pending)
 
+    def test_window_end_fallback_is_disabled_by_default(self):
+        c = self.coordinator()
+        c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-06T12:00:00Z"),
+        )
+        decision = c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-07T00:00:00Z"),
+        )
+        self.assertFalse(decision.armed_now)
+        self.assertFalse(decision.pending)
+
+    def test_window_end_fallback_arms_configured_action_at_cutoff(self):
+        self.cfg["forced_wipe_fallback_at_window_end"] = True
+        c = self.coordinator()
+        c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-06T12:00:00Z"),
+        )
+
+        before = c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-06T23:59:59Z"),
+        )
+        self.assertFalse(before.armed_now)
+        self.assertFalse(before.pending)
+
+        due = c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-07T00:00:00Z"),
+        )
+        self.assertTrue(due.armed_now)
+        self.assertTrue(due.pending)
+        self.assertTrue(due.action_due)
+        self.assertFalse(due.hold)
+        self.assertEqual(due.armed_trigger, "window-end-fallback")
+        self.assertEqual(due.candidate_remote_build, "")
+        self.assertEqual(c.state["armed_action"], "full-wipe")
+        self.assertEqual(c.state["armed_trigger"], "window-end-fallback")
+
+        reloaded = self.coordinator()
+        self.assertTrue(reloaded.state["pending"])
+        self.assertTrue(reloaded.needs_recovery(dt("2026-08-07T00:01:00Z")))
+
+    def test_window_end_fallback_refuses_retroactive_late_start(self):
+        self.cfg["forced_wipe_fallback_at_window_end"] = True
+        c = self.coordinator()
+        decision = c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-27T12:00:00Z"),
+        )
+        self.assertFalse(decision.armed_now)
+        self.assertFalse(decision.pending)
+        self.assertIn("not observed before the cutoff", decision.reason)
+
+    def test_manual_wipe_earlier_on_facepunch_day_suppresses_fallback(self):
+        self.cfg["forced_wipe_fallback_at_window_end"] = True
+        c = self.coordinator()
+        c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-06T08:00:00Z"),
+        )
+        result = c.mark_manual_complete(
+            dt("2026-08-06T10:05:00Z"),
+            wiped_at=dt("2026-08-06T10:00:00Z"),
+            wipe_kind="full-wipe",
+        )
+        self.assertTrue(result["completed_cycle"])
+
+        decision = c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-07T00:00:00Z"),
+        )
+        self.assertFalse(decision.armed_now)
+        self.assertFalse(decision.pending)
+        self.assertTrue(c.state["completed"])
+
+    def test_completed_fallback_cannot_rearm_on_later_update(self):
+        self.cfg["forced_wipe_fallback_at_window_end"] = True
+        c = self.coordinator()
+        c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-06T12:00:00Z"),
+        )
+        c.observe_update(
+            wd.UpdateCheckResult(False, "100", "100"),
+            dt("2026-08-07T00:00:00Z"),
+        )
+        c.mark_wipe_done(dt("2026-08-07T00:05:00Z"))
+        self.assertTrue(c.finish_if_running(dt("2026-08-07T00:10:00Z")))
+
+        later = c.observe_update(
+            wd.UpdateCheckResult(True, "100", "101"),
+            dt("2026-08-07T01:00:00Z"),
+        )
+        self.assertFalse(later.armed_now)
+        self.assertFalse(later.pending)
+
     def test_wipe_done_survives_restart(self):
         c = self.coordinator()
         c.state.update(

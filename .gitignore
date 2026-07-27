@@ -28,6 +28,9 @@ log/**
 log/
 *.log
 
+# archives
+*.zip
+
 # extra files
 .watchdog_pause
 

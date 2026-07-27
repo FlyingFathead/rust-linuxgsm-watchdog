@@ -63,6 +63,16 @@ Optional (only needed for WebRCON features like `--test-rcon-say` and the Smooth
 - `tests/test_alert_footnotes.py` -- Telegram HTML/Markdown footnote regression tests
 - `tests/test_config_edit.py` -- persistent config-editing and path-migration regression tests
 
+The release version is declared once as `__version__` near the top of
+`rust_watchdog.py`. Every alert reads that runtime value and renders it in the
+application label:
+
+```text
+🟢 rust-linuxgsm-watchdog (v0.4.4) -- started
+```
+
+If the value is missing or empty, the alert renderer uses `(N/A)` instead.
+
 ---
 
 ## Config / Usage
@@ -350,6 +360,7 @@ blueprints):
 
   "forced_wipe_early_release_tolerance_minutes": 15,
   "forced_wipe_action_window_minutes": 360,
+  "forced_wipe_fallback_at_window_end": false,
 
   "forced_wipe_backup_before": true,
   "forced_wipe_backup_required": true,
@@ -380,6 +391,29 @@ deletion.
 If the watchdog starts inside the release window without a previously persisted
 fence, it refuses to arm an automatic wipe. That can miss an unattended wipe,
 but it cannot reinterpret an old pending update as permission to delete data.
+
+An optional calendar backstop can guarantee the configured wipe action even
+when the monthly build is not identified:
+
+```json
+{
+  "forced_wipe_fallback_at_window_end": true
+}
+```
+
+The fallback arms at the end of `forced_wipe_action_window_minutes`. With the
+default schedule and 360-minute window, that is 01:00 `Europe/London` after the
+first-Thursday 19:00 release time. It uses `forced_wipe_action`, so it performs
+either `map-wipe` or `full-wipe`; it cannot select a different wipe kind.
+
+This does not claim that a particular build was the Facepunch monthly release.
+It is explicitly a calendar fallback: if no wipe is recorded for that cycle by
+the cutoff, it runs the normal backup/update/verify/mod-update/wipe/start
+lifecycle anyway. The watchdog must have observed the cycle before the cutoff.
+Consequently, enabling the option after an old monthly window has already
+passed cannot cause an immediate retroactive wipe. A manual wipe recorded on
+the scheduled Facepunch wipe day also completes the cycle and suppresses the
+fallback.
 
 Once armed, both restart paths use the same lifecycle:
 
@@ -734,6 +768,16 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.4
+  **Fixed / Added:**
+  - Declared `0.4.4` once in `rust_watchdog.py` and added `(v0.4.4)` to every normal alert header and the direct Telegram status-test header.
+  - Added an `(N/A)` alert-header fallback when no version value is available.
+  - Updated the MIT license copyright attribution and project home-page line.
+  - Added the opt-in `forced_wipe_fallback_at_window_end` calendar backstop.
+  - The fallback runs the configured `map-wipe` or `full-wipe` action when the Facepunch monthly action window ends without a recorded wipe.
+  - Added a pre-cutoff observation guard so enabling the option after an old window cannot trigger a retroactive wipe.
+  - A manual wipe recorded on the scheduled Facepunch wipe day now completes that cycle even when performed earlier than the build-candidate tolerance.
+  - The fallback reuses the persisted one-wipe-per-cycle, pre-destructive marker, ambiguous-result, and start-only retry protections.
 - v0.4.3
   **Fixed / Added:**
   - Added `--change-home-user USER` with the `--changeuser` alias to migrate all `/home/<user>`-prefixed JSON path values while leaving `identity` and the systemd unit untouched.
