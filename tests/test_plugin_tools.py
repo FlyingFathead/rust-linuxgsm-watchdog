@@ -141,6 +141,25 @@ class PluginUpdaterConfigTests(unittest.TestCase):
             config["cache"]["file"],
             "data/cache/oxide_plugin_updater_cache.json",
         )
+        self.assertEqual(
+            config["network"]["minimum_interval_seconds"],
+            1.5,
+        )
+        self.assertEqual(
+            config["network"]["maximum_interval_seconds"],
+            3.0,
+        )
+
+    def test_invalid_network_interval_range_is_rejected(self):
+        config = checker.copy.deepcopy(checker.CONFIG_DEFAULTS)
+        config["network"]["minimum_interval_seconds"] = 3.0
+        config["network"]["maximum_interval_seconds"] = 1.5
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "maximum_interval_seconds",
+        ):
+            checker.validate_updater_config(config)
 
     def test_config_paths_are_resolved_relative_to_config_file(self):
         with tempfile.TemporaryDirectory() as td:
@@ -545,8 +564,96 @@ class PluginCacheTests(unittest.TestCase):
 
             self.assertEqual(checker.load_cache(path), {})
 
+    def test_override_cache_fetches_fresh_result_and_replaces_valid_entry(self):
+        local = {
+            "file": "/srv/oxide/plugins/ExamplePlugin.cs",
+            "filename": "ExamplePlugin.cs",
+            "name": "Example Plugin",
+            "author": "Example Author",
+            "version": "1.0.0",
+            "size_bytes": 500,
+        }
+        fresh = checker.HttpResult(
+            data={
+                "latest_release_version": "1.2.0",
+                "url": "https://umod.org/plugins/example-plugin",
+            },
+            headers={},
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "cache.json"
+            checker.save_cache(
+                cache_path,
+                {
+                    "umod:json:ExamplePlugin": {
+                        "ts": int(checker.time.time()),
+                        "data": {
+                            "latest_release_version": "1.1.0",
+                            "url": "https://umod.org/plugins/example-plugin",
+                        },
+                    }
+                },
+            )
+            with mock.patch.object(
+                checker,
+                "scan_plugins",
+                return_value=[local],
+            ), mock.patch.object(
+                checker,
+                "http_get_json",
+                return_value=fresh,
+            ) as fetch, contextlib.redirect_stdout(
+                io.StringIO()
+            ) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                rc = checker.main(
+                    [
+                        "/srv/oxide/plugins",
+                        "--no-check-chaos",
+                        "--cache",
+                        str(cache_path),
+                        "--override-cache",
+                        "--no-log",
+                        "--no-state",
+                        "--color",
+                        "never",
+                    ]
+                )
+
+            self.assertEqual(rc, 1)
+            fetch.assert_called_once()
+            self.assertIn("1.2.0", stdout.getvalue())
+            self.assertIn("Cache override enabled", stderr.getvalue())
+            self.assertEqual(
+                checker.load_cache(cache_path)[
+                    "umod:json:ExamplePlugin"
+                ]["data"]["latest_release_version"],
+                "1.2.0",
+            )
+
 
 class PluginNetworkBackoffTests(unittest.TestCase):
+    def test_randomized_pacing_uses_one_shared_request_clock(self):
+        checker._LAST_NETWORK_REQUEST_STARTED = 0.0
+        with mock.patch.object(
+            checker.random,
+            "uniform",
+            side_effect=[1.5, 2.0],
+        ) as uniform, mock.patch.object(
+            checker.time,
+            "monotonic",
+            side_effect=[100.0, 100.0, 100.5, 102.0],
+        ), mock.patch.object(checker.time, "sleep") as sleep:
+            first_wait = checker.pace_network_request(1.5, 3.0)
+            second_wait = checker.pace_network_request(1.5, 3.0)
+
+        self.assertEqual(first_wait, 0.0)
+        self.assertEqual(second_wait, 1.5)
+        uniform.assert_has_calls(
+            [mock.call(1.5, 3.0), mock.call(1.5, 3.0)]
+        )
+        sleep.assert_called_once_with(1.5)
+
     def test_retry_header_and_exponential_fallback_are_bounded(self):
         self.assertEqual(
             checker.rate_limit_delay(
@@ -1217,8 +1324,16 @@ class PluginUpdateOutputTests(unittest.TestCase):
         self.assertIn("RCON unavailable", rendered)
 
     def test_reload_uses_environment_password_and_exact_oxide_command(self):
-        rcon_send = mock.Mock(return_value=(True, "reload complete"))
-        watchdog = mock.Mock(rcon_send=rcon_send)
+        rcon_send = mock.Mock(
+            side_effect=[
+                (True, "ExamplePlugin was compiled successfully"),
+                (True, "01 ExamplePlugin - 1.2.3"),
+            ]
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
         with mock.patch.dict(
             os.environ,
             {"TEST_RUST_RCON_PASSWORD": "secret"},
@@ -1235,16 +1350,88 @@ class PluginUpdateOutputTests(unittest.TestCase):
                     "password": "",
                     "password_environment_variable":
                         "TEST_RUST_RCON_PASSWORD",
-                }
+                },
+                [("ExamplePlugin.cs", "1.2.3")],
             )
 
         self.assertTrue(ok)
-        self.assertEqual(response, "reload complete")
-        rcon_send.assert_called_once()
-        cfg, command = rcon_send.call_args.args
-        self.assertEqual(command, "oxide.reload *")
+        self.assertEqual(response, "1 plugin reloaded and verified")
+        self.assertEqual(rcon_send.call_count, 2)
+        cfg, command = rcon_send.call_args_list[0].args
+        self.assertEqual(command, "oxide.reload ExamplePlugin")
         self.assertEqual(cfg["rcon_password"], "secret")
         self.assertEqual(cfg["identity"], "rustserver")
+        self.assertEqual(
+            rcon_send.call_args_list[1].args[1],
+            "oxide.plugins",
+        )
+
+    def test_individual_reload_reports_compile_failure_and_skips_inventory(self):
+        rcon_send = mock.Mock(
+            return_value=(
+                True,
+                "Kits - Failed to compile: bad overload | Line: 1840, Pos: 33",
+            )
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        progress = mock.Mock()
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ):
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                [("Kits.cs", "4.4.9")],
+                progress=progress,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Kits.cs: Kits - Failed to compile", response)
+        rcon_send.assert_called_once()
+        progress.assert_called_once()
+        self.assertEqual(
+            progress.call_args.args[3],
+            "FAILED TO COMPILE",
+        )
+
+    def test_individual_reload_rejects_missing_expected_inventory_version(self):
+        rcon_send = mock.Mock(
+            side_effect=[
+                (True, "reload complete"),
+                (True, "01 ExamplePlugin - 1.2.2"),
+            ]
+        )
+        watchdog = mock.Mock(
+            rcon_send=rcon_send,
+            rcon_extract_message=lambda value: value,
+        )
+        with mock.patch.object(
+            checker.importlib,
+            "import_module",
+            return_value=watchdog,
+        ):
+            ok, response = checker.reload_updated_plugins(
+                {
+                    "host": "127.0.0.1",
+                    "port": 28016,
+                    "password": "secret",
+                },
+                [("ExamplePlugin.cs", "1.2.3")],
+            )
+
+        self.assertFalse(ok)
+        self.assertIn(
+            "expected version 1.2.3 not found in oxide.plugins",
+            response,
+        )
 
     def test_audit_logger_appends_structured_records(self):
         with tempfile.TemporaryDirectory() as td:

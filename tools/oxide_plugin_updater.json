@@ -9,7 +9,8 @@
 
   "network": {
     "timeout_seconds": 12,
-    "minimum_interval_seconds": 0.6,
+    "minimum_interval_seconds": 1.5,
+    "maximum_interval_seconds": 3.0,
     "maximum_retries": 6,
     "maximum_backoff_seconds": 300,
     "fallback_backoff_seconds": 30,
@@ -18,7 +19,7 @@
 
   "cache": {
     "file": "data/cache/oxide_plugin_updater_cache.json",
-    "umod_ttl_seconds": 43200,
+    "umod_ttl_seconds": 3600,
     "chaoscode_ttl_seconds": 2700
   },
 

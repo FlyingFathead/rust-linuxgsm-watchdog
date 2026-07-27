@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import io
 import json
 import os
 import tempfile
@@ -73,6 +75,77 @@ class ServerInfoSaveCreatedTimeTests(unittest.TestCase):
             wd.extract_serverinfo_save_created_time("not-json"),
             "",
         )
+
+
+class SmoothRestartRequestTests(unittest.TestCase):
+    def test_optional_message_is_announced_before_restart_request(self):
+        cfg = {
+            "smoothrestarter_restart_delay_seconds": 300,
+            "smoothrestarter_console_cmd": "srestart restart {delay}",
+        }
+        with mock.patch.object(
+            wd,
+            "smoothrestarter_available",
+            return_value=(
+                True,
+                True,
+                "/srv/oxide/config/SmoothRestarter.json",
+                "/srv/oxide/plugins/SmoothRestarter.cs",
+                [],
+            ),
+        ), mock.patch.object(
+            wd,
+            "websocket_dep_status",
+            return_value=(True, ""),
+        ), mock.patch.object(
+            wd,
+            "rcon_send",
+            side_effect=[(True, "said"), (True, "scheduled")],
+        ) as send, contextlib.redirect_stdout(io.StringIO()):
+            ok = wd.request_smooth_restart(
+                cfg,
+                "/srv",
+                "/srv/rustserver",
+                announce_message="Restarting after plugin updates",
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(send.call_count, 2)
+        self.assertIn(
+            "Restarting after plugin updates",
+            send.call_args_list[0].args[1],
+        )
+        self.assertEqual(
+            send.call_args_list[1].args[1],
+            "srestart restart 300",
+        )
+
+    def test_missing_plugin_reports_path_and_official_install_url(self):
+        plugin_path = "/srv/oxide/plugins/SmoothRestarter.cs"
+        with mock.patch.object(
+            wd,
+            "smoothrestarter_available",
+            return_value=(
+                False,
+                False,
+                "/srv/oxide/config/SmoothRestarter.json",
+                plugin_path,
+                [f"SmoothRestarter plugin missing: {plugin_path}"],
+            ),
+        ), mock.patch.object(wd, "rcon_send") as send, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as output:
+            ok = wd.request_smooth_restart(
+                {},
+                "/srv",
+                "/srv/rustserver",
+            )
+
+        self.assertFalse(ok)
+        send.assert_not_called()
+        rendered = output.getvalue()
+        self.assertIn(plugin_path, rendered)
+        self.assertIn(wd.SMOOTHRESTARTER_URL, rendered)
 
 
 class RconWipeLedgerTests(unittest.TestCase):

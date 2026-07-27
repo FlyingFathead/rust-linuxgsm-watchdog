@@ -9,7 +9,7 @@ Features:
 - defaults to $HOME/serverfiles/oxide/plugins
 - cache to disk (TTL)
 - proper 429 handling (Retry-After / X-Retry-After)
-- min interval throttling
+- randomized request-interval throttling
 - progress output
 - optional ANSI colors
 - optional ChaosCode fallback (default: on)
@@ -31,6 +31,7 @@ import hashlib
 import importlib
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -68,7 +69,7 @@ CHAOS_MANIFEST_JSON = "https://chaoscode.io/api/resource_manifest.json"
 
 CACHE_DIR_DEFAULT = HERE / "data" / "cache"
 CACHE_FILE_DEFAULT = CACHE_DIR_DEFAULT / "oxide_plugin_updater_cache.json"
-CACHE_TTL_SECONDS_DEFAULT = 12 * 3600
+CACHE_TTL_SECONDS_DEFAULT = 60 * 60
 CONFIG_FILE_DEFAULT = HERE / "oxide_plugin_updater.json"
 LOG_FILE_DEFAULT = HERE.parent / "log" / "oxide_plugin_updater.log"
 PLUGIN_BACKUP_DIR_DEFAULT = HERE / "data" / "plugin-backups"
@@ -79,7 +80,7 @@ CHAOS_CACHE_TTL_SECONDS_DEFAULT = 45 * 60  # manifest updates ~31m; keep a littl
 MAX_PLUGIN_BYTES = 10 * 1024 * 1024
 SHRINK_WARN_PERCENT = 25.0
 SHRINK_REFUSE_PERCENT = 50.0
-RCON_RELOAD_COMMAND = "oxide.reload *"
+RCON_RELOAD_COMMAND = "oxide.reload <updated-plugin>"
 _ACTIVITY_SPINNER_ENABLED = True
 _NETWORK_AUDIT = None
 
@@ -92,7 +93,8 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
     },
     "network": {
         "timeout_seconds": 12,
-        "minimum_interval_seconds": 0.6,
+        "minimum_interval_seconds": 1.5,
+        "maximum_interval_seconds": 3.0,
         "maximum_retries": 6,
         "maximum_backoff_seconds": 300,
         "fallback_backoff_seconds": 30,
@@ -366,6 +368,8 @@ def validate_updater_config(config: Dict[str, Any]) -> None:
     float_minimums = {
         "network.minimum_interval_seconds":
             (config["network"].get("minimum_interval_seconds"), 0.0),
+        "network.maximum_interval_seconds":
+            (config["network"].get("maximum_interval_seconds"), 0.0),
         "validation.shrink_warning_percent":
             (config["validation"].get("shrink_warning_percent"), 0.0),
         "validation.shrink_refusal_percent":
@@ -386,6 +390,17 @@ def validate_updater_config(config: Dict[str, Any]) -> None:
     if refuse > 100:
         raise ValueError(
             "validation.shrink_refusal_percent must not exceed 100"
+        )
+    minimum_interval = float(
+        config["network"]["minimum_interval_seconds"]
+    )
+    maximum_interval = float(
+        config["network"]["maximum_interval_seconds"]
+    )
+    if maximum_interval < minimum_interval:
+        raise ValueError(
+            "network.maximum_interval_seconds must be greater than or equal "
+            "to network.minimum_interval_seconds"
         )
 
     fallback = config["network"]["fallback_backoff_seconds"]
@@ -992,6 +1007,37 @@ def is_rate_limit_failure(error: Exception) -> bool:
     return "http 429" in text or "rate-limit" in text or "rate limit" in text
 
 
+_LAST_NETWORK_REQUEST_STARTED = 0.0
+
+
+def pace_network_request(
+    minimum_interval_s: float,
+    maximum_interval_s: Optional[float] = None,
+) -> float:
+    """Sleep as needed to put a fresh random interval between HTTP requests."""
+    global _LAST_NETWORK_REQUEST_STARTED
+
+    minimum = max(0.0, float(minimum_interval_s))
+    maximum = minimum if maximum_interval_s is None else max(
+        0.0,
+        float(maximum_interval_s),
+    )
+    if maximum < minimum:
+        raise ValueError(
+            "maximum request interval must be greater than or equal to "
+            "minimum request interval"
+        )
+
+    target_interval = random.uniform(minimum, maximum)
+    now = time.monotonic()
+    elapsed = now - _LAST_NETWORK_REQUEST_STARTED
+    wait = max(0.0, target_interval - elapsed)
+    if _LAST_NETWORK_REQUEST_STARTED > 0.0 and wait > 0.0:
+        time.sleep(wait)
+    _LAST_NETWORK_REQUEST_STARTED = time.monotonic()
+    return wait
+
+
 def http_get_json(
     url: str,
     *,
@@ -1001,20 +1047,15 @@ def http_get_json(
     debug_headers: bool,
     fallback_backoff_s: int = 30,
     max_backoff_s: int = 300,
+    max_interval_s: Optional[float] = None,
 ) -> HttpResult:
-    # naive min-interval limiter (per-process)
-    now = time.monotonic()
-    last = getattr(http_get_json, "_last_call", 0.0)
-    dt = now - last
-    if dt < min_interval_s:
-        time.sleep(min_interval_s - dt)
+    pace_network_request(min_interval_s, max_interval_s)
 
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
 
     attempt = 0
     while True:
         attempt += 1
-        setattr(http_get_json, "_last_call", time.monotonic())
         try:
             label = Path(urlparse(url).path).name or "uMod metadata"
             with ActivitySpinner(f"Fetching {label}"):
@@ -1092,13 +1133,10 @@ def http_get_bytes(
     max_bytes: int = MAX_PLUGIN_BYTES,
     fallback_backoff_s: int = 30,
     max_backoff_s: int = 300,
+    max_interval_s: Optional[float] = None,
 ) -> HttpBytesResult:
     """Download a bounded response body with the checker's normal retry policy."""
-    now = time.monotonic()
-    last = getattr(http_get_bytes, "_last_call", 0.0)
-    dt = now - last
-    if dt < min_interval_s:
-        time.sleep(min_interval_s - dt)
+    pace_network_request(min_interval_s, max_interval_s)
 
     req = Request(
         url,
@@ -1111,7 +1149,6 @@ def http_get_bytes(
     attempt = 0
     while True:
         attempt += 1
-        setattr(http_get_bytes, "_last_call", time.monotonic())
         try:
             label = Path(urlparse(url).path).name or "plugin source"
             with ActivitySpinner(f"Downloading {label}"):
@@ -1254,6 +1291,8 @@ def load_chaos_manifest(
     debug_headers: bool,
     fallback_backoff_s: int = 30,
     max_backoff_s: int = 300,
+    min_interval_s: float = 0.0,
+    max_interval_s: Optional[float] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Returns mapping: stem_lower -> resource dict
@@ -1274,11 +1313,12 @@ def load_chaos_manifest(
     res = http_get_json(
         CHAOS_MANIFEST_JSON,
         timeout_s=int(timeout_s),
-        min_interval_s=0.0,  # one call
+        min_interval_s=min_interval_s,
         max_retries=3,
         debug_headers=bool(debug_headers),
         fallback_backoff_s=fallback_backoff_s,
         max_backoff_s=max_backoff_s,
+        max_interval_s=max_interval_s,
     )
     manifest_list = res.data
     if not isinstance(manifest_list, list):
@@ -1692,6 +1732,7 @@ def install_update(
     max_backoff_s: int = 300,
     package_state: Optional[Dict[str, Any]] = None,
     state_history_limit: int = 50,
+    max_interval_s: Optional[float] = None,
 ) -> bool:
     print(
         color_text(
@@ -1761,6 +1802,7 @@ def install_update(
             max_bytes=max_plugin_bytes,
             fallback_backoff_s=fallback_backoff_s,
             max_backoff_s=max_backoff_s,
+            max_interval_s=max_interval_s,
         )
     except Exception as e:
         print(color_text(f"  DOWNLOAD FAILED: {e}", "red", use=use_color))
@@ -1914,8 +1956,36 @@ def install_update(
     return True
 
 
-def reload_updated_plugins(rcon_config: Dict[str, Any]) -> Tuple[bool, str]:
-    """Send one post-update reload through the watchdog's proven WebRCON client."""
+def _rcon_response_text(watchdog: Any, response: Any) -> str:
+    extractor = getattr(watchdog, "rcon_extract_message", None)
+    if callable(extractor):
+        return str(extractor(str(response or "")) or "").strip()
+    return str(response or "").strip()
+
+
+def _reload_compile_failure(text: str) -> str:
+    """Return the useful compiler-error line, or an empty string."""
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    for line in lines:
+        if re.search(r"\bfailed to compile\b", line, re.IGNORECASE):
+            return line
+    for line in lines:
+        if re.search(
+            r"\b(?:compiler error|compilation failed)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            return line
+    return ""
+
+
+def reload_updated_plugins(
+    rcon_config: Dict[str, Any],
+    plugins: Optional[List[Tuple[str, str]]] = None,
+    *,
+    progress: Optional[Any] = None,
+) -> Tuple[bool, str]:
+    """Reload updated plugins individually and verify the resulting inventory."""
     password = str(rcon_config.get("password") or "")
     password_environment_variable = str(
         rcon_config.get("password_environment_variable") or ""
@@ -1942,11 +2012,86 @@ def reload_updated_plugins(rcon_config: Dict[str, Any]) -> Tuple[bool, str]:
         "rcon_port": port,
         "rcon_password": password,
     }
-    try:
-        ok, response = watchdog.rcon_send(cfg, RCON_RELOAD_COMMAND)
-    except Exception as e:
-        return False, f"RCON reload raised an exception: {e}"
-    return bool(ok), str(response or "").strip()
+    requested = list(plugins or [])
+    if not requested:
+        return False, "no updated plugins were supplied for reload"
+
+    failures: List[str] = []
+    for index, (filename, _expected_version) in enumerate(requested, start=1):
+        plugin_name = Path(filename).stem
+        command = f"oxide.reload {plugin_name}"
+        try:
+            ok, response = watchdog.rcon_send(cfg, command)
+        except Exception as e:
+            ok, response = False, f"RCON reload raised an exception: {e}"
+        response_text = _rcon_response_text(watchdog, response)
+        compile_failure = _reload_compile_failure(response_text)
+        if not ok:
+            status = "RCON FAILED"
+            detail = response_text or "no response"
+            failures.append(f"{filename}: {detail}")
+        elif compile_failure:
+            status = "FAILED TO COMPILE"
+            detail = compile_failure
+            failures.append(f"{filename}: {compile_failure}")
+        else:
+            status = "OK"
+            detail = response_text
+        if progress:
+            progress(index, len(requested), filename, status, detail)
+
+    inventory_ok = False
+    inventory_text = ""
+    if not failures:
+        try:
+            inventory_ok, inventory_response = watchdog.rcon_send(
+                cfg,
+                "oxide.plugins",
+            )
+            inventory_text = _rcon_response_text(
+                watchdog,
+                inventory_response,
+            )
+        except Exception as e:
+            inventory_text = f"oxide.plugins raised an exception: {e}"
+
+        if not inventory_ok:
+            failures.append(
+                "final oxide.plugins verification failed: "
+                + (inventory_text or "no response")
+            )
+        else:
+            inventory_lines = inventory_text.splitlines()
+            for filename, expected_version in requested:
+                plugin_name = Path(filename).stem
+                matching_lines = [
+                    line
+                    for line in inventory_lines
+                    if plugin_name.casefold() in line.casefold()
+                ]
+                if not matching_lines:
+                    failures.append(
+                        f"{filename}: not listed by oxide.plugins after reload"
+                    )
+                elif (
+                    expected_version
+                    and expected_version != "-"
+                    and not any(
+                        expected_version.casefold() in line.casefold()
+                        for line in matching_lines
+                    )
+                ):
+                    failures.append(
+                        f"{filename}: expected version {expected_version} "
+                        "not found in oxide.plugins"
+                    )
+
+    if failures:
+        return False, "\n".join(failures)
+    return True, (
+        f"{len(requested)} plugin"
+        f"{'' if len(requested) == 1 else 's'} reloaded and verified"
+    )
 
 
 # ------------------------------------------------------------
@@ -2093,7 +2238,15 @@ def main(
         "--cache-ttl",
         type=int,
         default=int(cache_config.get("umod_ttl_seconds", CACHE_TTL_SECONDS_DEFAULT)),
-        help="uMod cache TTL seconds",
+        help="uMod result validity time in seconds",
+    )
+    ap.add_argument(
+        "--override-cache",
+        action="store_true",
+        help=(
+            "ignore valid uMod and ChaosCode cache entries for this run, "
+            "fetch fresh results, and refresh the cache"
+        ),
     )
 
     # Chaos toggle (default: on)
@@ -2135,8 +2288,17 @@ def main(
     ap.add_argument(
         "--min-interval",
         type=float,
-        default=float(network_config.get("minimum_interval_seconds", 0.6)),
-        help="minimum seconds between HTTP requests",
+        default=None,
+        help=(
+            "minimum seconds between HTTP requests; by itself, preserves "
+            "legacy fixed-interval behavior"
+        ),
+    )
+    ap.add_argument(
+        "--max-interval",
+        type=float,
+        default=None,
+        help="maximum seconds between HTTP requests for randomized pacing",
     )
     ap.add_argument(
         "--max-retries",
@@ -2194,8 +2356,8 @@ def main(
             ),
             action=argparse.BooleanOptionalAction,
             help=argparse.SUPPRESS if legacy_check_only else (
-                f"send `{RCON_RELOAD_COMMAND}` once after successful updates "
-                "(configured default: enabled)"
+                "reload each updated plugin via RCON, detect compile failures, "
+                "and verify oxide.plugins (configured default: enabled)"
             ),
         )
     except AttributeError:
@@ -2235,6 +2397,27 @@ def main(
         help="do not read or write persistent plugin package state",
     )
     args = ap.parse_args(argv)
+
+    configured_min_interval = float(
+        network_config.get("minimum_interval_seconds", 1.5)
+    )
+    configured_max_interval = float(
+        network_config.get("maximum_interval_seconds", 3.0)
+    )
+    if args.min_interval is None and args.max_interval is None:
+        args.min_interval = configured_min_interval
+        args.max_interval = configured_max_interval
+    elif args.min_interval is not None and args.max_interval is None:
+        # Preserve the pre-range CLI meaning: --min-interval N alone is a
+        # fixed N-second interval rather than an accidental N-to-config-max
+        # range.
+        args.max_interval = args.min_interval
+    elif args.min_interval is None:
+        args.min_interval = configured_min_interval
+    if args.min_interval < 0:
+        ap.error("--min-interval must be at least 0")
+    if args.max_interval < args.min_interval:
+        ap.error("--max-interval must be greater than or equal to --min-interval")
 
     _ACTIVITY_SPINNER_ENABLED = bool(
         network_config.get("show_activity_spinner", True)
@@ -2353,6 +2536,12 @@ def main(
         ),
     )
     cache = load_cache(cache_path)
+    if args.override_cache:
+        print(
+            "Cache override enabled: fetching fresh uMod and ChaosCode "
+            "results; refreshed results will still be cached.",
+            file=sys.stderr,
+        )
     package_state: Optional[Dict[str, Any]] = None
     if state_enabled:
         try:
@@ -2390,16 +2579,28 @@ def main(
 
     chaos_index: Dict[str, Dict[str, Any]] = {}
     chaos_load_err: Optional[str] = None
+    chaos_manifest_cached = False
     if check_chaos:
+        chaos_ent = cache.get("chaos:manifest")
+        if isinstance(chaos_ent, dict) and not args.override_cache:
+            chaos_ts = int(chaos_ent.get("ts", 0) or 0)
+            chaos_manifest_cached = bool(
+                chaos_ts
+                and (int(time.time()) - chaos_ts)
+                <= int(args.chaos_cache_ttl)
+                and isinstance(chaos_ent.get("data"), list)
+            )
         try:
             chaos_index = load_chaos_manifest(
                 cache,
                 cache_path,
-                ttl_s=int(args.chaos_cache_ttl),
+                ttl_s=-1 if args.override_cache else int(args.chaos_cache_ttl),
                 timeout_s=int(args.timeout),
                 debug_headers=bool(args.debug_headers),
                 fallback_backoff_s=fallback_backoff_s,
                 max_backoff_s=max_backoff_s,
+                min_interval_s=float(args.min_interval),
+                max_interval_s=float(args.max_interval),
             )
         except Exception as e:
             chaos_load_err = str(e)
@@ -2440,7 +2641,7 @@ def main(
         data = None
 
         ent = cache.get(key)
-        if isinstance(ent, dict):
+        if isinstance(ent, dict) and not args.override_cache:
             ts = int(ent.get("ts", 0) or 0)
             if ts and (now - ts) <= int(args.cache_ttl) and "data" in ent:
                 data = ent["data"]
@@ -2464,6 +2665,7 @@ def main(
                         debug_headers=bool(args.debug_headers),
                         fallback_backoff_s=fallback_backoff_s,
                         max_backoff_s=max_backoff_s,
+                        max_interval_s=float(args.max_interval),
                     )
                     data = res.data
                     cache[key] = {"ts": now, "data": data}
@@ -2502,6 +2704,7 @@ def main(
                     debug_headers=bool(args.debug_headers),
                     fallback_backoff_s=fallback_backoff_s,
                     max_backoff_s=max_backoff_s,
+                    max_interval_s=float(args.max_interval),
                 )
                 m = best_match_from_search(filename, sres.data if isinstance(sres.data, dict) else {})
                 if m:
@@ -2540,6 +2743,7 @@ def main(
             rr = chaos_index.get(stem_l)
             if isinstance(rr, dict):
                 source = "chaos"
+                cached = chaos_manifest_cached
                 remote_ver = str(rr.get("ResourceVersion") or "-")
                 remote_url = str(rr.get("ResourceURL") or "-")
 
@@ -2670,6 +2874,7 @@ def main(
     update_failures = 0
     update_successes = 0
     updated_filenames = set()
+    updated_plugins_for_reload: List[Tuple[str, str]] = []
     failed_filenames = set()
     reload_attempted = False
     reload_succeeded = False
@@ -2731,12 +2936,16 @@ def main(
                 ),
                 fallback_backoff_s=fallback_backoff_s,
                 max_backoff_s=max_backoff_s,
+                max_interval_s=float(args.max_interval),
                 package_state=package_state,
                 state_history_limit=history_limit,
             )
             if installed_ok:
                 update_successes += 1
                 updated_filenames.add(candidate.filename)
+                updated_plugins_for_reload.append(
+                    (candidate.filename, candidate.remote_version)
+                )
                 if package_state is not None:
                     try:
                         save_plugin_state(state_path, package_state)
@@ -2760,13 +2969,40 @@ def main(
             print()
             print(
                 color_text(
-                    f"Reloading plugins via RCON: {RCON_RELOAD_COMMAND}",
+                    "Reloading updated plugins individually via RCON "
+                    "and checking compile results:",
                     "cyan",
                     use=use_color,
                     bold=True,
                 )
             )
-            reload_succeeded, reload_detail = reload_updated_plugins(rcon_config)
+
+            def show_reload_progress(
+                index: int,
+                total: int,
+                filename: str,
+                status: str,
+                detail: str,
+            ) -> None:
+                status_color = "green" if status == "OK" else "red"
+                print(
+                    f"  [{index:>{len(str(total))}}/{total}] "
+                    f"{filename} -- "
+                    + color_text(
+                        status,
+                        status_color,
+                        use=use_color,
+                        bold=status != "OK",
+                    )
+                )
+                if status != "OK" and detail:
+                    print(f"      {detail}")
+
+            reload_succeeded, reload_detail = reload_updated_plugins(
+                rcon_config,
+                updated_plugins_for_reload,
+                progress=show_reload_progress,
+            )
             if reload_succeeded:
                 print(
                     color_text(

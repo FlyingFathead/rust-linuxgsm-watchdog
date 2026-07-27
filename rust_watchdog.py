@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 
 def _runtime_version():
@@ -5197,7 +5197,13 @@ def screen_send_line(target_session, line, fp=None, dry_run=False, timeout=5):
         log(f"SMOOTH_BRIDGE: screen stuff error: {e}", fp)
         return False
 
-def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
+def request_smooth_restart(
+    cfg,
+    server_dir,
+    rustserver_path,
+    fp=None,
+    announce_message=None,
+):
     """
     Ask SmoothRestarter to schedule a restart.
 
@@ -5212,6 +5218,10 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
 
     if not ok:
         log(f"SMOOTH_BRIDGE: SmoothRestarter plugin not found: {sr_plugin}", fp)
+        log(
+            f"SMOOTH_BRIDGE: Install it from: {SMOOTHRESTARTER_URL}",
+            fp,
+        )
         return False
     if not cfg_ok:
         log(f"SMOOTH_BRIDGE: NOTE: SmoothRestarter config missing (may be first run): {sr_cfg}", fp)
@@ -5222,8 +5232,28 @@ def request_smooth_restart(cfg, server_dir, rustserver_path, fp=None):
 
     ok_ws, ws_err = websocket_dep_status()
     if not ok_ws:
-        log(f"SMOOTH_BRIDGE: FAIL: websocket-client missing ({ws_err}) -- cannot use RCON", fp)
+        log(
+            f"SMOOTH_BRIDGE: FAIL: websocket-client missing ({ws_err}) "
+            "-- install it with: python3 -m pip install websocket-client",
+            fp,
+        )
         return False
+
+    message = str(announce_message or "").strip()
+    if message:
+        ok_say, say_resp = rcon_send(
+            cfg,
+            rcon_say_cmd("", message),
+            fp=fp,
+        )
+        if ok_say:
+            log("SMOOTH_BRIDGE: restart announcement sent via RCON", fp)
+        else:
+            log(
+                "SMOOTH_BRIDGE: WARNING: restart announcement failed; "
+                f"continuing with SmoothRestarter request: {say_resp}",
+                fp,
+            )
 
     ok_r, resp = rcon_send(cfg, cmd, fp=fp)
     if ok_r:
@@ -6206,6 +6236,16 @@ def main():
     ap.add_argument("--test-smoothrestarter-send", action="store_true",
         help="same as --test-smoothrestarter but actually sends the ceremony via RCON; then exit")
     ap.add_argument(
+        "--smooth-restart-server",
+        nargs="?",
+        const="",
+        metavar="MESSAGE",
+        help=(
+            "request a real restart through SmoothRestarter and exit; "
+            "optionally broadcast MESSAGE first"
+        ),
+    )
+    ap.add_argument(
         "--test-telegram-status",
         action="store_true",
         help="send a direct Telegram status test message and exit",
@@ -6368,6 +6408,18 @@ def main():
         if fp:
             fp.close()
         raise SystemExit(rc)
+
+    if args.smooth_restart_server is not None:
+        ok = request_smooth_restart(
+            cfg,
+            server_dir,
+            rustserver_path,
+            fp=fp,
+            announce_message=args.smooth_restart_server,
+        )
+        if fp:
+            fp.close()
+        raise SystemExit(0 if ok else 2)
 
     if not (cfg.get("check_process_identity") or cfg.get("check_tcp_rcon") or cfg.get("check_lgsm_details")):
         fatal("config: at least one health check must be enabled", fp=fp)

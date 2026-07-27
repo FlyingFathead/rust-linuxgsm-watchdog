@@ -54,7 +54,7 @@ Optional (disabled by default): `./rustserver details` parsing exists for debugg
 
 Optional (needed for authenticated wipe-timestamp discovery and other WebRCON
 features such as `--test-rcon-say`, the SmoothRestarter bridge, and Oxide
-Plugin Updater's default post-update `oxide.reload *` activation):
+Plugin Updater's default post-update per-plugin reload verification):
 - `websocket-client` (install via `requirements.txt`, or `pip install websocket-client`) 
 
 ---
@@ -76,7 +76,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.7) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.8) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -398,6 +398,40 @@ endpoint discovery; and post-update reload behavior. Paths are expanded from
 `~` or resolved relative to the JSON file. Use `--config PATH` for another
 configuration and normal CLI options for one-run overrides.
 
+Fresh HTTP requests are paced with a newly randomized delay between the
+configured lower and upper bounds. Cached plugin metadata does not wait
+because it does not access the network. The defaults deliberately trade a
+little scan time for fewer uMod rate-limit responses:
+
+```json
+"network": {
+  "minimum_interval_seconds": 1.5,
+  "maximum_interval_seconds": 3.0
+}
+```
+
+For a one-run override, pass both `--min-interval X` and `--max-interval Y`.
+For backward compatibility, `--min-interval X` by itself selects a fixed
+X-second interval.
+
+By default, a successful uMod result remains valid for one hour and the shared
+ChaosCode manifest for 45 minutes:
+
+```json
+"cache": {
+  "umod_ttl_seconds": 3600,
+  "chaoscode_ttl_seconds": 2700
+}
+```
+
+Progress lines explicitly show `(cached)` whenever a valid cached result was
+used. To deliberately bypass both caches for one run while replacing them with
+fresh results:
+
+```bash
+python3 tools/oxide_plugin_updater.py --override-cache
+```
+
 Before replacing a plugin, the updater:
 
 - accepts downloads only from the official HTTPS uMod host;
@@ -453,12 +487,21 @@ cached/history information. Interactive terminals show an unbracketed
 Cooldowns and transient failures also leave timestamped `[WAIT]` and
 `[CONTINUE]` lines; redirected output contains no animation/control sequence.
 
-After one or more successful installations, the default configuration sends
-one batch activation command through Rust WebRCON:
+After one or more successful installations, the default configuration reloads
+each updated plugin separately through Rust WebRCON:
 
 ```text
-oxide.reload *
+oxide.reload AdminRadar
+oxide.reload Kits
+...
 ```
+
+The updater prints live progress for every plugin, treats a `Failed to compile`
+response as an activation failure, and includes the compiler detail in its
+output. If all individual reloads succeed, it runs `oxide.plugins` and checks
+that every updated plugin is listed at the expected new version. This is
+deliberately not a blind `oxide.reload *`: command acceptance alone does not
+prove that the updated C# sources compiled.
 
 Set `"reload_plugins_after_updates": false` in
 `oxide_plugin_updater.json`, or pass
@@ -880,6 +923,20 @@ When `enable_smoothrestarter_bridge=true`, the watchdog logs the expected Smooth
 Note: the bridge sends commands via Rust WebRCON (requires `websocket-client`).
 Run the watchdog outside tmux/screen (systemd recommended) so recovery isn’t blocked by nested multiplexers.
 
+To request a real SmoothRestarter restart directly, without starting the
+watchdog loop:
+
+```bash
+./rust_watchdog.py --smooth-restart-server
+./rust_watchdog.py --smooth-restart-server "Restarting after plugin updates"
+```
+
+The optional message is broadcast first. The command checks the configured
+SmoothRestarter plugin path and runtime-loaded state, verifies the WebRCON
+dependency, then sends the configured restart command. If the plugin is
+missing, it prints the expected path and the official uMod installation URL
+instead of falling back to an immediate LinuxGSM restart.
+
 ---
 
 ## Telegram alerts setup
@@ -1024,6 +1081,15 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.8
+  **Fixed / Added:**
+  - Added `--smooth-restart-server [MESSAGE]` for a real one-shot restart through SmoothRestarter, including installation, dependency, runtime-loaded-state, and WebRCON checks.
+  - Added optional pre-restart server announcements and clearer recovery instructions when SmoothRestarter or `websocket-client` is unavailable.
+  - Changed updater HTTP pacing to a randomized `1.5`–`3.0` second interval shared across uMod metadata, ChaosCode requests, fallback searches, and plugin downloads.
+  - Added configurable uMod and ChaosCode cache-validity periods, explicit cached-result labels, and `--override-cache` for deliberate fresh checks.
+  - Replaced blind batch `oxide.reload *` activation with sequential per-plugin WebRCON reloads and live status reporting.
+  - Added compile-error detection with compiler details and final `oxide.plugins` name/version verification, preventing accepted commands from being reported as successful activation when a plugin failed to compile.
+  - Added regression coverage for SmoothRestarter actions, pacing, cache overrides, per-plugin reload failures, and loaded-version verification.
 - v0.4.7
   **Fixed / Added:**
   - Added the canonical, separately configured **Oxide Plugin Updater** with check-only and explicit `--update` modes.
