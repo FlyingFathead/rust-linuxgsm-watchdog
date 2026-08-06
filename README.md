@@ -708,8 +708,9 @@ blueprints):
   "forced_wipe_action": "full-wipe",
   "forced_wipe_trigger": "new-build-after-schedule",
 
-  "forced_wipe_early_release_tolerance_minutes": 15,
+  "forced_wipe_early_release_tolerance_minutes": 60,
   "forced_wipe_action_window_minutes": 360,
+  "forced_wipe_fallback_at_schedule": true,
   "forced_wipe_fallback_at_window_end": false,
 
   "forced_wipe_backup_before": true,
@@ -718,7 +719,7 @@ blueprints):
   "forced_wipe_state_file": "/home/rustserver/rust-linuxgsm-watchdog/data/state/forced_wipe.json",
 
   "forced_wipe_window_notification_enabled": true,
-  "forced_wipe_window_notification_message_template": "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch forced-wipe window for cycle {cycle} is now active (started {wipe_tz} {tz_name}); forced_wipe_action={action}.",
+  "forced_wipe_window_notification_message_template": "⚠️ FORCED WIPE WINDOW: the Facepunch forced-wipe guard for cycle {cycle} is active (started {window_starts_tz} {tz_name}; nominal wipe {wipe_tz}); forced_wipe_action={action}.",
   "forced_wipe_reminder_enabled": true,
   "forced_wipe_reminder_repeat_minutes": 30
 }
@@ -728,55 +729,38 @@ The schedule is the first Thursday at 19:00 `Europe/London`. This is deliberatel
 not described as 19:00 GMT: during British Summer Time it is 18:00 UTC.
 
 `forced_wipe_window_notification_enabled` defaults to `true`. It sends one
-heads-up when the scheduled Facepunch window becomes active, independently of
-whether `forced_wipe_action` is `off`, `map-wipe`, or `full-wipe`. The sent
-marker is persisted per monthly cycle, so restarting the watchdog inside the
-window does not send it again. Setting it to `false` suppresses only this
-one-shot notification. The text can be customized with
-`forced_wipe_window_notification_message_template` using the placeholders
-shown in the example above. If the watchdog starts after the scheduled time but
-still within `forced_wipe_window_minutes`, it sends the notification then. It
-does not backfill the notification after that window has ended.
+heads-up when the early guard opens, independently of whether
+`forced_wipe_action` is `off`, `map-wipe`, or `full-wipe`. With the default
+60-minute tolerance, the guard opens at 18:00 `Europe/London`, one hour before
+the nominal 19:00 wipe time. The sent marker is persisted per monthly cycle, so
+restarting the watchdog inside the window does not send it again. Setting it to
+`false` suppresses only this one-shot notification.
 
-The calendar alone never triggers deletion. The watchdog parses LinuxGSM's
-`Local build` and `Remote build` values and maintains a pre-release remote-build
-fence. A different remote build first observed within the configured tolerance
-before release, or after release, becomes the candidate. An earlier same-day
-update becomes the fence instead of the wipe candidate.
+The authoritative state is the calendar cycle: the first Thursday of the month
+plus a persisted record of whether that cycle has completed. Elapsed days since
+the previous wipe are status information, not the decision anchor.
 
-The Rust player client and dedicated server are separate Steam apps with
-separate build IDs. Near-simultaneous changes are useful evidence that a
-coordinated Rust release landed, especially around the scheduled monthly
-window, but they are not a forced-wipe flag: an ordinary coordinated hotfix can
-also change both. Build correlation therefore must not independently authorize
-deletion.
+Inside the early guard, any LinuxGSM `update available` result arms the monthly
+wipe immediately. It no longer requires a second remote-build change or a
+pre-release fence. This prevents the real monthly build from being swallowed as
+a new baseline when Facepunch publishes slightly earlier than the nominal time.
 
-If the watchdog starts inside the release window without a previously persisted
-fence, it refuses to arm an automatic wipe. That can miss an unattended wipe,
-but it cannot reinterpret an old pending update as permission to delete data.
+At the nominal first-Thursday time,
+`forced_wipe_fallback_at_schedule=true` becomes the calendar backstop. If no
+completed wipe is recorded, the configured `map-wipe` or `full-wipe` action is
+armed even when the server has already updated and LinuxGSM reports the build as
+current. The automatic backstop is limited to
+`forced_wipe_action_window_minutes`; with the default 360-minute window it
+remains available until 01:00 `Europe/London`.
 
-An optional calendar backstop can guarantee the configured wipe action even
-when the monthly build is not identified:
+A manual or RCON-observed wipe on the scheduled first Thursday completes the
+cycle and suppresses both build-triggered and calendar-triggered actions. Once
+the destructive wipe step is persisted, retries are start-only, so a watchdog
+restart cannot repeat the wipe.
 
-```json
-{
-  "forced_wipe_fallback_at_window_end": true
-}
-```
-
-The fallback arms at the end of `forced_wipe_action_window_minutes`. With the
-default schedule and 360-minute window, that is 01:00 `Europe/London` after the
-first-Thursday 19:00 release time. It uses `forced_wipe_action`, so it performs
-either `map-wipe` or `full-wipe`; it cannot select a different wipe kind.
-
-This does not claim that a particular build was the Facepunch monthly release.
-It is explicitly a calendar fallback: if no wipe is recorded for that cycle by
-the cutoff, it runs the normal backup/update/verify/mod-update/wipe/start
-lifecycle anyway. The watchdog must have observed the cycle before the cutoff.
-Consequently, enabling the option after an old monthly window has already
-passed cannot cause an immediate retroactive wipe. A manual wipe recorded on
-the scheduled Facepunch wipe day also completes the cycle and suppresses the
-fallback.
+`forced_wipe_fallback_at_window_end` remains available as a legacy final-cutoff
+backstop. It is normally unnecessary when the default scheduled backstop is
+enabled.
 
 Once armed, both restart paths use the same lifecycle:
 
@@ -1185,6 +1169,16 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.13
+  **Fixed / Added:**
+  - Made the first-Thursday monthly cycle plus persisted completion state the authoritative forced-wipe gate; elapsed wipe age is no longer used as a decision anchor.
+  - Expanded the early release guard from 15 to 60 minutes and made an update detected inside that guard immediately arm and execute the configured monthly wipe action.
+  - Added the default-on `forced_wipe_fallback_at_schedule` backstop: at the nominal first-Thursday time, an incomplete cycle is armed even if LinuxGSM already reports the new build as current.
+  - Prevented an early monthly build from being rewritten as the pre-wipe baseline, fixing the August 2026 `17:38 update -> 17:59 DOWN -> ordinary restart` race.
+  - Made DOWN recovery consult the forced-wipe cycle before generic recovery, so a due cycle runs `backup -> update -> mu -> wipe -> start` instead of `update -> mu -> restart`.
+  - Suppressed false red crash alerts when DOWN follows a watchdog-requested SmoothRestarter transition, while preserving genuine unexpected-DOWN alerts.
+  - Moved the one-shot forced-wipe-window notification to the start of the early guard and added the nominal wipe time to the message.
+  - Added regressions for the observed August 2026 timing sequence, already-current build fallback, poisoned v0.4.12 state recovery, and early-window notification.
 - v0.4.12
   **Fixed / Added:**
   - Changed successful plugin version comparisons from `OK` to `UP TO DATE` in progress output, the results table, and persisted state; live compile/load verification still uses `OK`, and legacy saved `OK` state remains compatible.

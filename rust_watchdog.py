@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.12"
+__version__ = "0.4.13"
 
 
 def _runtime_version():
@@ -118,24 +118,26 @@ DEFAULTS = {
     # Values: "off" | "map-wipe" | "full-wipe"
     "forced_wipe_action": "off",
     "forced_wipe_trigger": "new-build-after-schedule",
-    "forced_wipe_early_release_tolerance_minutes": 15,
+    "forced_wipe_early_release_tolerance_minutes": 60,
     "forced_wipe_action_window_minutes": 360,
-    # Optional calendar backstop: if this cycle was observed before the action
-    # window ended but no wipe was recorded, arm the configured wipe action at
-    # the end of that window even when no monthly build was identified.
+    # Calendar backstop: once the nominal first-Thursday time arrives, arm
+    # the configured wipe action if this cycle has not been completed. The
+    # action remains limited to forced_wipe_action_window_minutes.
+    "forced_wipe_fallback_at_schedule": True,
+    # Legacy optional final cutoff backstop.
     "forced_wipe_fallback_at_window_end": False,
     "forced_wipe_backup_before": True,
     "forced_wipe_backup_required": True,
     "forced_wipe_verify_update_current": True,
     "forced_wipe_state_file": os.path.join(PROJECT_DIR, "data", "state", "forced_wipe.json"),
 
-    # Send one heads-up when the scheduled Facepunch wipe window becomes
-    # active. This is independent of forced_wipe_action.
+    # Send one heads-up when the early forced-wipe guard becomes active.
+    # This is independent of forced_wipe_action.
     "forced_wipe_window_notification_enabled": True,
     "forced_wipe_window_notification_message_template":
-        "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch forced-wipe "
-        "window for cycle {cycle} is now active (started {wipe_tz} "
-        "{tz_name}); forced_wipe_action={action}.",
+        "⚠️ FORCED WIPE WINDOW: the Facepunch forced-wipe guard for "
+        "cycle {cycle} is active (started {window_starts_tz} {tz_name}; "
+        "nominal wipe {wipe_tz}); forced_wipe_action={action}.",
 
     # With automatic deletion off, keep warning after the monthly schedule
     # passes until an administrator records that the manual wipe is complete.
@@ -1702,7 +1704,7 @@ class ForcedWipeCoordinator:
     @staticmethod
     def _empty_state() -> dict:
         return {
-            "schema_version": 5,
+            "schema_version": 6,
             "cycle": "",
             "scheduled_utc": "",
             "cycle_first_observed_at": "",
@@ -1746,7 +1748,7 @@ class ForcedWipeCoordinator:
             if isinstance(obj, dict):
                 state = self._empty_state()
                 state.update(obj)
-                state["schema_version"] = 5
+                state["schema_version"] = 6
                 for key in (
                     "pending",
                     "wipe_done",
@@ -1800,7 +1802,10 @@ class ForcedWipeCoordinator:
                     and state["armed_action"] in ("map-wipe", "full-wipe")
                     and (
                         state["candidate_remote_build"]
-                        or state["armed_trigger"] == "window-end-fallback"
+                        or state["armed_trigger"] in (
+                            "calendar-due",
+                            "window-end-fallback",
+                        )
                     )
                 )
                 if state["pending"] and not pending_valid:
@@ -2005,6 +2010,126 @@ class ForcedWipeCoordinator:
             f"no wipe recorded by the {action_window_m}m action-window cutoff",
         )
 
+    def _guard_start(self, info: dict) -> datetime:
+        tolerance_m = max(
+            0,
+            int(
+                self.cfg.get(
+                    "forced_wipe_early_release_tolerance_minutes",
+                    60,
+                )
+            ),
+        )
+        return info["wipe_utc_dt"] - timedelta(minutes=tolerance_m)
+
+    def _action_end(self, info: dict) -> datetime:
+        action_window_m = max(
+            1,
+            int(self.cfg.get("forced_wipe_action_window_minutes", 360)),
+        )
+        return info["wipe_utc_dt"] + timedelta(minutes=action_window_m)
+
+    def _arm(
+        self,
+        info: dict,
+        now_utc: datetime,
+        *,
+        trigger: str,
+        candidate_remote_build: str = "",
+    ) -> bool:
+        if (
+            not self.enabled
+            or self.state.get("completed")
+            or self.state.get("pending")
+            or self._wipe_recorded_for_cycle(info)
+        ):
+            return False
+        self.state["pending"] = True
+        self.state["armed_action"] = self.action
+        self.state["armed_trigger"] = str(trigger)
+        self.state["candidate_seen_at"] = _utc_iso(now_utc)
+        self.state["candidate_remote_build"] = str(
+            candidate_remote_build or ""
+        )
+        self.state["failed_step"] = ""
+        self.state["last_error"] = ""
+        if self._save(now_utc):
+            return True
+        self.state["pending"] = False
+        self.state["armed_action"] = ""
+        self.state["armed_trigger"] = ""
+        self.state["candidate_seen_at"] = ""
+        self.state["candidate_remote_build"] = ""
+        return False
+
+    def reconcile_cycle(self, now_utc: datetime) -> ForcedWipeDecision:
+        """
+        Reconcile the authoritative monthly cycle without relying on an update
+        check. The first Thursday schedule plus persisted completion state is
+        the source of truth.
+        """
+        if not self.enabled:
+            return ForcedWipeDecision(enabled=False)
+
+        info = self._ensure_cycle(now_utc)
+        self._record_cycle_observation(now_utc)
+        scheduled = info["wipe_utc_dt"]
+        guard_start = self._guard_start(info)
+        action_end = self._action_end(info)
+        cycle = str(info["cycle"])
+        armed_now = False
+        reason = ""
+
+        if (
+            not self.state.get("completed")
+            and not self.state.get("pending")
+            and not self._wipe_recorded_for_cycle(info)
+            and parse_bool(
+                self.cfg.get("forced_wipe_fallback_at_schedule"), True
+            )
+            and scheduled <= now_utc <= action_end
+        ):
+            armed_now = self._arm(
+                info,
+                now_utc,
+                trigger="calendar-due",
+            )
+            if armed_now:
+                reason = (
+                    "scheduled first-Thursday wipe is due and no completed "
+                    "wipe is recorded"
+                )
+
+        if not self.state.get("pending"):
+            fallback_armed, fallback_reason = (
+                self._maybe_arm_window_end_fallback(info, now_utc)
+            )
+            if fallback_armed:
+                armed_now = True
+            if fallback_reason:
+                reason = fallback_reason
+
+        pending = bool(self.state.get("pending"))
+        action_due = bool(
+            pending
+            and not self.state.get("completed")
+            and (self.state.get("wipe_done") or now_utc >= guard_start)
+        )
+        return ForcedWipeDecision(
+            enabled=True,
+            cycle=cycle,
+            scheduled_utc=_utc_iso(scheduled),
+            armed_now=armed_now,
+            pending=pending,
+            action_due=action_due,
+            hold=bool(pending and not action_due),
+            reason=reason,
+            candidate_remote_build=str(
+                self.state.get("candidate_remote_build") or ""
+            ),
+            armed_trigger=str(self.state.get("armed_trigger") or ""),
+        )
+
     def observe_update(self, result: UpdateCheckResult, now_utc: datetime) -> ForcedWipeDecision:
         reminder_enabled = parse_bool(
             self.cfg.get("forced_wipe_reminder_enabled"), True
@@ -2017,6 +2142,8 @@ class ForcedWipeCoordinator:
 
         info = self._ensure_cycle(now_utc)
         scheduled = info["wipe_utc_dt"]
+        guard_start = self._guard_start(info)
+        action_end = self._action_end(info)
         cycle = str(info["cycle"])
         self._record_cycle_observation(now_utc)
         remote = str(result.remote_build or "").strip()
@@ -2051,97 +2178,80 @@ class ForcedWipeCoordinator:
             "cycle": cycle,
             "scheduled_utc": _utc_iso(scheduled),
             "pending": bool(self.state.get("pending")),
-            "candidate_remote_build": str(self.state.get("candidate_remote_build") or ""),
+            "candidate_remote_build": str(
+                self.state.get("candidate_remote_build") or ""
+            ),
             "armed_trigger": str(self.state.get("armed_trigger") or ""),
         }
 
         if not self.enabled:
             return ForcedWipeDecision(**base)
-
-        if not remote:
-            fallback_armed, fallback_reason = (
-                self._maybe_arm_window_end_fallback(info, now_utc)
-            )
-            pending = bool(self.state.get("pending"))
-            return ForcedWipeDecision(
-                enabled=self.enabled,
-                cycle=cycle,
-                scheduled_utc=_utc_iso(scheduled),
-                armed_now=fallback_armed,
-                pending=pending,
-                action_due=bool(
-                    pending
-                    and not self.state.get("completed")
-                    and now_utc >= scheduled
-                ),
-                hold=bool(pending and now_utc < scheduled),
-                reason=(
-                    "armed state retained despite missing build IDs"
-                    if pending
-                    else fallback_reason
-                ),
-                candidate_remote_build=str(
-                    self.state.get("candidate_remote_build") or ""
-                ),
-                armed_trigger=str(self.state.get("armed_trigger") or ""),
-            )
-
         if self.state.get("completed"):
             return ForcedWipeDecision(**base)
 
-        tolerance_m = max(
-            0, int(self.cfg.get("forced_wipe_early_release_tolerance_minutes", 15))
-        )
-        action_window_m = max(
-            1, int(self.cfg.get("forced_wipe_action_window_minutes", 360))
-        )
-        earliest_candidate = scheduled - timedelta(minutes=tolerance_m)
-        action_end = scheduled + timedelta(minutes=action_window_m)
         armed_now = False
         reason = ""
 
-        if now_utc < earliest_candidate:
+        # Before the early guard, retain a diagnostic remote-build fence. Once
+        # the guard opens, never rewrite it with the release candidate.
+        if remote and now_utc < guard_start:
             if self.state.get("prewipe_remote_build") != remote:
                 self.state["prewipe_remote_build"] = remote
                 self._save(now_utc)
-        elif now_utc <= action_end and not self.state.get("wipe_done"):
-            baseline = str(self.state.get("prewipe_remote_build") or "")
-            if not baseline:
-                # Starting inside the release window is ambiguous. Establish a
-                # fence but do not turn a possibly old update into a wipe.
-                self.state["prewipe_remote_build"] = remote
-                self._save(now_utc)
-                reason = "no pre-release build fence; refusing to arm"
-            elif result.verdict is True and remote != baseline:
-                if not self.state.get("pending"):
-                    armed_now = True
-                    self.state["pending"] = True
-                    self.state["candidate_seen_at"] = _utc_iso(now_utc)
-                    self.state["armed_action"] = self.action
-                    self.state["armed_trigger"] = "build-change"
-                self.state["candidate_remote_build"] = remote
-                self.state["failed_step"] = ""
-                self.state["last_error"] = ""
-                self._save(now_utc)
-                reason = f"remote build changed {baseline} -> {remote}"
 
+        # An available update during the early first-Thursday guard is enough
+        # to identify the monthly release. Requiring a second build change is
+        # what caused v0.4.12 to swallow the actual release as its baseline.
+        if (
+            result.verdict is True
+            and remote
+            and guard_start <= now_utc <= action_end
+            and not self.state.get("wipe_done")
+        ):
+            if not self.state.get("pending"):
+                armed_now = self._arm(
+                    info,
+                    now_utc,
+                    trigger="build-change",
+                    candidate_remote_build=remote,
+                )
+            elif self.state.get("armed_trigger") == "build-change":
+                if self.state.get("candidate_remote_build") != remote:
+                    self.state["candidate_remote_build"] = remote
+                    self._save(now_utc)
+            if self.state.get("pending"):
+                reason = (
+                    "update available inside early forced-wipe guard "
+                    f"({local or '?'} -> {remote})"
+                )
+
+        # At the nominal first-Thursday time, the calendar becomes the
+        # backstop. A current build does not mean the required wipe happened.
         if not self.state.get("pending"):
-            fallback_armed, fallback_reason = (
-                self._maybe_arm_window_end_fallback(info, now_utc)
-            )
-            if fallback_armed:
+            reconciled = self.reconcile_cycle(now_utc)
+            if reconciled.armed_now:
                 armed_now = True
-            if fallback_reason:
-                reason = fallback_reason
+            if reconciled.reason:
+                reason = reconciled.reason
 
         pending = bool(self.state.get("pending"))
-        action_due = pending and not self.state.get("completed") and now_utc >= scheduled
+        action_due = bool(
+            pending
+            and not self.state.get("completed")
+            and (self.state.get("wipe_done") or now_utc >= guard_start)
+        )
         prewipe_hold, hold_reason = in_forced_wipe_update_hold(
             self.cfg, now_utc, fp=self.fp
         )
-        hold = bool((pending and now_utc < scheduled) or (result.verdict is True and prewipe_hold))
+        hold = bool(
+            not action_due
+            and (
+                (pending and now_utc < guard_start)
+                or (result.verdict is True and prewipe_hold)
+            )
+        )
         if hold and not reason:
-            reason = hold_reason or "candidate observed before scheduled release time"
+            reason = hold_reason or "waiting for early forced-wipe guard"
 
         return ForcedWipeDecision(
             enabled=self.enabled,
@@ -2152,19 +2262,17 @@ class ForcedWipeCoordinator:
             action_due=action_due,
             hold=hold,
             reason=reason,
-            candidate_remote_build=str(self.state.get("candidate_remote_build") or ""),
+            candidate_remote_build=str(
+                self.state.get("candidate_remote_build") or ""
+            ),
             armed_trigger=str(self.state.get("armed_trigger") or ""),
         )
 
     def needs_recovery(self, now_utc: datetime) -> bool:
         if not self.enabled:
             return False
-        info = self._ensure_cycle(now_utc)
-        return bool(
-            self.state.get("pending")
-            and not self.state.get("completed")
-            and now_utc >= info["wipe_utc_dt"]
-        )
+        decision = self.reconcile_cycle(now_utc)
+        return bool(decision.pending and decision.action_due)
 
     def mark_started(self, now_utc: datetime) -> bool:
         changed = not bool(self.state.get("started_at"))
@@ -2259,7 +2367,7 @@ class ForcedWipeCoordinator:
             int(
                 self.cfg.get(
                     "forced_wipe_early_release_tolerance_minutes",
-                    15,
+                    60,
                 )
             ),
         )
@@ -2349,17 +2457,22 @@ class ForcedWipeCoordinator:
             window_m = 180
 
         scheduled = info["wipe_utc_dt"]
+        window_starts = self._guard_start(info)
         window_ends = scheduled + timedelta(minutes=window_m)
         sent_at = str(
             self.state.get("window_notification_sent_at") or ""
         )
-        in_window = bool(scheduled <= now_utc <= window_ends)
+        in_window = bool(window_starts <= now_utc <= window_ends)
         return {
             "enabled": enabled,
             "in_window": in_window,
             "send_due": bool(enabled and in_window and not sent_at),
             "cycle": str(info["cycle"]),
             "scheduled_utc": _utc_iso(scheduled),
+            "window_starts_utc": _utc_iso(window_starts),
+            "window_starts_tz": window_starts.astimezone(
+                info["tz"]
+            ).strftime("%Y-%m-%d %H:%M"),
             "wipe_tz": info["wipe_tz_dt"].strftime("%Y-%m-%d %H:%M"),
             "tz_name": str(info.get("tz_name") or ""),
             "window_minutes": window_m,
@@ -2372,9 +2485,9 @@ class ForcedWipeCoordinator:
         template = str(
             self.cfg.get(
                 "forced_wipe_window_notification_message_template",
-                "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch "
-                "forced-wipe window for cycle {cycle} is now active "
-                "(started {wipe_tz} {tz_name}); "
+                "⚠️ FORCED WIPE WINDOW: the Facepunch forced-wipe "
+                "guard for cycle {cycle} is active (started "
+                "{window_starts_tz} {tz_name}; nominal wipe {wipe_tz}); "
                 "forced_wipe_action={action}.",
             )
         )
@@ -2382,10 +2495,11 @@ class ForcedWipeCoordinator:
             return template.format(**status)
         except Exception:
             return (
-                "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch "
-                f"forced-wipe window for cycle {status.get('cycle', '?')} "
-                f"is now active (started {status.get('wipe_tz', '?')} "
-                f"{status.get('tz_name', '?')}); "
+                "⚠️ FORCED WIPE WINDOW: the Facepunch forced-wipe "
+                f"guard for cycle {status.get('cycle', '?')} is active "
+                f"(started {status.get('window_starts_tz', '?')} "
+                f"{status.get('tz_name', '?')}; nominal wipe "
+                f"{status.get('wipe_tz', '?')}); "
                 f"forced_wipe_action={self.action}."
             )
 
@@ -2524,7 +2638,7 @@ class ForcedWipeCoordinator:
             int(
                 self.cfg.get(
                     "forced_wipe_early_release_tolerance_minutes",
-                    15,
+                    60,
                 )
             ),
         )
@@ -5992,7 +6106,10 @@ def update_watch_fallback_restart_now(
     """
     calendar_fallback = bool(
         forced_wipe
-        and forced_wipe.state.get("armed_trigger") == "window-end-fallback"
+        and forced_wipe.state.get("armed_trigger") in (
+            "calendar-due",
+            "window-end-fallback",
+        )
     )
     if calendar_fallback:
         action = forced_wipe.action
@@ -6760,6 +6877,7 @@ def main():
 
     last_update_check = 0.0
     last_restart_request = 0.0
+    last_restart_reason = ""
 
     startup_ok_sent = False
 
@@ -6913,7 +7031,10 @@ def main():
             # Optional: watch for updates while server is RUNNING
             # If update is found -> optionally request SmoothRestarter
             # ---------------------------------------------------------
-            if state == "RUNNING" and parse_bool(cfg.get("enable_update_watch"), False):
+            if state == "RUNNING" and (
+                parse_bool(cfg.get("enable_update_watch"), False)
+                or forced_wipe.enabled
+            ):
                 now = time.monotonic()
                 interval = int(cfg.get("update_check_interval_seconds", 600))
 
@@ -6939,15 +7060,20 @@ def main():
                         update_result, now_utc
                     )
                     verdict = update_result.verdict
+                    forced_wipe_due = bool(wipe_decision.action_due)
                     calendar_fallback_due = bool(
-                        wipe_decision.action_due
-                        and wipe_decision.armed_trigger
-                        == "window-end-fallback"
+                        forced_wipe_due
+                        and wipe_decision.armed_trigger in (
+                            "calendar-due",
+                            "window-end-fallback",
+                        )
                     )
 
                     if wipe_decision.armed_now:
                         armed_description = (
-                            "window-end calendar fallback"
+                            "scheduled first-Thursday fallback"
+                            if wipe_decision.armed_trigger == "calendar-due"
+                            else "window-end calendar fallback"
                             if wipe_decision.armed_trigger
                             == "window-end-fallback"
                             else "monthly build"
@@ -7000,10 +7126,10 @@ def main():
                             )
                         else:
                             action_reason = (
-                                "forced-wipe window-end calendar fallback"
+                                "scheduled first-Thursday forced wipe"
                                 if calendar_fallback_due
                                 else "armed monthly forced-wipe build"
-                                if wipe_decision.action_due
+                                if forced_wipe_due
                                 else "update detected"
                             )
                             log(
@@ -7034,7 +7160,7 @@ def main():
                                 announce_message = (
                                     f"Facepunch forced-wipe cutoff reached -- "
                                     f"{forced_wipe.action} incoming."
-                                    if calendar_fallback_due
+                                    if forced_wipe_due
                                     else str(
                                         cfg.get(
                                             "update_watch_announce_message",
@@ -7057,7 +7183,7 @@ def main():
                                             f"Time until forced "
                                             f"{forced_wipe.action}: "
                                             f"{{seconds}} seconds."
-                                            if calendar_fallback_due
+                                            if forced_wipe_due
                                             else str(cfg.get(
                                                 "update_watch_countdown_template",
                                                 "Time until server update and "
@@ -7079,7 +7205,7 @@ def main():
                                             f"Forced {forced_wipe.action} "
                                             f"starting now -- come back in a "
                                             f"few minutes!"
-                                            if calendar_fallback_due
+                                            if forced_wipe_due
                                             else str(
                                                 cfg.get(
                                                     "update_watch_final_message",
@@ -7094,6 +7220,7 @@ def main():
 
                                     if ok:
                                         last_restart_request = now
+                                        last_restart_reason = action_reason
                                         log(
                                             f"SMOOTH_BRIDGE: requested SmoothRestarter restart "
                                             f"(delay={sr_delay}s)",
@@ -7170,20 +7297,53 @@ def main():
                         log("UPDATE_WATCH: unknown (could not determine update availability)", fp)
 
             if state == "DOWN" and down_streak >= int(cfg["down_confirmations"]):
-                log("CONFIRMED DOWN -> recovery sequence", fp)
                 primary = next((l for l in evidence if l.startswith("PRIMARY_CAUSE:")), "")
-
-                alert(
-                    "server_down",
-                    f"Server '{cfg.get('identity')}' confirmed DOWN -- starting recovery",
-                    level="warning",
-                    fp=fp,
-                    identity=cfg.get("identity"),
-                    primary_cause=primary,
-                    reason="health_report down_confirmed",
+                recovery_now_utc = datetime.now(timezone.utc)
+                forced_recovery_due = forced_wipe.needs_recovery(
+                    recovery_now_utc
+                )
+                planned_restart_grace = max(
+                    600,
+                    int(
+                        cfg.get(
+                            "smoothrestarter_restart_delay_seconds",
+                            300,
+                        )
+                    )
+                    + int(cfg.get("cooldown_seconds", 120))
+                    + 120,
+                )
+                planned_restart_active = bool(
+                    last_restart_request > 0
+                    and (time.monotonic() - last_restart_request)
+                    <= planned_restart_grace
                 )
 
-                if forced_wipe.needs_recovery(datetime.now(timezone.utc)):
+                if forced_recovery_due:
+                    log(
+                        "CONFIRMED DOWN during due forced-wipe cycle -> "
+                        "forced-wipe sequence",
+                        fp,
+                    )
+                elif planned_restart_active:
+                    log(
+                        "CONFIRMED DOWN after planned restart request -> "
+                        f"recovery sequence ({last_restart_reason or 'restart requested'})",
+                        fp,
+                    )
+                else:
+                    log("CONFIRMED DOWN -> recovery sequence", fp)
+                    alert(
+                        "server_down",
+                        f"Server '{cfg.get('identity')}' confirmed DOWN -- starting recovery",
+                        level="warning",
+                        fp=fp,
+                        identity=cfg.get("identity"),
+                        primary_cause=primary,
+                        reason="health_report down_confirmed",
+                    )
+
+                if forced_recovery_due:
                     steps = [
                         "stop",
                         "backup",
@@ -7232,12 +7392,23 @@ def main():
 
                 alert(
                     "recovery_attempted",
-                    f"Recovery sequence finished for '{cfg.get('identity')}'",
+                    (
+                        f"Forced-wipe sequence finished for "
+                        f"'{cfg.get('identity')}'"
+                        if forced_recovery_due
+                        else f"Planned restart/update sequence finished for "
+                        f"'{cfg.get('identity')}'"
+                        if planned_restart_active
+                        else f"Recovery sequence finished for "
+                        f"'{cfg.get('identity')}'"
+                    ),
                     level="warning",
                     fp=fp,
                     identity=cfg.get("identity"),
                     steps=steps,
                 )
+                last_restart_request = 0.0
+                last_restart_reason = ""
 
                 cooldown = int(cfg.get("cooldown_seconds", 0) or 0)
                 if cooldown > 0:

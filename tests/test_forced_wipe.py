@@ -82,7 +82,7 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
             {
                 "forced_wipe_action": "full-wipe",
                 "forced_wipe_state_file": self.state_path,
-                "forced_wipe_early_release_tolerance_minutes": 15,
+                "forced_wipe_early_release_tolerance_minutes": 60,
                 "forced_wipe_action_window_minutes": 360,
             }
         )
@@ -90,55 +90,76 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
     def coordinator(self):
         return wd.ForcedWipeCoordinator(self.cfg, persist=True)
 
-    def test_earlier_same_day_update_becomes_fence_not_candidate(self):
+    def test_august_release_arms_in_early_guard_and_down_recovery_is_due(self):
         c = self.coordinator()
-
         c.observe_update(
-            wd.UpdateCheckResult(False, "100", "100"),
+            wd.UpdateCheckResult(False, "24253458", "24253458"),
             dt("2026-08-06T12:00:00Z"),
         )
-        early = c.observe_update(
-            wd.UpdateCheckResult(True, "100", "200"),
-            dt("2026-08-06T17:30:00Z"),
-        )
-        self.assertFalse(early.pending)
-        self.assertEqual(c.state["prewipe_remote_build"], "200")
 
-        monthly = c.observe_update(
-            wd.UpdateCheckResult(True, "100", "300"),
-            dt("2026-08-06T17:50:00Z"),
+        release = c.observe_update(
+            wd.UpdateCheckResult(True, "24253458", "24587531"),
+            dt("2026-08-06T17:38:10Z"),
         )
-        self.assertTrue(monthly.armed_now)
-        self.assertTrue(monthly.pending)
-        self.assertTrue(monthly.hold)
-        self.assertFalse(monthly.action_due)
-        self.assertEqual(monthly.candidate_remote_build, "300")
+        self.assertTrue(release.armed_now)
+        self.assertTrue(release.pending)
+        self.assertTrue(release.action_due)
+        self.assertFalse(release.hold)
+        self.assertEqual(release.armed_trigger, "build-change")
+        self.assertEqual(release.candidate_remote_build, "24587531")
 
-        due = c.observe_update(
-            wd.UpdateCheckResult(True, "100", "300"),
-            dt("2026-08-06T18:00:00Z"),
+        self.assertTrue(
+            c.needs_recovery(dt("2026-08-06T17:59:28Z"))
         )
-        self.assertTrue(due.pending)
-        self.assertTrue(due.action_due)
-        self.assertFalse(due.hold)
 
-        due_without_build_output = c.observe_update(
-            wd.UpdateCheckResult(None),
-            dt("2026-08-06T18:01:00Z"),
-        )
-        self.assertTrue(due_without_build_output.pending)
-        self.assertTrue(due_without_build_output.action_due)
-
-    def test_late_start_without_fence_refuses_to_arm(self):
+    def test_late_start_inside_action_window_arms_without_build_fence(self):
         c = self.coordinator()
         decision = c.observe_update(
             wd.UpdateCheckResult(True, "100", "300"),
             dt("2026-08-06T18:05:00Z"),
         )
-        self.assertFalse(decision.armed_now)
-        self.assertFalse(decision.pending)
-        self.assertIn("refusing to arm", decision.reason)
-        self.assertEqual(c.state["prewipe_remote_build"], "300")
+        self.assertTrue(decision.armed_now)
+        self.assertTrue(decision.pending)
+        self.assertTrue(decision.action_due)
+        self.assertFalse(decision.hold)
+        self.assertEqual(decision.armed_trigger, "build-change")
+        self.assertEqual(decision.candidate_remote_build, "300")
+
+    def test_nominal_schedule_arms_when_build_is_already_current(self):
+        c = self.coordinator()
+        before = c.observe_update(
+            wd.UpdateCheckResult(False, "24587531", "24587531"),
+            dt("2026-08-06T17:58:15Z"),
+        )
+        self.assertFalse(before.pending)
+
+        due = c.observe_update(
+            wd.UpdateCheckResult(False, "24587531", "24587531"),
+            dt("2026-08-06T18:08:20Z"),
+        )
+        self.assertTrue(due.armed_now)
+        self.assertTrue(due.pending)
+        self.assertTrue(due.action_due)
+        self.assertEqual(due.armed_trigger, "calendar-due")
+
+    def test_v0412_poisoned_fence_is_recovered_by_calendar_due(self):
+        c = self.coordinator()
+        c._ensure_cycle(dt("2026-08-06T17:58:15Z"))
+        c.state["prewipe_remote_build"] = "24587531"
+        c.state["latest_local_build"] = "24253458"
+        c.state["latest_remote_build"] = "24587531"
+        c.state["pending"] = False
+        c._save(dt("2026-08-06T17:58:15Z"))
+
+        reloaded = self.coordinator()
+        due = reloaded.observe_update(
+            wd.UpdateCheckResult(False, "24587531", "24587531"),
+            dt("2026-08-06T18:14:00Z"),
+        )
+        self.assertTrue(due.armed_now)
+        self.assertTrue(due.pending)
+        self.assertTrue(due.action_due)
+        self.assertEqual(due.armed_trigger, "calendar-due")
 
     def test_completed_cycle_ignores_later_hotfix(self):
         c = self.coordinator()
@@ -160,7 +181,8 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertFalse(hotfix.armed_now)
         self.assertFalse(hotfix.pending)
 
-    def test_window_end_fallback_is_disabled_by_default(self):
+    def test_window_end_fallback_is_disabled_when_all_fallbacks_are_off(self):
+        self.cfg["forced_wipe_fallback_at_schedule"] = False
         c = self.coordinator()
         c.observe_update(
             wd.UpdateCheckResult(False, "100", "100"),
@@ -174,6 +196,7 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertFalse(decision.pending)
 
     def test_window_end_fallback_arms_configured_action_at_cutoff(self):
+        self.cfg["forced_wipe_fallback_at_schedule"] = False
         self.cfg["forced_wipe_fallback_at_window_end"] = True
         c = self.coordinator()
         c.observe_update(
@@ -206,6 +229,7 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertTrue(reloaded.needs_recovery(dt("2026-08-07T00:01:00Z")))
 
     def test_window_end_fallback_refuses_retroactive_late_start(self):
+        self.cfg["forced_wipe_fallback_at_schedule"] = False
         self.cfg["forced_wipe_fallback_at_window_end"] = True
         c = self.coordinator()
         decision = c.observe_update(
@@ -217,6 +241,7 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertIn("not observed before the cutoff", decision.reason)
 
     def test_manual_wipe_earlier_on_facepunch_day_suppresses_fallback(self):
+        self.cfg["forced_wipe_fallback_at_schedule"] = False
         self.cfg["forced_wipe_fallback_at_window_end"] = True
         c = self.coordinator()
         c.observe_update(
@@ -239,6 +264,7 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertTrue(c.state["completed"])
 
     def test_completed_fallback_cannot_rearm_on_later_update(self):
+        self.cfg["forced_wipe_fallback_at_schedule"] = False
         self.cfg["forced_wipe_fallback_at_window_end"] = True
         c = self.coordinator()
         c.observe_update(
@@ -297,7 +323,7 @@ class ForcedWipeWindowNotificationTests(unittest.TestCase):
         return wd.ForcedWipeCoordinator(self.cfg, persist=True)
 
     def test_send_due_is_independent_of_forced_wipe_action(self):
-        entered_at = dt("2026-08-06T18:00:00Z")
+        entered_at = dt("2026-08-06T17:00:00Z")
         for action in ("off", "map-wipe", "full-wipe"):
             with self.subTest(action=action):
                 cfg = copy.deepcopy(self.cfg)
@@ -319,11 +345,11 @@ class ForcedWipeWindowNotificationTests(unittest.TestCase):
         c = self.coordinator()
         self.assertFalse(
             c.window_notification_status(
-                dt("2026-08-06T17:59:59Z")
+                dt("2026-08-06T16:59:59Z")
             )["send_due"]
         )
 
-        entered_at = dt("2026-08-06T18:00:00Z")
+        entered_at = dt("2026-08-06T17:00:00Z")
         with mock.patch.object(wd, "alert") as alert_mock, mock.patch.object(
             wd, "log"
         ):
@@ -337,7 +363,7 @@ class ForcedWipeWindowNotificationTests(unittest.TestCase):
         self.assertEqual(alert_mock.call_args.args[0], "forced_wipe_window")
         self.assertEqual(
             c.state["window_notification_sent_at"],
-            "2026-08-06T18:00:00Z",
+            "2026-08-06T17:00:00Z",
         )
 
         reloaded = self.coordinator()
