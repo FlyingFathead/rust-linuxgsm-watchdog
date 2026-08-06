@@ -14,7 +14,8 @@ sequence, i.e.:
 
 This is meant to complement workflows like uMod’s **[Smooth Restarter](https://umod.org/plugins/smooth-restarter)** that can *stop the server gracefully* but don’t handle **Steam-end server update + mod updates + restart** on their own.
 
-The Rust Watchdog currently supports server status/restart/update alerts via the [Telegram Bot API](https://core.telegram.org/bots).
+The Rust Watchdog currently supports server status/restart/update alerts via
+the [Telegram Bot API](https://core.telegram.org/bots) and Discord webhooks.
 
 ---
 
@@ -66,7 +67,7 @@ Plugin Updater's default post-update per-plugin reload verification):
 - `rust_watchdog.json` -- config (merged over defaults)
 - `rust-watchdog.service` -- example systemd unit
 - `tests/test_forced_wipe.py` -- forced-wipe schedule/state/lifecycle regression tests
-- `tests/test_alert_footnotes.py` -- Telegram HTML/Markdown footnote regression tests
+- `tests/test_alert_footnotes.py` -- Telegram HTML/Markdown and Discord Markdown footnote regression tests
 - `tests/test_config_edit.py` -- persistent config-editing and path-migration regression tests
 - `tests/test_view_config.py` -- effective-config rendering and safe-exit regression tests
 - `tests/test_plugin_tools.py` -- Oxide plugin-tool path-default regression tests
@@ -76,7 +77,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.10) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.11) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -710,6 +711,8 @@ blueprints):
   "forced_wipe_verify_update_current": true,
   "forced_wipe_state_file": "/home/rustserver/rust-linuxgsm-watchdog/data/state/forced_wipe.json",
 
+  "forced_wipe_window_notification_enabled": true,
+  "forced_wipe_window_notification_message_template": "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch forced-wipe window for cycle {cycle} is now active (started {wipe_tz} {tz_name}); forced_wipe_action={action}.",
   "forced_wipe_reminder_enabled": true,
   "forced_wipe_reminder_repeat_minutes": 30
 }
@@ -717,6 +720,17 @@ blueprints):
 
 The schedule is the first Thursday at 19:00 `Europe/London`. This is deliberately
 not described as 19:00 GMT: during British Summer Time it is 18:00 UTC.
+
+`forced_wipe_window_notification_enabled` defaults to `true`. It sends one
+heads-up when the scheduled Facepunch window becomes active, independently of
+whether `forced_wipe_action` is `off`, `map-wipe`, or `full-wipe`. The sent
+marker is persisted per monthly cycle, so restarting the watchdog inside the
+window does not send it again. Setting it to `false` suppresses only this
+one-shot notification. The text can be customized with
+`forced_wipe_window_notification_message_template` using the placeholders
+shown in the example above. If the watchdog starts after the scheduled time but
+still within `forced_wipe_window_minutes`, it sends the notification then. It
+does not backfill the notification after that window has ended.
 
 The calendar alone never triggers deletion. The watchdog parses LinuxGSM's
 `Local build` and `Remote build` values and maintains a pre-release remote-build
@@ -793,7 +807,9 @@ Steam build numbers alone cannot prove that a wipe occurred. By default, the
 watchdog also queries authenticated WebRCON `serverinfo.SaveCreatedTime`, which
 does identify when the current map/save was created. If that timestamp belongs
 to the active Facepunch cycle, the reminder and any pending duplicate automatic
-wipe are suppressed.
+wipe are suppressed. When both the one-shot window notification and the
+off-mode reminder are enabled, the first repeating reminder is delayed by the
+configured repeat interval so the two alerts are not sent simultaneously.
 
 The automatic path records the exact successful wipe-command time. After a
 manual `full-wipe` or `map-wipe`, record either the current time or the actual
@@ -849,14 +865,16 @@ last_restart_source: rust-process-start
 Every normal watchdog alert receives a separate status footnote by default:
 
 ```text
-Server last wiped: 2026-08-06 18:23:00 UTC (RCON)
+Server last wiped:
+2026-08-06 18:23:00 UTC (RCON)
 (20 days, 3 hours, 12 minutes ago)
 
-Server last restarted: 2026-08-06 18:24:15 UTC
+Server last restarted:
+2026-08-06 18:24:15 UTC
 (20 days, 3 hours, 10 minutes ago)
 ```
 
-The wipe line identifies the source actually used: `(RCON)` for
+The wipe timestamp line identifies the source actually used: `(RCON)` for
 `serverinfo.SaveCreatedTime`, `(map file mtime)` for the filesystem fallback,
 `(manual record)` for `--mark-forced-wipe-done`, or
 `(watchdog automatic wipe)` when the watchdog performed the wipe. Legacy
@@ -872,9 +890,11 @@ been persisted, the watchdog says so instead of guessing from a save-file
 mtime or Steam build time:
 
 ```text
-Server last wiped: unknown (no wipe timestamp recorded)
+Server last wiped:
+unknown (no wipe timestamp recorded)
 
-Server last restarted: unknown (no Rust process start timestamp recorded)
+Server last restarted:
+unknown (no Rust process start timestamp recorded)
 ```
 
 The footnote can be configured under `alerts`:
@@ -1159,6 +1179,16 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.11
+  **Fixed / Added:**
+  - Added the default-on `forced_wipe_window_notification_enabled` switch for one notification when the scheduled monthly Facepunch forced-wipe window becomes active.
+  - Made the window notification independent of `forced_wipe_action`, so it works with `off`, `map-wipe`, and `full-wipe`.
+  - Persisted the notification marker per monthly cycle to prevent duplicate alerts after watchdog restarts, and kept it separate from the repeating manual/off-mode `forced_wipe_due` reminder.
+  - Delayed the first off-mode repeating reminder by its configured interval when the window notification was just sent, preventing two alerts at the same instant.
+  - Added the `forced_wipe_window` Telegram/Discord event metadata and a customizable notification message template.
+  - Put `Server last wiped:` and `Server last restarted:` on their own lines, retaining literal newlines and the blank line between the two Telegram/Discord status blocks.
+  - Updated the verifier spinner regression test to match the corrected current spinner constructor without changing runtime spinner behavior.
+  - Added regression coverage for notification defaults, all forced-wipe actions, disabling, persistence across restarts, post-window suppression, reminder spacing, and alert newline rendering.
 - v0.4.10
   **Fixed / Added:**
   - Fixed `--verify-plugin` and `--verify-all` incorrectly waiting 120 seconds and reporting `RCON FAILED` after Oxide had already reloaded a plugin successfully.

@@ -64,6 +64,8 @@
   "forced_wipe_backup_required": true,
   "forced_wipe_verify_update_current": true,
   "forced_wipe_state_file": "/home/rustserver/rust-linuxgsm-watchdog/data/state/forced_wipe.json",
+  "forced_wipe_window_notification_enabled": true,
+  "forced_wipe_window_notification_message_template": "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch forced-wipe window for cycle {cycle} is now active (started {wipe_tz} {tz_name}); forced_wipe_action={action}.",
   "forced_wipe_reminder_enabled": true,
   "forced_wipe_reminder_repeat_minutes": 30,
   "forced_wipe_reminder_message_template": "⚠️ FORCED WIPE DUE: cycle {cycle} entered its scheduled wipe window at {wipe_tz} ({tz_name}); no completed wipe is recorded and forced_wipe_action={action}.",
@@ -116,6 +118,7 @@
     "forced_wipe_started": 0,
     "forced_wipe_completed": 0,
     "forced_wipe_failed": 300,
+    "forced_wipe_window": 0,
     "forced_wipe_due": 0,
 
     "server_down": 0,
@@ -155,6 +158,7 @@
       "forced_wipe_started": "💥",
       "forced_wipe_completed": "✅",
       "forced_wipe_failed": "🚨",
+      "forced_wipe_window": "⚠️",
       "forced_wipe_due": "⚠️"
     },
     "event_titles": {
@@ -172,6 +176,7 @@
       "forced_wipe_started": "Forced wipe started",
       "forced_wipe_completed": "Forced wipe completed",
       "forced_wipe_failed": "Forced wipe failed",
+      "forced_wipe_window": "Forced wipe window",
       "forced_wipe_due": "Forced wipe due"
     },
     "event_bodies": {
@@ -189,6 +194,7 @@
       "forced_wipe_started": "backup/update/mod-update/wipe/start sequence started",
       "forced_wipe_completed": "wipe completed and server health verified",
       "forced_wipe_failed": "automatic wipe sequence stopped before completion",
+      "forced_wipe_window": "scheduled monthly forced-wipe window is now active",
       "forced_wipe_due": "scheduled monthly wipe window has arrived without a recorded wipe"
     },
     "telegram": {

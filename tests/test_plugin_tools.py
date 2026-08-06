@@ -2167,8 +2167,9 @@ class PluginUpdateOutputTests(unittest.TestCase):
 
         self.assertTrue(ok, response)
         spinner.assert_called_once_with(
-            "[1/1] Verifying Admin No Loot v0.1.3 by Dana "
-            "(oxide.reload AdminNoLoot)"
+            "  [1/1] Verifying Admin No Loot v0.1.3 by Dana "
+            "(oxide.reload AdminNoLoot)",
+            message_on_own_line=True,
         )
         self.assertEqual(
             activation_records,

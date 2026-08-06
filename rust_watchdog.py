@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.10"
+__version__ = "0.4.11"
 
 
 def _runtime_version():
@@ -128,6 +128,14 @@ DEFAULTS = {
     "forced_wipe_backup_required": True,
     "forced_wipe_verify_update_current": True,
     "forced_wipe_state_file": os.path.join(PROJECT_DIR, "data", "state", "forced_wipe.json"),
+
+    # Send one heads-up when the scheduled Facepunch wipe window becomes
+    # active. This is independent of forced_wipe_action.
+    "forced_wipe_window_notification_enabled": True,
+    "forced_wipe_window_notification_message_template":
+        "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch forced-wipe "
+        "window for cycle {cycle} is now active (started {wipe_tz} "
+        "{tz_name}); forced_wipe_action={action}.",
 
     # With automatic deletion off, keep warning after the monthly schedule
     # passes until an administrator records that the manual wipe is complete.
@@ -1694,7 +1702,7 @@ class ForcedWipeCoordinator:
     @staticmethod
     def _empty_state() -> dict:
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "cycle": "",
             "scheduled_utc": "",
             "cycle_first_observed_at": "",
@@ -1722,6 +1730,7 @@ class ForcedWipeCoordinator:
             "last_wipe_kind": "",
             "last_restart_at": "",
             "last_restart_source": "",
+            "window_notification_sent_at": "",
             "reminder_last_sent_at": "",
             "failed_step": "",
             "last_error": "",
@@ -1737,7 +1746,7 @@ class ForcedWipeCoordinator:
             if isinstance(obj, dict):
                 state = self._empty_state()
                 state.update(obj)
-                state["schema_version"] = 4
+                state["schema_version"] = 5
                 for key in (
                     "pending",
                     "wipe_done",
@@ -1770,6 +1779,7 @@ class ForcedWipeCoordinator:
                     "last_wipe_kind",
                     "last_restart_at",
                     "last_restart_source",
+                    "window_notification_sent_at",
                     "reminder_last_sent_at",
                     "failed_step",
                     "last_error",
@@ -2325,6 +2335,72 @@ class ForcedWipeCoordinator:
             return True
         return False
 
+    def window_notification_status(self, now_utc: datetime) -> dict:
+        info = self._ensure_cycle(now_utc)
+        enabled = parse_bool(
+            self.cfg.get("forced_wipe_window_notification_enabled"), True
+        )
+        try:
+            window_m = max(
+                0,
+                int(self.cfg.get("forced_wipe_window_minutes", 180)),
+            )
+        except Exception:
+            window_m = 180
+
+        scheduled = info["wipe_utc_dt"]
+        window_ends = scheduled + timedelta(minutes=window_m)
+        sent_at = str(
+            self.state.get("window_notification_sent_at") or ""
+        )
+        in_window = bool(scheduled <= now_utc <= window_ends)
+        return {
+            "enabled": enabled,
+            "in_window": in_window,
+            "send_due": bool(enabled and in_window and not sent_at),
+            "cycle": str(info["cycle"]),
+            "scheduled_utc": _utc_iso(scheduled),
+            "wipe_tz": info["wipe_tz_dt"].strftime("%Y-%m-%d %H:%M"),
+            "tz_name": str(info.get("tz_name") or ""),
+            "window_minutes": window_m,
+            "window_ends_utc": _utc_iso(window_ends),
+            "action": self.action,
+            "sent_at": sent_at,
+        }
+
+    def render_window_notification(self, status: dict) -> str:
+        template = str(
+            self.cfg.get(
+                "forced_wipe_window_notification_message_template",
+                "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch "
+                "forced-wipe window for cycle {cycle} is now active "
+                "(started {wipe_tz} {tz_name}); "
+                "forced_wipe_action={action}.",
+            )
+        )
+        try:
+            return template.format(**status)
+        except Exception:
+            return (
+                "⚠️ FORCED WIPE WINDOW: the scheduled Facepunch "
+                f"forced-wipe window for cycle {status.get('cycle', '?')} "
+                f"is now active (started {status.get('wipe_tz', '?')} "
+                f"{status.get('tz_name', '?')}); "
+                f"forced_wipe_action={self.action}."
+            )
+
+    def mark_window_notification_sent(
+        self,
+        now_utc: datetime,
+        *,
+        rate_limit_reminder: bool = False,
+    ) -> bool:
+        sent_at = _utc_iso(now_utc)
+        self.state["window_notification_sent_at"] = sent_at
+        if rate_limit_reminder:
+            self.state["reminder_last_sent_at"] = sent_at
+        return self._save(now_utc)
+
     def reminder_status(self, now_utc: datetime) -> dict:
         info = self._ensure_cycle(now_utc)
         enabled = parse_bool(
@@ -2511,8 +2587,12 @@ class ForcedWipeCoordinator:
             }
         )
         reminder = self.reminder_status(now_utc)
+        window_notification = self.window_notification_status(now_utc)
         out.update(
             {
+                "window_notification_enabled": window_notification["enabled"],
+                "window_notification_in_window": window_notification["in_window"],
+                "window_notification_sent_at": window_notification["sent_at"],
                 "reminder_enabled": reminder["enabled"],
                 "reminder_due": reminder["due"],
                 "reminder_repeat_minutes": reminder["repeat_minutes"],
@@ -4082,6 +4162,9 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
     forced_wipe_reminder_enabled = parse_bool(
         cfg.get("forced_wipe_reminder_enabled"), True
     )
+    forced_wipe_window_notification_enabled = parse_bool(
+        cfg.get("forced_wipe_window_notification_enabled"), True
+    )
     forced_wipe_trigger = str(
         cfg.get("forced_wipe_trigger", "new-build-after-schedule")
     ).strip().lower()
@@ -4206,11 +4289,16 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
 
     # 6) Forced-wipe state directory (automatic action and/or reminders)
     forced_wipe_state_file = str(cfg.get("forced_wipe_state_file") or "").strip()
-    if forced_wipe_action != "off" or forced_wipe_reminder_enabled:
+    if (
+        forced_wipe_action != "off"
+        or forced_wipe_reminder_enabled
+        or forced_wipe_window_notification_enabled
+    ):
         if not forced_wipe_state_file:
             fatal(
                 "config: forced_wipe_state_file cannot be empty when automatic "
-                "wiping or persistent reminders are enabled",
+                "wiping, window notifications, or persistent reminders are "
+                "enabled",
                 fp=fp,
             )
         forced_wipe_state_dir = (
@@ -4233,9 +4321,15 @@ def preflight_or_die(cfg, server_dir, rustserver_path):
         log(f"  OK: pause_file parent dir writable: {os.path.dirname(os.path.abspath(pause_file))}", fp)
     else:
         log("  NOTE: pause_file disabled (empty)", fp)
-    if forced_wipe_action != "off" or forced_wipe_reminder_enabled:
+    if (
+        forced_wipe_action != "off"
+        or forced_wipe_reminder_enabled
+        or forced_wipe_window_notification_enabled
+    ):
         log(f"  OK: forced-wipe action: {forced_wipe_action}", fp)
         log(f"  OK: forced-wipe state file: {forced_wipe_state_file}", fp)
+        if forced_wipe_window_notification_enabled:
+            log("  OK: forced-wipe window notification: enabled", fp)
         if forced_wipe_reminder_enabled:
             log(
                 "  OK: forced-wipe reminder: "
@@ -6170,6 +6264,9 @@ def print_forced_wipe_status(cfg: dict) -> None:
         "last_restart_at",
         "last_restart_age",
         "last_restart_source",
+        "window_notification_enabled",
+        "window_notification_in_window",
+        "window_notification_sent_at",
         "reminder_enabled",
         "reminder_due",
         "reminder_repeat_minutes",
@@ -6220,6 +6317,46 @@ def maybe_emit_forced_wipe_reminder(
         local_build=status.get("latest_local_build"),
         remote_build=status.get("latest_remote_build"),
         update_verdict=status.get("latest_update_verdict"),
+    )
+    return True
+
+
+def maybe_emit_forced_wipe_window_notification(
+    coordinator: ForcedWipeCoordinator,
+    cfg: dict,
+    fp=None,
+    *,
+    now_utc: datetime = None,
+) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    status = coordinator.window_notification_status(now_utc)
+    if not status.get("send_due"):
+        return False
+
+    message = coordinator.render_window_notification(status)
+    # Persist before queuing so a restart inside the same monthly window does
+    # not deliver the one-shot notification again. In manual/off mode this
+    # first warning also starts the repeat-reminder interval, avoiding two
+    # alerts at the exact same moment.
+    rate_limit_reminder = bool(
+        not coordinator.enabled
+        and parse_bool(cfg.get("forced_wipe_reminder_enabled"), True)
+    )
+    coordinator.mark_window_notification_sent(
+        now_utc,
+        rate_limit_reminder=rate_limit_reminder,
+    )
+    log(message, fp)
+    alert(
+        "forced_wipe_window",
+        message,
+        level="warning",
+        fp=fp,
+        identity=cfg.get("identity"),
+        cycle=status.get("cycle"),
+        scheduled_utc=status.get("scheduled_utc"),
+        window_ends_utc=status.get("window_ends_utc"),
+        action=status.get("action"),
     )
     return True
 
@@ -6569,6 +6706,18 @@ def main():
             log(f"FORCED_WIPE: WARNING: failed to compute/log forced wipe schedule: {e}", fp)
 
     try:
+        maybe_emit_forced_wipe_window_notification(
+            forced_wipe,
+            cfg,
+            fp=fp,
+        )
+    except Exception as e:
+        log(
+            "FORCED_WIPE: WARNING: window notification check failed: "
+            f"{e}",
+            fp,
+        )
+    try:
         maybe_emit_forced_wipe_reminder(forced_wipe, cfg, fp=fp)
     except Exception as e:
         log(f"FORCED_WIPE: WARNING: reminder check failed: {e}", fp)
@@ -6620,8 +6769,21 @@ def main():
                 log("Stop requested -- exiting watchdog loop", fp)
                 break
 
-            # Reminder delivery is independent of health/recovery and remains
-            # active even while a pause file suppresses operational actions.
+            # Forced-wipe notifications are independent of health/recovery and
+            # remain active even while a pause file suppresses operational
+            # actions.
+            try:
+                maybe_emit_forced_wipe_window_notification(
+                    forced_wipe,
+                    cfg,
+                    fp=fp,
+                )
+            except Exception as e:
+                log(
+                    "FORCED_WIPE: WARNING: window notification check failed: "
+                    f"{e}",
+                    fp,
+                )
             try:
                 maybe_emit_forced_wipe_reminder(forced_wipe, cfg, fp=fp)
             except Exception as e:

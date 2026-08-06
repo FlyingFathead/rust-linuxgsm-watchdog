@@ -228,9 +228,10 @@ class RconWipeLedgerTests(unittest.TestCase):
                 now_utc=dt("2026-07-27T14:06:28Z"),
             )
         self.assertEqual(
-            footnotes[:2],
+            footnotes[:3],
             [
-                "Server last wiped: 2026-07-02 18:25:08 UTC (RCON)",
+                "Server last wiped:",
+                "2026-07-02 18:25:08 UTC (RCON)",
                 "(24 days, 19 hours, 41 minutes ago)",
             ],
         )
@@ -474,10 +475,10 @@ class RconWipeLedgerTests(unittest.TestCase):
                 now_utc=dt("2026-07-27T14:06:28Z"),
             )
         self.assertEqual(
-            footnotes[:2],
+            footnotes[:3],
             [
-                "Server last wiped: 2026-07-02 18:24:55 UTC "
-                "(map file mtime)",
+                "Server last wiped:",
+                "2026-07-02 18:24:55 UTC (map file mtime)",
                 "(24 days, 19 hours, 41 minutes ago)",
             ],
         )
@@ -508,12 +509,15 @@ class RconWipeLedgerTests(unittest.TestCase):
                     suffix = f" ({label})" if label else ""
                     self.assertEqual(
                         footnotes[0],
-                        "Server last wiped: "
+                        "Server last wiped:",
+                    )
+                    self.assertEqual(
+                        footnotes[1],
                         "2026-07-02 18:25:08 UTC"
                         f"{suffix}",
                     )
                     self.assertEqual(
-                        footnotes[1],
+                        footnotes[2],
                         "(24 days, 19 hours, 41 minutes ago)",
                     )
 

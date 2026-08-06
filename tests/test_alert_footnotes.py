@@ -26,11 +26,12 @@ class AlertFootnoteRenderTests(unittest.TestCase):
             text="server looks healthy",
             fields={
                 "_footnote_lines": [
-                    "Server last wiped: 2026-07-31 18:09:00 UTC (RCON)",
+                    "Server last wiped:",
+                    "2026-07-31 18:09:00 UTC (RCON)",
                     "(5 days, 23 hours, 51 minutes ago)",
                     "",
-                    "Server last restarted: unknown "
-                    "(no Rust process start timestamp recorded)",
+                    "Server last restarted:",
+                    "unknown (no Rust process start timestamp recorded)",
                 ]
             },
             ts=0,
@@ -39,11 +40,11 @@ class AlertFootnoteRenderTests(unittest.TestCase):
     def test_html_footnotes_are_separate_and_italic(self):
         rendered = self.manager._render_html(self.alert)
         self.assertIn(
-            "\n\n<i>Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON)</i>\n"
+            "\n\n<i>Server last wiped:</i>\n"
+            "<i>2026-07-31 18:09:00 UTC (RCON)</i>\n"
             "<i>(5 days, 23 hours, 51 minutes ago)</i>\n\n"
-            "<i>Server last restarted: unknown "
-            "(no Rust process start timestamp recorded)</i>",
+            "<i>Server last restarted:</i>\n"
+            "<i>unknown (no Rust process start timestamp recorded)</i>",
             rendered,
         )
         self.assertNotIn("<i></i>", rendered)
@@ -52,11 +53,11 @@ class AlertFootnoteRenderTests(unittest.TestCase):
     def test_existing_discord_renderer_uses_markdown_italics(self):
         rendered = self.manager._render_plain(self.alert)
         self.assertIn(
-            "\n\n*Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON)*\n"
+            "\n\n*Server last wiped:*\n"
+            "*2026-07-31 18:09:00 UTC (RCON)*\n"
             "*(5 days, 23 hours, 51 minutes ago)*\n\n"
-            "*Server last restarted: unknown "
-            "(no Rust process start timestamp recorded)*",
+            "*Server last restarted:*\n"
+            "*unknown (no Rust process start timestamp recorded)*",
             rendered,
         )
 
@@ -66,11 +67,11 @@ class AlertFootnoteRenderTests(unittest.TestCase):
             v2=False,
         )
         self.assertIn(
-            "\n\n_Server last wiped: 2026-07-31 18:09:00 UTC "
-            "(RCON)_\n"
+            "\n\n_Server last wiped:_\n"
+            "_2026-07-31 18:09:00 UTC (RCON)_\n"
             "_(5 days, 23 hours, 51 minutes ago)_\n\n"
-            "_Server last restarted: unknown "
-            "(no Rust process start timestamp recorded)_",
+            "_Server last restarted:_\n"
+            "_unknown (no Rust process start timestamp recorded)_",
             rendered,
         )
 

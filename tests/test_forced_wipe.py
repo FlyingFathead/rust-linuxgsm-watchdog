@@ -279,6 +279,131 @@ class ForcedWipeCoordinatorTests(unittest.TestCase):
         self.assertTrue(reloaded.needs_recovery(datetime.now(UTC)))
 
 
+class ForcedWipeWindowNotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = copy.deepcopy(wd.DEFAULTS)
+        self.cfg.update(
+            {
+                "forced_wipe_action": "full-wipe",
+                "forced_wipe_state_file": str(
+                    Path(self.tmp.name) / "forced_wipe.json"
+                ),
+            }
+        )
+
+    def coordinator(self):
+        return wd.ForcedWipeCoordinator(self.cfg, persist=True)
+
+    def test_send_due_is_independent_of_forced_wipe_action(self):
+        entered_at = dt("2026-08-06T18:00:00Z")
+        for action in ("off", "map-wipe", "full-wipe"):
+            with self.subTest(action=action):
+                cfg = copy.deepcopy(self.cfg)
+                cfg["forced_wipe_action"] = action
+                cfg["forced_wipe_state_file"] = str(
+                    Path(self.tmp.name) / f"forced_wipe-{action}.json"
+                )
+                coordinator = wd.ForcedWipeCoordinator(cfg, persist=True)
+                self.assertTrue(
+                    coordinator.window_notification_status(entered_at)[
+                        "send_due"
+                    ]
+                )
+
+    def test_default_sends_once_inside_window_with_automatic_wipe_enabled(self):
+        self.assertTrue(
+            wd.DEFAULTS["forced_wipe_window_notification_enabled"]
+        )
+        c = self.coordinator()
+        self.assertFalse(
+            c.window_notification_status(
+                dt("2026-08-06T17:59:59Z")
+            )["send_due"]
+        )
+
+        entered_at = dt("2026-08-06T18:00:00Z")
+        with mock.patch.object(wd, "alert") as alert_mock, mock.patch.object(
+            wd, "log"
+        ):
+            self.assertTrue(
+                wd.maybe_emit_forced_wipe_window_notification(
+                    c,
+                    self.cfg,
+                    now_utc=entered_at,
+                )
+            )
+        self.assertEqual(alert_mock.call_args.args[0], "forced_wipe_window")
+        self.assertEqual(
+            c.state["window_notification_sent_at"],
+            "2026-08-06T18:00:00Z",
+        )
+
+        reloaded = self.coordinator()
+        self.assertFalse(
+            reloaded.window_notification_status(
+                dt("2026-08-06T18:05:00Z")
+            )["send_due"]
+        )
+
+    def test_notification_can_be_disabled(self):
+        self.cfg["forced_wipe_window_notification_enabled"] = False
+        c = self.coordinator()
+        status = c.window_notification_status(
+            dt("2026-08-06T18:00:00Z")
+        )
+        self.assertFalse(status["enabled"])
+        self.assertFalse(status["send_due"])
+        with mock.patch.object(wd, "alert") as alert_mock:
+            self.assertFalse(
+                wd.maybe_emit_forced_wipe_window_notification(
+                    c,
+                    self.cfg,
+                    now_utc=dt("2026-08-06T18:00:00Z"),
+                )
+            )
+        alert_mock.assert_not_called()
+
+    def test_notification_is_not_backfilled_after_window(self):
+        c = self.coordinator()
+        status = c.window_notification_status(
+            dt("2026-08-06T21:00:01Z")
+        )
+        self.assertFalse(status["in_window"])
+        self.assertFalse(status["send_due"])
+
+    def test_off_mode_does_not_send_window_and_due_alerts_together(self):
+        self.cfg["forced_wipe_action"] = "off"
+        self.cfg["forced_wipe_reminder_enabled"] = True
+        self.cfg["forced_wipe_reminder_repeat_minutes"] = 30
+        c = self.coordinator()
+        entered_at = dt("2026-08-06T18:00:00Z")
+
+        with mock.patch.object(wd, "alert"), mock.patch.object(wd, "log"):
+            self.assertTrue(
+                wd.maybe_emit_forced_wipe_window_notification(
+                    c,
+                    self.cfg,
+                    now_utc=entered_at,
+                )
+            )
+            self.assertFalse(
+                wd.maybe_emit_forced_wipe_reminder(
+                    c,
+                    self.cfg,
+                    now_utc=entered_at,
+                )
+            )
+
+        self.assertFalse(
+            c.reminder_status(dt("2026-08-06T18:29:59Z"))["send_due"]
+        )
+        self.assertTrue(
+            c.reminder_status(dt("2026-08-06T18:30:00Z"))["send_due"]
+        )
+
+
 class ForcedWipeReminderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -409,11 +534,12 @@ class ForcedWipeReminderTests(unittest.TestCase):
         self.assertEqual(
             lines,
             [
-                "Server last wiped: 2026-07-31 18:09:00 UTC "
-                "(manual record)",
+                "Server last wiped:",
+                "2026-07-31 18:09:00 UTC (manual record)",
                 "(5 days, 23 hours, 51 minutes ago)",
                 "",
-                "Server last restarted: 2026-07-31 18:09:00 UTC",
+                "Server last restarted:",
+                "2026-07-31 18:09:00 UTC",
                 "(5 days, 23 hours, 51 minutes ago)",
             ],
         )
@@ -433,10 +559,11 @@ class ForcedWipeReminderTests(unittest.TestCase):
         self.assertEqual(
             lines,
             [
-                "Server last wiped: unknown (no wipe timestamp recorded)",
+                "Server last wiped:",
+                "unknown (no wipe timestamp recorded)",
                 "",
-                "Server last restarted: unknown "
-                "(no Rust process start timestamp recorded)",
+                "Server last restarted:",
+                "unknown (no Rust process start timestamp recorded)",
             ],
         )
 

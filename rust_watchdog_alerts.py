@@ -32,6 +32,7 @@ DEFAULT_EMOJI_BY_EVENT = {
     "forced_wipe_started": "💥",
     "forced_wipe_completed": "✅",
     "forced_wipe_failed": "🚨",
+    "forced_wipe_window": "⚠️",
     "forced_wipe_due": "⚠️",
 }
 
@@ -57,6 +58,7 @@ DEFAULT_EVENT_TITLES = {
     "forced_wipe_started": "Forced wipe started",
     "forced_wipe_completed": "Forced wipe completed",
     "forced_wipe_failed": "Forced wipe failed",
+    "forced_wipe_window": "Forced wipe window",
     "forced_wipe_due": "Forced wipe due",
 }
 
@@ -75,6 +77,7 @@ DEFAULT_EVENT_BODIES = {
     "forced_wipe_started": "backup/update/mod-update/wipe/start sequence started",
     "forced_wipe_completed": "wipe completed and server health verified",
     "forced_wipe_failed": "automatic wipe sequence stopped before completion",
+    "forced_wipe_window": "scheduled monthly forced-wipe window is now active",
     "forced_wipe_due": "scheduled monthly wipe window has arrived without a recorded wipe",
 }
 
