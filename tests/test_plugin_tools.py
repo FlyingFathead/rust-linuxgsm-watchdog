@@ -487,7 +487,10 @@ class PluginPackageStateTests(unittest.TestCase):
             history_limit=50,
             observed_at="2026-07-28T20:00:00+03:00",
         )
-        resolved_row = self.row(remote="1.2.0", status="OK")
+        resolved_row = self.row(
+            remote="1.2.0",
+            status=checker.CHECK_STATUS_CURRENT,
+        )
         resolved_row["local"] = "1.2.0"
         checker.observe_plugin_state(
             state,
@@ -509,6 +512,30 @@ class PluginPackageStateTests(unittest.TestCase):
             ],
         )
         self.assertIsNone(entry["active_outdated"])
+
+    def test_legacy_ok_status_still_resolves_an_outdated_state(self):
+        state = checker._empty_plugin_state()
+        checker.observe_plugin_state(
+            state,
+            key="ExamplePlugin.cs",
+            plugin=self.plugin(),
+            row=self.row(),
+            history_limit=50,
+        )
+
+        resolved_row = self.row(remote="1.1.0", status="OK")
+        resolved_row["local"] = "1.1.0"
+        checker.observe_plugin_state(
+            state,
+            key="ExamplePlugin.cs",
+            plugin=self.plugin(version="1.1.0", sha256="b" * 64),
+            row=resolved_row,
+            history_limit=50,
+        )
+
+        self.assertIsNone(
+            state["plugins"]["ExamplePlugin.cs"]["active_outdated"]
+        )
 
     def test_state_round_trip_is_atomic_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1500,6 +1527,7 @@ class PluginUpdateOutputTests(unittest.TestCase):
                 str(Path(td) / "cache.json"),
                 "--color",
                 "never",
+                "--progress",
                 "--update-plugin",
                 "heliride.cs",
                 "--force",
@@ -1508,7 +1536,7 @@ class PluginUpdateOutputTests(unittest.TestCase):
             ],
         ), contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(
             io.StringIO()
-        ):
+        ) as stderr:
             rc = checker.main()
 
         self.assertEqual(rc, 0)
@@ -1529,6 +1557,8 @@ class PluginUpdateOutputTests(unittest.TestCase):
             [],
         )
         rendered = stdout.getvalue()
+        self.assertIn("UP TO DATE", rendered)
+        self.assertIn("-- UP TO DATE (net)", stderr.getvalue())
         self.assertIn("1 plugin found in directory", rendered)
         self.assertIn("0 plugin sources updated.", rendered)
         self.assertIn(

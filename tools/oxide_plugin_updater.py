@@ -17,7 +17,7 @@ Features:
 - optional validated uMod updates with backups and atomic replacement
 
 Exit codes:
-- 0: all OK, or every update candidate was installed successfully
+- 0: all plugins are up to date, or every update candidate was installed successfully
 - 1: at least one plugin remains OUTDATED
 - 2: at least one UNKNOWN, ERROR, or update failure
 """
@@ -81,6 +81,12 @@ MAX_PLUGIN_BYTES = 10 * 1024 * 1024
 SHRINK_WARN_PERCENT = 25.0
 SHRINK_REFUSE_PERCENT = 50.0
 RCON_ACTIVATION_COMMAND = "oxide.load|oxide.reload <updated-plugin>"
+CHECK_STATUS_CURRENT = "UP TO DATE"
+LEGACY_CHECK_STATUS_CURRENT = "OK"
+CURRENT_CHECK_STATUSES = {
+    CHECK_STATUS_CURRENT,
+    LEGACY_CHECK_STATUS_CURRENT,
+}
 _ACTIVITY_SPINNER_ENABLED = True
 _NETWORK_AUDIT = None
 
@@ -696,7 +702,10 @@ def observe_plugin_state(
         }
         return classification
 
-    if status == "OK" and isinstance(active, dict):
+    # Accept the old label when reading state written before the status was
+    # renamed. A version match says nothing about whether a plugin compiles or
+    # behaves correctly; it only resolves the known-outdated condition.
+    if status in CURRENT_CHECK_STATUSES and isinstance(active, dict):
         _append_limited(
             history,
             {
@@ -751,7 +760,7 @@ def record_installed_update(
         "size_bytes": validation.new_size,
         "mtime": now,
     }
-    entry["last_check_status"] = "OK"
+    entry["last_check_status"] = CHECK_STATUS_CURRENT
     entry["active_outdated"] = None
 
 
@@ -820,7 +829,7 @@ def record_revalidated_source(
         "size_bytes": validation.old_size,
         "mtime": now,
     }
-    entry["last_check_status"] = "OK"
+    entry["last_check_status"] = CHECK_STATUS_CURRENT
     entry["active_outdated"] = None
 
 # ------------------------------------------------------------
@@ -1434,7 +1443,7 @@ def want_color(mode: str) -> bool:
 def color_status(s: str, *, use: bool) -> str:
     if not use:
         return s
-    if s == "OK":
+    if s in CURRENT_CHECK_STATUSES:
         return f"{ANSI['green']}{s}{ANSI['reset']}"
     if s == "OUTDATED":
         return f"{ANSI['yellow']}{s}{ANSI['reset']}"
@@ -3393,10 +3402,14 @@ def main(
 
             if local_ver != "-" and remote_ver != "-" and local_ver and remote_ver:
                 if local_ver == remote_ver:
-                    status = "OK"
+                    status = CHECK_STATUS_CURRENT
                 else:
                     newer = version_is_newer(remote_ver, local_ver)
-                    status = "OUTDATED" if (newer is True or newer is None) else "OK"
+                    status = (
+                        "OUTDATED"
+                        if (newer is True or newer is None)
+                        else CHECK_STATUS_CURRENT
+                    )
             else:
                 status = "UNKNOWN (missing version)"
                 any_unknown = True
@@ -3418,10 +3431,14 @@ def main(
 
                 if local_ver and remote_ver and local_ver != "-" and remote_ver != "-":
                     if local_ver == remote_ver:
-                        status = "OK"
+                        status = CHECK_STATUS_CURRENT
                     else:
                         newer = version_is_newer(remote_ver, local_ver)
-                        status = "OUTDATED" if (newer is True or newer is None) else "OK"
+                        status = (
+                            "OUTDATED"
+                            if (newer is True or newer is None)
+                            else CHECK_STATUS_CURRENT
+                        )
                 else:
                     status = "UNKNOWN (missing version)"
                     any_unknown = True

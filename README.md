@@ -77,7 +77,7 @@ The release version is declared once as `__version__` near the top of
 application label:
 
 ```text
-🟢 rust-linuxgsm-watchdog (v0.4.11) -- started
+🟢 rust-linuxgsm-watchdog (v0.4.12) -- started
 ```
 
 If the value is missing or empty, the alert renderer uses `(N/A)` instead.
@@ -358,6 +358,12 @@ The updater is also check-only unless `--update` is explicitly supplied:
 python3 tools/oxide_plugin_updater.py
 python3 tools/oxide_plugin_updater.py --update
 ```
+
+An installed/upstream version match is reported as `UP TO DATE` in progress
+output, the results table, and persisted updater state. This means only that
+the versions match; it is not a plugin health or compatibility result. `OK`
+remains the successful status for live Oxide compile/load verification, and
+legacy updater state written with `OK` for a version match remains compatible.
 
 If the configured Oxide plugin directory does not exist, the updater exits
 with status 2 and prints both the permanent and one-run recovery commands.
@@ -1179,6 +1185,10 @@ If Telegram is misconfigured, you should see a clear error (bad token/chat ids, 
 ---
 
 ### History
+- v0.4.12
+  **Fixed / Added:**
+  - Changed successful plugin version comparisons from `OK` to `UP TO DATE` in progress output, the results table, and persisted state; live compile/load verification still uses `OK`, and legacy saved `OK` state remains compatible.
+  - Added the previously omitted unit-test update covering `UP TO DATE` output and compatibility with legacy `OK` updater state.
 - v0.4.11
   **Fixed / Added:**
   - Added the default-on `forced_wipe_window_notification_enabled` switch for one notification when the scheduled monthly Facepunch forced-wipe window becomes active.

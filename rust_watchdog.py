@@ -34,7 +34,7 @@ except Exception:
     ZoneInfo = None  # type: ignore
     ZoneInfoNotFoundError = Exception  # type: ignore
 
-__version__ = "0.4.11"
+__version__ = "0.4.12"
 
 
 def _runtime_version():
