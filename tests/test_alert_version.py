@@ -5,6 +5,21 @@ from rust_watchdog_alerts import Alert, AlertManager
 
 
 class AlertVersionTests(unittest.TestCase):
+    @staticmethod
+    def _main_version_label():
+        version = str(rust_watchdog.__version__).strip()
+        if not version:
+            return "N/A"
+        return version if version.lower().startswith("v") else f"v{version}"
+
+    @staticmethod
+    def _telegram_markdown_v2_escape(value):
+        special_chars = r"_*[]()~`>#+-=|{}.!\\"
+        return "".join(
+            ("\\" + char) if char in special_chars else char
+            for char in str(value)
+        )
+
     def setUp(self):
         self.manager = AlertManager(
             {
@@ -42,29 +57,35 @@ class AlertVersionTests(unittest.TestCase):
             rust_watchdog.ALERTS = previous
 
         self.assertEqual(captured["version"], rust_watchdog.__version__)
-        self.assertEqual(rust_watchdog._runtime_version_label(), "v0.4.11")
+        self.assertEqual(
+            rust_watchdog._runtime_version_label(),
+            self._main_version_label(),
+        )
 
     def test_versioned_label_is_used_by_every_renderer(self):
         alert = self._alert(rust_watchdog.__version__)
+        version_label = self._main_version_label()
 
         self.assertTrue(
             self.manager._render_html(alert).startswith(
-                "🟢 <b>rust-linuxgsm-watchdog (v0.4.11)</b> -- "
+                f"🟢 <b>rust-linuxgsm-watchdog ({version_label})</b> -- "
                 "<b>started</b>"
             )
         )
         self.assertTrue(
             self.manager._render_plain(alert).startswith(
-                "🟢 rust-linuxgsm-watchdog (v0.4.11) -- started"
+                f"🟢 rust-linuxgsm-watchdog ({version_label}) -- started"
             )
         )
         self.assertTrue(
             self.manager._render_telegram_markdown(alert, v2=False).startswith(
-                "🟢 *rust-linuxgsm-watchdog (v0.4.11)* -- *started*"
+                f"🟢 *rust-linuxgsm-watchdog ({version_label})* -- *started*"
             )
         )
         self.assertIn(
-            r"rust\-linuxgsm\-watchdog \(v0\.4\.11\)",
+            self._telegram_markdown_v2_escape(
+                f"rust-linuxgsm-watchdog ({version_label})"
+            ),
             self.manager._render_telegram_markdown(alert, v2=True),
         )
 
