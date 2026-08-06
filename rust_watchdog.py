@@ -2803,7 +2803,8 @@ def _build_alert_status_footnotes(
                 str(state.get("last_wipe_source") or "")
             )
             source_suffix = f" ({source_label})" if source_label else ""
-            lines.append(f"Server last wiped: {rendered_at}{source_suffix}")
+            lines.append("Server last wiped:")
+            lines.append(f"{rendered_at}{source_suffix}")
             lines.append(f"({_elapsed_ago(wiped_at, now_utc)})")
         else:
             unknown = str(
@@ -2812,7 +2813,8 @@ def _build_alert_status_footnotes(
                     "unknown (no wipe timestamp recorded)",
                 )
             ).strip()
-            lines.append(f"Server last wiped: {unknown}")
+            lines.append("Server last wiped:")
+            lines.append(unknown)
 
     if include_restart:
         if lines:
@@ -2820,7 +2822,8 @@ def _build_alert_status_footnotes(
         restarted_at = current_restart or str(state.get("last_restart_at") or "")
         rendered_at = _status_timestamp(restarted_at)
         if rendered_at:
-            lines.append(f"Server last restarted: {rendered_at}")
+            lines.append("Server last restarted:")
+            lines.append(rendered_at)
             lines.append(f"({_elapsed_ago(restarted_at, now_utc)})")
         else:
             unknown = str(
@@ -2829,7 +2832,8 @@ def _build_alert_status_footnotes(
                     "unknown (no Rust process start timestamp recorded)",
                 )
             ).strip()
-            lines.append(f"Server last restarted: {unknown}")
+            lines.append("Server last restarted:")
+            lines.append(unknown)
 
     return lines
 
