@@ -1,6 +1,25 @@
 # rust-linuxgsm-watchdog
 
-A watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM** to keep your server up, running and up to date in a more automated way than what [LinuxGSM](https://linuxgsm.com/) offers by default.
+> [!WARNING]
+> ## Security notice
+>
+> **This is the official `rust-linuxgsm-watchdog` repository:**
+>
+> **https://github.com/FlyingFathead/rust-linuxgsm-watchdog**
+>
+> A malicious copy of this project has been found distributing a malware-linked ZIP.
+>
+> **You do not need any third-party ZIP archive, installer, or external download to install or run this watchdog.**
+>
+> **Do not download third-party ZIP archives or installers claiming to be this project.**
+>
+> The malicious copy has been reported to GitHub.
+
+---
+
+## About
+
+This a server watchdog for **[Rust (the game)](https://rust.facepunch.com/), i.e. for dedicated servers managed by LinuxGSM** to keep your server up, running and up to date in a more automated way than what [LinuxGSM](https://linuxgsm.com/) offers by default.
 
 This program is stdlib-only unless WebRCON features are used. Authenticated
 wipe-timestamp discovery is enabled by default, and WebRCON tests plus the
