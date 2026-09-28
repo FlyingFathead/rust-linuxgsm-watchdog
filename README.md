@@ -1,19 +1,10 @@
 # rust-linuxgsm-watchdog
 
-> [!WARNING]
-> ## Security notice
->
-> **This is the official `rust-linuxgsm-watchdog` repository:**
+> **This is the official `rust-linuxgsm-watchdog` repository.**
 >
 > **https://github.com/FlyingFathead/rust-linuxgsm-watchdog**
 >
-> A malicious copy of this project has been found distributing a malware-linked ZIP.
->
-> **You do not need any third-party ZIP archive, installer, or external download to install or run this watchdog.**
->
-> **Do not download third-party ZIP archives or installers claiming to be this project.**
->
-> The malicious copy has been reported to GitHub.
+> Accept no substitutes and do not source the program elsewhere.
 
 ---
 
